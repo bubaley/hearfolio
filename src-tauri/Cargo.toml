@@ -1,6 +1,6 @@
 [package]
 name = "speechdesk"
-version = "0.1.0"
+version = "0.2.0"
 description = "Hearfolio — audio recordings into a personal text archive"
 authors = ["bubaley"]
 edition = "2021"
