@@ -53,6 +53,11 @@
     "createUpdaterArtifacts": true,
     "macOS": {
       "signingIdentity": "-"
+    },
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": true
+      }
     }
   },
   "plugins": {

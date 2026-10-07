@@ -176,7 +176,7 @@ function updatesHtml():string {
   if(platform.os!=='android'&&platform.os!=='macos'&&platform.os!=='linux')return `<p>${tr('Обновления на этой платформе недоступны.')}</p>`;
   if(updateInstalled)return `<p>${tr('Обновление установлено. Перезапустите приложение, когда закончите работу.')}</p><button type="button" class="secondary" id="restart-update" ${busy?'disabled':''}>${tr('Перезапустить приложение')}</button>`;
   const version=pendingUpdate?.version||androidRelease?.version;
-  return `<p>${platform.mobile?tr('На Android обновление устанавливается вручную из APK. Ваш архив останется в приложении.'):tr('Обновления проверяются автоматически. Установка и перезапуск выполняются по вашему запросу.')}</p>${version?`<div class="update-offer"><span>${tr('Доступно обновление')} <strong>${esc(version)}</strong></span><button type="button" class="secondary" id="install-update" ${busy||updateChecking?'disabled':''}>${tr(platform.mobile?'Открыть APK':'Установить обновление')}</button></div>`:''}${updateError?`<p class="update-error" role="alert">${esc(updateError)}</p>`:updateChecked&&!version?`<p class="update-checked">${tr('Установлена последняя версия')}</p>`:''}<button type="button" class="text-button" id="check-update" ${busy||updateChecking?'disabled':''}>${tr(updateChecking?'Проверяем обновления…':'Проверить обновления')}</button>`;
+  return `<p>${platform.mobile?tr('На Android обновление устанавливается вручную из APK. Ваш архив останется в приложении.'):tr('Обновления проверяются автоматически. Установка и перезапуск выполняются по вашему запросу.')}</p>${version?`<div class="update-offer"><span>${tr('Доступно обновление')} <strong>${esc(version)}</strong></span><button type="button" class="secondary" id="install-update" ${busy||updateChecking?'disabled':''}>${tr(platform.mobile?'Открыть APK':'Установить обновление')}</button></div>`:''}${updateError?`<p class="update-error" role="alert">${esc(tr(updateError))}</p>`:updateChecked&&!version?`<p class="update-checked">${tr('Установлена последняя версия')}</p>`:''}<button type="button" class="text-button" id="check-update" ${busy||updateChecking?'disabled':''}>${tr(updateChecking?'Проверяем обновления…':'Проверить обновления')}</button>`;
 }
 function refreshUpdateUi() {
   const section=document.querySelector('#about-updates');if(section){section.innerHTML=updatesHtml();bindUpdates();}
@@ -195,7 +195,7 @@ async function checkUpdates(manual=false) {
     updateChecked=true;
     if(manual&&!pendingUpdate&&!androidRelease)notice(tr('Установлена последняя версия'));
     const availableVersion=pendingUpdate?.version||androidRelease?.version;if(availableVersion&&(manual||availableVersion!==lastNotifiedUpdate)){lastNotifiedUpdate=availableVersion;notice(`${tr('Доступно обновление')} ${availableVersion}`);}
-  }catch(error){updateError=tr('Не удалось проверить обновления. Повторите попытку позже.');if(manual)notice(`${updateError} ${errorText(error)}`,true);}
+  }catch(error){updateError='Не удалось проверить обновления. Повторите попытку позже.';if(manual)notice(`${tr(updateError)} ${errorText(error)}`,true);}
   finally{updateChecking=false;refreshUpdateUi();}
 }
 async function installUpdate() {
@@ -311,10 +311,15 @@ async function changeStorage() {
   }catch(error){notice(`${tr("Не удалось перенести архив: ")}${errorText(error)}`,true);}
   finally{endOperation();render();}
 }
+function normalizeCatalogConfiguration(candidate:RecognitionConfig):RecognitionConfig {
+  const model=candidate.provider==='openrouter'?cloudModels.find(item=>item.id===candidate.model):null;
+  return model&&!model.modes.includes(candidate.mode as 'streaming'|'transcription')?{...candidate,mode:model.preferredMode}:candidate;
+}
 function restoreConfiguration(entry?:Entry|null) {
   const legacyModel=entry?.model?.replace(/^openrouter\//,'');
   configuration={...(entry?.configuration||(legacyModel?{provider:legacyModel.startsWith('whisper-')||legacyModel==='nemotron-3.5'?'local':'openrouter',model:legacyModel,mode:legacyModel.startsWith('whisper-')||legacyModel==='nemotron-3.5'?'local':'streaming'}:settings.lastConfiguration))} as RecognitionConfig;
   if(!platform.localRecognition&&configuration.provider==='local')configuration={provider:'openrouter',model:cloudChoice||'google/gemini-2.5-flash',mode:'streaming'};
+  configuration=normalizeCatalogConfiguration(configuration);
   if(configuration.provider==='local')localChoice=configuration.model;else cloudChoice=configuration.model;
   catalogOpen=false;catalogSearch='';
   if(configuration.provider==='openrouter'&&!cloudModels.length)void loadCloudModels();
@@ -341,8 +346,8 @@ async function loadCloudModels() {
   cloudLoading=true;catalogError='';render();
   try{
     cloudModels=(await call<CloudModel[]>('list_openrouter_models')).filter(model=>model.modes.some(mode=>mode==='streaming'||mode==='transcription')).map(model=>({...model,preferredMode:model.modes.includes('transcription')?'transcription':'streaming'}));
-    const model=cloudModels.find(item=>item.id===configuration.model);
-    if(configuration.provider==='openrouter'&&model&&!model.modes.includes(configuration.mode as 'streaming'|'transcription'))chooseConfiguration({...configuration,mode:model.preferredMode});
+    const normalized=normalizeCatalogConfiguration(configuration);
+    if(normalized.mode!==configuration.mode)chooseConfiguration(normalized);
   }
   catch(error){catalogError=errorText(error);}
   finally{cloudLoading=false;render();if(catalogOpen)document.querySelector<HTMLInputElement>('#catalog-search')?.focus();}
