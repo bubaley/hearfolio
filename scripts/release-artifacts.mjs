@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 const DESKTOP = {
   darwin_universal: ['.dmg', '.app.tar.gz', '.app.tar.gz.sig'],
   linux_x86_64: ['.AppImage', '.AppImage.sig', '.deb', '.deb.sig', '.rpm', '.rpm.sig'],
+  windows_x86_64: ['-setup.exe', '-setup.exe.sig'],
 };
 export function assetName(version, platform, extension) {
   if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) throw new Error('Invalid stable release version');
@@ -82,6 +83,7 @@ export function createManifests(version, repository, directory, notes, date = ne
     ['linux_x86_64', '.AppImage', ['linux-x86_64', 'linux-x86_64-appimage']],
     ['linux_x86_64', '.deb', ['linux-x86_64-deb']],
     ['linux_x86_64', '.rpm', ['linux-x86_64-rpm']],
+    ['windows_x86_64', '-setup.exe', ['windows-x86_64', 'windows-x86_64-nsis']],
   ]) {
     const name = assetName(version, platform, extension);
     const signature = readFileSync(join(directory, `${name}.sig`), 'utf8').trim();

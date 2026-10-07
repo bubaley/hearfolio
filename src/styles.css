@@ -363,7 +363,7 @@ main { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: colu
 .mobile-nav { flex: none; justify-content: space-around; align-items: center; min-height: 59px; padding: 5px 8px calc(5px + env(safe-area-inset-bottom)); gap: 4px; background: var(--chrome); }
 .mobile-nav button { display: grid; justify-items: center; gap: 5px; min-width: 60px; min-height: 46px; padding: 5px 8px; color: var(--muted); font-size: 10px; border-radius: 7px; }
 .mobile-nav button svg { width: 19px; height: 19px; }
-.mobile-nav button.active { color: var(--text); background: var(--selected); }
+.mobile-nav button.active { color: var(--text); background: none; }
 @media (max-width: 760px) {
   .mobile-nav { display: flex; }
   .mobile-new { display: inline-flex; }
@@ -388,4 +388,68 @@ main { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: colu
   .mobile-platform .control-divider { display: none; }
   .mobile-platform .cloud-picker { flex: 1; }
   .mobile-platform .run-button.with-label { padding: 0 10px; font-size: 11px; }
+}
+
+/* Phone capture and recognition stay in separate, readable steps. */
+.mobile-platform .capture-panel { width: min(100%, 390px); margin: auto; padding: 32px 24px; display: flex; flex-direction: column; align-items: stretch; text-align: center; }
+.mobile-platform .capture-panel .empty-symbol { align-self: center; margin-bottom: 22px; }
+.mobile-platform .capture-panel h1 { font-size: 25px; }
+.mobile-platform .capture-panel p { color: var(--muted); font-size: 13px; line-height: 1.65; margin: 12px 0 27px; }
+.mobile-platform .capture-panel>.primary, .mobile-platform .capture-panel>.secondary { min-height: 48px; font-size: 14px; border-radius: 9px; }
+.mobile-platform .capture-file { margin-top: 10px; }
+.mobile-platform .capture-panel small { color: var(--muted); font-size: 10px; line-height: 1.8; margin-top: 20px; }
+.mobile-platform .capture-cancel { align-self: center; padding: 13px 10px; min-height: 44px; margin-top: 8px; }
+.recording-indicator { display: flex; align-items: center; justify-content: center; gap: 9px; color: var(--text); font-size: 13px; }
+.recording-indicator svg { color: var(--accent); width: 22px; height: 22px; }
+.recording-duration { font-size: 59px; letter-spacing: -2px; font-weight: 400; font-variant-numeric: tabular-nums; margin-top: 20px; line-height: 1.2; }
+.stop-symbol { width: 12px; height: 12px; border-radius: 2px; background: currentColor; }
+.mobile-platform .composer-controls { display: flex; flex-direction: column; align-items: stretch; gap: 13px; }
+.mobile-recognition { width: 100%; display: grid; gap: 10px; }
+.recognition-service, .recognition-mode-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 11px; color: var(--muted); }
+.recognition-service strong { display: flex; align-items: center; gap: 6px; color: var(--text); font-weight: 500; }
+.recognition-service svg { width: 14px; height: 14px; }
+.recognition-model { display: grid; gap: 5px; min-width: 0; }
+.recognition-label { color: var(--muted); font-size: 11px; }
+.mobile-platform .recognition-model .cloud-model-control { display: flex; justify-content: space-between; max-width: none; width: 100%; height: auto; min-height: 44px; padding: 10px 12px; border-radius: 6px; background: var(--canvas); border: 1px solid var(--line); font-size: 13px; text-align: left; }
+.mobile-platform .recognition-model .cloud-model-control>span { white-space: normal; overflow-wrap: anywhere; overflow: visible; text-overflow: clip; }
+.recognition-mode-row>span:last-child { text-align: right; }
+.mobile-platform .has-record .run-button.with-label { width: 100%; margin: 0; min-height: 44px; font-size: 13px; justify-content: center; }
+.mobile-platform .composer { padding: 13px; }
+.mobile-platform .composer-requirement { align-items: flex-start; }
+.mobile-platform .record-empty { padding: 22px; min-height: 150px; }
+.mobile-platform .record-empty h2 { font-size: 16px; }
+.mobile-platform .mobile-nav button { font-size: 11px; color: var(--muted); }
+.mobile-platform .mobile-nav button.active { color: var(--text); background: none; }
+:root:not([data-theme='dark']) .mobile-platform .mobile-nav button { color: #62626b; }
+:root:not([data-theme='dark']) .mobile-platform .mobile-nav button.active { color: var(--accent); }
+.catalog-backdrop { position: fixed; z-index: 100; inset: var(--catalog-top, 0px) 0 auto; height: var(--catalog-height, 100dvh); padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); display: flex; align-items: flex-end; justify-content: center; background: #0006; }
+.catalog-backdrop .model-catalog { position: relative; inset: auto; width: min(100%, 540px); max-height: 100%; min-height: 0; display: flex; flex-direction: column; padding: 16px; border-radius: 14px; box-shadow: 0 16px 50px #0003; }
+.catalog-backdrop .catalog-heading { font-size: 14px; flex: none; }
+.catalog-backdrop .catalog-heading .icon-button { min-height: 44px; min-width: 44px; }
+.catalog-backdrop .search-field { flex: none; min-height: 44px; }
+.catalog-backdrop .search-field input { min-width: 0; font-size: 16px; }
+.catalog-backdrop #catalog-results { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.catalog-backdrop .catalog-list { max-height: none; overflow: visible; }
+.catalog-backdrop .catalog-option { min-height: 59px; padding: 12px 8px; }
+.catalog-backdrop .catalog-option strong { font-size: 13px; overflow-wrap: anywhere; }
+.catalog-backdrop .catalog-option small { overflow-wrap: anywhere; white-space: normal; font-size: 11px; }
+.catalog-backdrop .model-catalog>.text-button { min-height: 44px; flex: none; }
+@media (max-height: 480px) {
+  .catalog-backdrop { align-items: center; }
+  .catalog-backdrop .model-catalog { padding: 8px 14px; }
+  .catalog-backdrop .catalog-heading { margin-bottom: 3px; }
+  .mobile-platform .capture-panel { padding-top: 18px; padding-bottom: 18px; }
+  .mobile-platform .capture-panel .empty-symbol { display: none; }
+  .recording-duration { font-size: 42px; margin-top: 8px; }
+  .mobile-platform .capture-panel p { margin: 10px 0 16px; }
+  .mobile-platform .composer-controls { gap: 8px; }
+  .mobile-recognition { gap: 6px; }
+}
+
+.mobile-platform .transcript-scroll:has(.capture-panel) { display: flex; }
+@media (max-height: 480px) {
+  .mobile-platform .workspace { overflow-y: auto; overscroll-behavior: contain; }
+  .mobile-platform .transcript-scroll { flex: none; overflow: visible; }
+  .mobile-platform .record-empty { height: auto; min-height: 120px; }
+  .mobile-platform .record-toolbar, .mobile-platform .audio-bar { flex: none; }
 }

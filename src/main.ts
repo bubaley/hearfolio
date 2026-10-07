@@ -1,5 +1,5 @@
 import './styles.css';
-import {call, pickAudio, exportText, subscribe, subscribeAudioDrop, registerPreviewFile, audioSource, openExternal, pickStorageParent, loadRuntimePlatform, previewCapabilities, appVersion, checkDesktopUpdate, latestAndroidRelease, restartApp, isNewerVersion, preview, type Entry, type Progress, type Settings, type CloudModel, type RecognitionConfig, type RuntimeCapabilities, type AndroidRelease, type AppUpdate} from './api';
+import {call, pickAudio, startAudioRecording, stopAudioRecording, cancelAudioRecording, discardAudioRecording, exportText, subscribe, subscribeAudioDrop, registerPreviewFile, audioSource, openExternal, pickStorageParent, loadRuntimePlatform, previewCapabilities, appVersion, checkDesktopUpdate, latestAndroidRelease, restartApp, isNewerVersion, preview, type AudioSelection, type Entry, type Progress, type Settings, type CloudModel, type RecognitionConfig, type RuntimeCapabilities, type AndroidRelease, type AppUpdate} from './api';
 import {icon, escapeHtml as esc} from './icons';
 import {tr, locale, countLabel, errorText, setLanguage, currentLanguage, type LanguagePreference} from './i18n';
 
@@ -15,7 +15,7 @@ const app = document.querySelector<HTMLDivElement>('#app')!;
 let view:View='work', history:Entry[]=[], active:Entry|null=null, text='', busy=false, loading=true;
 let status='', isError=false, progress:Progress|null=null, resultSaved=false, search='', cloudLoading=false;
 let settings:Settings={language:'system',systemLanguage:currentLanguage(),openrouterUrl:'https://openrouter.ai/api/v1',hasToken:false,storageParent:'',storagePath:'',lastConfiguration:{provider:'local',model:'whisper-base',mode:'local'}};
-let platform:RuntimeCapabilities=preview?{...previewCapabilities}:{os:'unknown',mobile:false,localRecognition:false,customStorage:false,nativeAudio:false};
+let platform:RuntimeCapabilities=preview?{...previewCapabilities}:{os:'unknown',mobile:false,localRecognition:false,customStorage:false,nativeAudio:false,audioRecording:false};
 let applicationVersion='',updateChecking=false,updateChecked=false,updateError='',pendingUpdate:AppUpdate|null=null,androidRelease:AndroidRelease|null=null,updateInstalled=false,installedUpdateVersion='',lastNotifiedUpdate='',lastUpdateCheck=0;
 let configuration:RecognitionConfig={...settings.lastConfiguration};
 let localChoice='whisper-base',cloudChoice='',catalogOpen=false,catalogSearch='',catalogError='';
@@ -28,6 +28,9 @@ let operationStarted=0, elapsedTimer:ReturnType<typeof setInterval>|null=null;
 let settingsSaveQueue:Promise<unknown>=Promise.resolve(), previousResult:{text:string;saved:boolean}|null=null;
 let receivedPartial=false, audioPosition=0, audioWasPlaying=false, pickingAudio=false;
 let noticeTimer:ReturnType<typeof setTimeout>|null=null;
+let recordingPhase:'idle'|'starting'|'recording'|'stopping'|'cancelling'='idle', recordingStarted=0, recordingTimer:ReturnType<typeof setInterval>|null=null, pendingRecording:AudioSelection|null=null;
+const microphone=()=>'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><rect x="9" y="2" width="6" height="13" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg>';
+const recordingDuration=()=>formatTime(recordingStarted?Math.floor((Date.now()-recordingStarted)/1000):0);
 document.documentElement.dataset.theme=theme;
 const title:Record<View,string>={work:"Расшифровка",history:"Записи",models:"Модели",settings:"Настройки"};
 const modelName=(id:string|null)=>{const normalized=id?.replace(/^openrouter\//,'');return models.find(model=>model.id===normalized)?.name||cloudModels.find(model=>model.id===normalized)?.name||normalized||tr("Модель не выбрана");};
@@ -95,17 +98,30 @@ function sidebarHtml():string {
   const recent=history.slice(0,window.innerHeight<700?4:6);
   return `${tr("<aside class=\"sidebar\" aria-label=\"Навигация\"><div class=\"sidebar-chrome\" data-tauri-drag-region><button class=\"icon-button\" id=\"collapse\" title=\"Свернуть боковую панель\" aria-label=\"Свернуть боковую панель\" aria-expanded=\"true\">")}${icon('panel')}${tr("</button></div><div class=\"sidebar-body\"><div class=\"brand-row\"><button class=\"brand\" data-view=\"work\" title=\"Hearfolio — расшифровка аудио\">")}${icon('wave')}Hearfolio</button></div><div class="primary-nav"><button class="nav-item" id="new" ${disabled()}>${icon('plus')}${tr("<span>Новая запись</span><kbd>⌘ N</kbd></button><button class=\"nav-item ")}${view==='history'?'active':''}" data-view="history">${icon('search')}${tr("<span>Найти запись</span><kbd>⌘ K</kbd></button></div><div class=\"recent-records\"><div class=\"recent-heading\"><span>Недавние записи</span>")}${history.length?`${tr("<button class=\"text-button\" data-view=\"history\">Все ")}${history.length}</button>`:''}</div>${loading?tr("<div class=\"sidebar-empty\">Загружаем записи…</div>"):historyError?tr("<button class=\"text-button\" id=\"retry-history\">Повторить загрузку</button>"):recent.length?historyItems(recent,true):tr("<div class=\"sidebar-empty\">Здесь появятся ваши записи</div>")}</div><nav class="bottom-nav" aria-label="${tr('Приложение')}">${desktopModelsNav()}<button class="nav-item ${view==='settings'?'active':''}" data-view="settings">${icon('settings')}${tr("<span>Настройки</span></button></nav><div class=\"sidebar-footer\"><span>")}${icon('headphones')}${tr("Личный аудиоархив</span><button class=\"icon-button\" data-theme title=\"")}${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}" aria-label="${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}">${icon(theme==='dark'?'sun':'moon')}</button></div></div></aside>`;
 }
+function mobileCaptureHtml():string {
+  if(recordingPhase!=='idle')return `<div class="capture-panel recording-panel"><div class="recording-indicator">${microphone()}<span>${tr(recordingPhase==='starting'?'Подключаем микрофон…':recordingPhase==='stopping'?'Сохраняем аудио…':recordingPhase==='cancelling'?'Отменяем запись…':'Идёт запись')}</span></div><div class="recording-duration" id="recording-duration" aria-label="${tr('Длительность записи')}">${recordingDuration()}</div><p>${tr('После остановки выберите модель и распознайте аудио.')}</p><button class="primary capture-stop" id="stop-recording" ${recordingPhase!=='recording'?'disabled':''}><span class="stop-symbol"></span>${tr('Остановить и сохранить')}</button><button class="text-button capture-cancel" id="cancel-recording" ${recordingPhase!=='recording'?'disabled':''}>${tr('Отменить запись')}</button></div>`;
+  if(pendingRecording)return `<div class="capture-panel"><div class="empty-symbol">${microphone()}</div><h1>${tr('Аудио записано')}</h1><p>${tr('Добавьте запись в архив, чтобы перейти к распознаванию.')}</p><button class="primary" id="retry-recording" ${disabled()}>${tr('Добавить в архив')}</button><button class="text-button capture-cancel" id="discard-recording" ${disabled()}>${tr('Удалить эту запись')}</button></div>`;
+  return `<div class="capture-panel"><div class="empty-symbol">${icon('wave')}</div><h1>${tr('Начните с аудио')}</h1><p>${tr('Запишите голосовую заметку или выберите готовый файл.')}</p>${platform.audioRecording?`<button class="primary capture-start" id="start-recording" ${disabled()}>${microphone()}${tr('Записать аудио')}</button>`:''}<button class="secondary capture-file" data-choose ${disabled()}>${icon('plus')}${tr('Выбрать аудиофайл')}</button><small>${audioFormats}</small></div>`;
+}
 function outputHtml():string {
+  if(platform.mobile&&!active)return mobileCaptureHtml();
   if (text) return `<article class="transcript">${esc(text)}</article>`;
   if (active) return `<div class="record-empty"><div class="empty-symbol">${icon('wave')}</div><h2>${busy&&progress?.kind==='transcribe'?tr("Распознаём запись…"):tr("Запись готова к распознаванию")}</h2><p>${busy&&progress?.kind==='transcribe'?tr("Текст будет появляться здесь по мере обработки."):tr("Выберите способ распознавания внизу и нажмите «Распознать».")}</p></div>`;
   return `<div class="welcome" id="drop-area"><div class="empty-symbol">${icon('wave')}${tr("</div><h1>Превратите запись в текст</h1><p>Встреча, интервью или голосовая заметка —<br>добавьте аудиофайл, чтобы начать.</p><button class=\"secondary choose-file\" data-choose ")}${disabled()}>${icon('plus')}${tr("Выбрать аудиофайл<kbd>⌘ O</kbd></button><small>")}${platform.mobile?'':tr("Или перетащите файл сюда")+' · '}${audioFormats}</small></div>`;
 }
 function resultMeta():string {return busy&&progress?.kind==='transcribe'?tr("Распознавание…"):text?`${countLabel(words(),'word')} · ${resultSaved?tr("Сохранено в архиве"):tr("Неполный текст · не сохранён")}`:tr("Аудиофайл");}
 function providerControlsHtml():string {
+  if(platform.mobile)return `<div class="mobile-recognition"><div class="recognition-service"><span>${tr('Сервис')}</span><strong>${icon('cloud')}OpenRouter</strong></div>${cloudControlsHtml()}</div>`;
   if(!platform.localRecognition)return `<span class="mobile-provider">${icon('cloud')}OpenRouter</span><span class="control-divider"></span>${cloudControlsHtml()}`;
   return `${tr("<label class=\"control-select provider-select\"><span class=\"sr-only\">Способ распознавания</span>")}${icon(configuration.provider==='local'?'headphones':'cloud')}<select id="provider" ${disabled()}><option value="local" ${configuration.provider==='local'?'selected':''}${tr(">На устройстве</option><option value=\"openrouter\" ")}${configuration.provider==='openrouter'?'selected':''}>OpenRouter</option></select></label><span class="control-divider"></span>${configuration.provider==='local'?`${tr("<label class=\"control-select model-select\"><span class=\"sr-only\">Локальная модель</span><select id=\"local-model\" ")}${disabled()}>${models.map(model=>`<option value="${model.id}" ${configuration.model===model.id?'selected':''}>${model.name}${model.installed?'':tr(" · скачать")}</option>`).join('')}</select></label>`:cloudControlsHtml()}`;
 }
-function cloudControlsHtml():string {return `<div class="cloud-picker"><button type="button" class="cloud-model-control" id="cloud-picker-toggle" aria-haspopup="dialog" aria-expanded="${catalogOpen}" ${disabled()}><span>${esc(cloudModels.find(model=>model.id===configuration.model)?.name||configuration.model||tr("Выбрать модель"))}</span>${icon('chevron')}</button>${cloudModels.some(model=>model.id===configuration.model)?`<small class="recognition-mode">${configuration.mode==='transcription'?tr("Аудиотранскрибация"):tr("Потоковый текст")}</small>`:''}${catalogOpen?catalogHtml():''}</div>`;}
+function cloudControlsHtml():string {
+  const model=cloudModels.find(item=>item.id===configuration.model),label=model?.name||configuration.model||tr('Выбрать модель');
+  const button=`<button type="button" class="cloud-model-control" id="cloud-picker-toggle" aria-haspopup="dialog" aria-expanded="${catalogOpen}" ${disabled()}><span>${esc(label)}</span>${icon('chevron')}</button>`;
+  const mode=model?(configuration.mode==='transcription'?tr('Аудиотранскрибация'):tr('Потоковый текст')):tr('Выбирается автоматически');
+  if(platform.mobile)return `<div class="recognition-model"><span class="recognition-label">${tr('Модель')}</span>${button}</div><div class="recognition-mode-row"><span>${tr('Режим')}</span><span>${mode}</span></div>`;
+  return `<div class="cloud-picker">${button}${model?`<small class="recognition-mode">${mode}</small>`:''}${catalogOpen?catalogHtml():''}</div>`;
+}
 function catalogHtml():string {
   const matches=cloudModels.filter(model=>`${model.name} ${model.id}`.toLocaleLowerCase().includes(catalogSearch.toLocaleLowerCase()));
   return `${tr("<section class=\"model-catalog\" role=\"dialog\" aria-label=\"Модели OpenRouter\"><div class=\"catalog-heading\"><strong>Модели OpenRouter</strong><button type=\"button\" class=\"icon-button\" id=\"catalog-close\" aria-label=\"Закрыть\">")}${icon('close')}</button></div><label class="search-field">${icon('search')}${tr("<input type=\"search\" id=\"catalog-search\" placeholder=\"Найти модель\" value=\"")}${esc(catalogSearch)}${tr("\" aria-label=\"Найти модель\"></label><div id=\"catalog-results\">")}${catalogResults(matches)}</div><button type="button" class="text-button" id="catalog-refresh" ${cloudLoading?'disabled':''}${tr(">Обновить каталог</button></section>")}`;
@@ -121,6 +137,7 @@ function runButtonHtml(issue:string):string {
   return `<button class="run-button ${active&&!busy?'with-label':''}" id="run" ${busy||!active||issue?'disabled':''} title="${esc(issue||(!active?tr("Добавьте аудиофайл"):label+' · ⌘ Enter'))}" aria-label="${label}">${active&&!busy?`<span>${label}</span>`:''}${busy&&progress?.kind==='transcribe'?'<span class="spinner"></span>':icon('arrow')}</button>`;
 }
 function composerHtml(issue:string):string {
+  if(platform.mobile&&!active)return progress?`<div class="composer-area"><div id="progress">${progressHtml()}</div></div>`:'';
   const needsDownload=configuration.provider==='local'&&runtime.ffmpeg&&!models.find(model=>model.id===localChoice)?.installed;
   const needsCatalog=configuration.provider==='openrouter'&&(platform.nativeAudio||runtime.ffmpeg)&&settings.hasToken;
   const action=needsDownload?`data-download="${localChoice}"`:needsCatalog?'id="open-catalog"':configuration.provider==='openrouter'&&(platform.nativeAudio||runtime.ffmpeg)?'data-view="settings"':'data-view="models"';
@@ -167,13 +184,13 @@ function settingsHtml():string {
   return `<div class="page-heading"><div><h1>${tr('Настройки')}</h1><p>${tr('Язык, подключение и расположение вашего архива.')}</p></div></div><form id="settings-form" class="settings-panel"><section class="settings-section"><h2>${tr('Язык приложения')}</h2><label class="field"><span>${tr('Язык')}</span><select name="language"><option value="system" ${draft.language==='system'?'selected':''}>${tr('Системный')}</option><option value="ru" ${draft.language==='ru'?'selected':''}>${tr('Русский')}</option><option value="en" ${draft.language==='en'?'selected':''}>English</option></select><small>${tr('Системный язык определяется по настройкам устройства.')}</small></label></section><section class="settings-section"><div class="section-heading"><h2>OpenRouter</h2><span class="badge ${settings.hasToken?'success':''}">${settings.hasToken?tr('Токен подключён'):tr('Нужен API token')}</span></div><p>${tr('Аудио отправляется выбранному провайдеру. Стоимость и обработка данных зависят от модели.')}</p><label class="field"><span>API URL</span><input name="url" type="url" required value="${esc(draft.url)}" placeholder="https://openrouter.ai/api/v1"><small>${tr('Измените адрес для другого совместимого сервиса.')}</small></label><label class="field"><span>API token</span><input name="token" type="password" autocomplete="off" value="${esc(draft.token)}" placeholder="${settings.hasToken?tr('Введите новый токен для замены'):'sk-or-…'}"><small>${settings.hasToken?tr('Оставьте поле пустым, чтобы использовать сохранённый токен.'):tr('Токен хранится в настройках приложения на этом устройстве.')}</small></label>${settings.hasToken?`<button type="button" id="remove-token" class="text-button danger">${tr('Удалить сохранённый токен')}</button>`:''}</section>${storageSettingsHtml()}${mobileAppearanceHtml()}<div class="settings-actions"><button class="primary" type="submit" ${busy||!settingsDraft?'disabled':''}>${tr('Применить')}</button><span>${settingsDraft?tr('Есть неприменённые изменения'):''}</span></div></form><section class="settings-section about-section"><h2>${tr('О приложении')}</h2><div class="app-version"><strong>Hearfolio</strong><span>${tr('Версия')} ${esc(applicationVersion||'…')}</span></div><div id="about-updates">${updatesHtml()}</div></section>`;
 }
 function mobileNavHtml():string {
-  return `<nav class="mobile-nav" aria-label="${tr('Навигация')}">${(['work','history',...(platform.localRecognition?['models']:[]),'settings'] as View[]).map(target=>`<button type="button" data-view="${target}" class="${view===target?'active':''}" ${target==='work'&&busy?'disabled':''}>${icon(target==='work'?'wave':target==='history'?'history':target)}<span>${tr(title[target])}</span></button>`).join('')}</nav>`;
+  return `<nav class="mobile-nav" aria-label="${tr('Навигация')}">${(['work','history',...(platform.localRecognition?['models']:[]),'settings'] as View[]).map(target=>`<button type="button" data-view="${target}" class="${view===target?'active':''}" ${recordingPhase!=='idle'||(target==='work'&&busy)?'disabled':''}>${icon(target==='work'?'wave':target==='history'?'history':target)}<span>${tr(title[target])}</span></button>`).join('')}</nav>`;
 }
 function updateHeaderHtml():string {
   return pendingUpdate||androidRelease||updateInstalled?`<button type="button" class="text-button update-shortcut" data-view="settings">${icon('download')}<span>${tr(updateInstalled?'Нужен перезапуск':'Доступно обновление')}</span></button>`:'';
 }
 function updatesHtml():string {
-  if(platform.os!=='android'&&platform.os!=='macos'&&platform.os!=='linux')return `<p>${tr('Обновления на этой платформе недоступны.')}</p>`;
+  if(platform.os!=='android'&&platform.os!=='macos'&&platform.os!=='linux'&&platform.os!=='windows')return `<p>${tr('Обновления на этой платформе недоступны.')}</p>`;
   if(updateInstalled)return `<p>${tr('Обновление установлено. Перезапустите приложение, когда закончите работу.')}</p><button type="button" class="secondary" id="restart-update" ${busy?'disabled':''}>${tr('Перезапустить приложение')}</button>`;
   const version=pendingUpdate?.version||androidRelease?.version;
   return `<p>${platform.mobile?tr('На Android обновление устанавливается вручную из APK. Ваш архив останется в приложении.'):tr('Обновления проверяются автоматически. Установка и перезапуск выполняются по вашему запросу.')}</p>${version?`<div class="update-offer"><span>${tr('Доступно обновление')} <strong>${esc(version)}</strong></span><button type="button" class="secondary" id="install-update" ${busy||updateChecking?'disabled':''}>${tr(platform.mobile?'Открыть APK':'Установить обновление')}</button></div>`:''}${updateError?`<p class="update-error" role="alert">${esc(tr(updateError))}</p>`:updateChecked&&!version?`<p class="update-checked">${tr('Установлена последняя версия')}</p>`:''}<button type="button" class="text-button" id="check-update" ${busy||updateChecking?'disabled':''}>${tr(updateChecking?'Проверяем обновления…':'Проверить обновления')}</button>`;
@@ -183,7 +200,7 @@ function refreshUpdateUi() {
   const header=document.querySelector('#update-header');if(header){header.innerHTML=updateHeaderHtml();header.querySelector<HTMLElement>('[data-view]')?.addEventListener('click',()=>changeView('settings'));}
 }
 async function checkUpdates(manual=false) {
-  if(busy||updateChecking||updateInstalled||(!platform.mobile&&platform.os!=='macos'&&platform.os!=='linux')||platform.os==='ios')return;
+  if(busy||updateChecking||updateInstalled||(!platform.mobile&&platform.os!=='macos'&&platform.os!=='linux'&&platform.os!=='windows')||platform.os==='ios')return;
   if(preview&&!manual)return;
   updateChecking=true;updateError='';lastUpdateCheck=Date.now();refreshUpdateUi();
   try{
@@ -231,7 +248,7 @@ function preservePlayback() {
 function render() {
   preservePlayback();
   document.documentElement.dataset.platform=platform.os;
-  app.innerHTML=`<div class="shell ${sidebarCollapsed?'sidebar-collapsed':''} ${platform.mobile?'mobile-platform':''}">${sidebarHtml()}<main><header class="main-header" data-tauri-drag-region><div class="header-title" data-tauri-drag-region>${!platform.mobile?`${tr("<button class=\"icon-button\" id=\"expand\" title=\"Показать боковую панель\" aria-label=\"Показать боковую панель\" aria-expanded=\"false\">")}${icon('panel')}</button>`:''}<span data-tauri-drag-region>${esc(view==='work'?(active?.name||tr("Новая расшифровка")):tr(title[view]))}</span></div><button type="button" class="icon-button mobile-new" id="mobile-new" aria-label="${tr('Новая запись')}" ${disabled()}>${icon('plus')}</button><div class="header-status"><div id="update-header">${updateHeaderHtml()}</div>${busy?`<span class="header-activity"><span class="spinner"></span>${progress?.kind==='download'?tr("Скачиваем модель"):progress?.kind==='import'?tr("Добавляем запись"):progress?.kind==='storage'?tr('Переносим архив'):progress?.kind==='update'?tr('Устанавливаем обновление'):tr("Распознаём")}</span>`:''}${preview?tr("<span class=\"preview-label\">Предпросмотр</span>"):''}</div></header><div class="main-surface ${view==='work'?'work-surface':''}">${view==='work'?workHtml():`<div class="page-scroll"><div class="page-content">${view==='history'?historyHtml():view==='models'?modelsHtml():settingsHtml()}${busy?`<div id="progress">${progressHtml()}</div>`:''}</div></div>`}<div id="status" class="notice ${isError?'error':''}" role="status" aria-live="polite"></div></div>${mobileNavHtml()}</main></div>`;
+  app.innerHTML=`<div ${platform.mobile&&catalogOpen?'inert':''} class="shell ${sidebarCollapsed?'sidebar-collapsed':''} ${platform.mobile?'mobile-platform':''}">${sidebarHtml()}<main><header class="main-header" data-tauri-drag-region><div class="header-title" data-tauri-drag-region>${!platform.mobile?`${tr("<button class=\"icon-button\" id=\"expand\" title=\"Показать боковую панель\" aria-label=\"Показать боковую панель\" aria-expanded=\"false\">")}${icon('panel')}</button>`:''}<span data-tauri-drag-region>${esc(view==='work'?(active?.name||tr("Новая расшифровка")):tr(title[view]))}</span></div><button type="button" class="icon-button mobile-new" id="mobile-new" aria-label="${tr('Новая запись')}" ${disabled()}>${icon('plus')}</button><div class="header-status"><div id="update-header">${updateHeaderHtml()}</div>${busy?`<span class="header-activity"><span class="spinner"></span>${recordingPhase!=='idle'?tr('Запись аудио'):progress?.kind==='download'?tr("Скачиваем модель"):progress?.kind==='import'?tr("Добавляем запись"):progress?.kind==='storage'?tr('Переносим архив'):progress?.kind==='update'?tr('Устанавливаем обновление'):tr("Распознаём")}</span>`:''}${preview?tr("<span class=\"preview-label\">Предпросмотр</span>"):''}</div></header><div class="main-surface ${view==='work'?'work-surface':''}">${view==='work'?workHtml():`<div class="page-scroll"><div class="page-content">${view==='history'?historyHtml():view==='models'?modelsHtml():settingsHtml()}${busy?`<div id="progress">${progressHtml()}</div>`:''}</div></div>`}<div id="status" class="notice ${isError?'error':''}" role="status" aria-live="polite"></div></div>${mobileNavHtml()}</main></div>${platform.mobile&&catalogOpen?`<div class="catalog-backdrop" id="catalog-backdrop">${catalogHtml()}</div>`:''}`;
   bind();updateNotice();restorePlayback();
 }
 function restorePlayback() {
@@ -241,9 +258,10 @@ function restorePlayback() {
   audio.addEventListener('error',()=>{const bar=document.querySelector('.audio-bar');if(bar)bar.innerHTML=tr("<span class=\"playback-error\">Не удалось воспроизвести этот формат. Файл можно распознать.</span>");});
 }
 function resetPlayback() {audioPosition=0;audioWasPlaying=false;const audio=document.querySelector<HTMLAudioElement>('#audio');if(audio){audio.pause();audio.currentTime=0;}}
-async function mayReplaceRecord() {return !text||resultSaved||await confirmAction(tr("Неполный текст не сохранён"),tr("Скопируйте или экспортируйте текст, чтобы сохранить его. При переходе к другой записи этот результат будет потерян."),tr("Продолжить без текста"),false);}
+async function mayReplaceRecord() {if(!await discardPendingRecording())return false;return !text||resultSaved||await confirmAction(tr("Неполный текст не сохранён"),tr("Скопируйте или экспортируйте текст, чтобы сохранить его. При переходе к другой записи этот результат будет потерян."),tr("Продолжить без текста"),false);}
 async function mayLeaveSettings() {return !settingsDraft||await confirmAction(tr("Изменения не применены"),tr("Примените настройки перед уходом или продолжите без этих изменений."),tr("Продолжить без изменений"),false);}
 async function changeView(target:View) {
+  if(recordingPhase!=='idle')return;
   if(target==='models'&&!platform.localRecognition)return;
   if (view==='settings'&&target!=='settings') {if(!await mayLeaveSettings())return;settingsDraft=null;}
   view=target;status='';if(window.innerWidth<=760)sidebarCollapsed=true;render();if(target==='history')document.querySelector<HTMLInputElement>('#history-search')?.focus();
@@ -254,6 +272,11 @@ function bindRecordActions() {
   document.querySelectorAll<HTMLElement>('[data-rename]').forEach(element=>element.onclick=()=>renameEntry(element.dataset.rename!));
 }
 function bind() {
+  document.querySelector('#start-recording')?.addEventListener('click',startRecording);
+  document.querySelector('#stop-recording')?.addEventListener('click',stopRecording);
+  document.querySelector('#cancel-recording')?.addEventListener('click',cancelRecording);
+  document.querySelector('#retry-recording')?.addEventListener('click',()=>{if(pendingRecording&&!busy)void importSelection(pendingRecording);});
+  document.querySelector('#discard-recording')?.addEventListener('click',async()=>{if(await discardPendingRecording())render();});
   document.querySelectorAll<HTMLElement>('[data-view]').forEach(element=>element.onclick=()=>changeView(element.dataset.view as View));
   document.querySelectorAll('[data-choose]').forEach(element=>element.addEventListener('click',()=>choose()));
   document.querySelector('#new')?.addEventListener('click',newRecord);
@@ -331,11 +354,18 @@ function chooseConfiguration(next:RecognitionConfig) {
   render();
 }
 function bindCatalogOptions() {
-  document.querySelectorAll<HTMLElement>('[data-cloud-model]').forEach(element=>element.onclick=()=>{const model=cloudModels.find(item=>item.id===element.dataset.cloudModel);if(model){catalogOpen=false;chooseConfiguration({provider:'openrouter',model:model.id,mode:model.preferredMode});}});
+  document.querySelectorAll<HTMLElement>('[data-cloud-model]').forEach(element=>element.onclick=()=>{const model=cloudModels.find(item=>item.id===element.dataset.cloudModel);if(model){catalogOpen=false;chooseConfiguration({provider:'openrouter',model:model.id,mode:model.preferredMode});document.querySelector<HTMLButtonElement>('#cloud-picker-toggle')?.focus();}});
 }
+function closeCatalog(){catalogOpen=false;render();document.querySelector<HTMLButtonElement>('#cloud-picker-toggle')?.focus();}
 function bindCatalog() {
+  const backdrop=document.querySelector('#catalog-backdrop');
+  backdrop?.addEventListener('click',event=>{if(event.target===backdrop)closeCatalog();});
+  if(platform.mobile&&catalogOpen){
+    const dialog=document.querySelector<HTMLElement>('.model-catalog');dialog?.setAttribute('aria-modal','true');
+    dialog?.addEventListener('keydown',event=>{if(event.key!=='Tab')return;const items=Array.from(dialog.querySelectorAll<HTMLElement>('button:not(:disabled),input'));const first=items[0],last=items[items.length-1];if(event.shiftKey&&document.activeElement===first){event.preventDefault();last?.focus();}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first?.focus();}});
+  }
   document.querySelector('#cloud-picker-toggle')?.addEventListener('click',()=>{catalogOpen=!catalogOpen;render();if(catalogOpen){document.querySelector<HTMLInputElement>('#catalog-search')?.focus();if(!cloudModels.length)void loadCloudModels();}});
-  document.querySelector('#catalog-close')?.addEventListener('click',()=>{catalogOpen=false;render();document.querySelector<HTMLButtonElement>('#cloud-picker-toggle')?.focus();});
+  document.querySelector('#catalog-close')?.addEventListener('click',closeCatalog);
   document.querySelector('#open-catalog')?.addEventListener('click',()=>{catalogOpen=true;render();document.querySelector<HTMLInputElement>('#catalog-search')?.focus();if(!cloudModels.length)void loadCloudModels();});
   document.querySelector('#catalog-refresh')?.addEventListener('click',()=>loadCloudModels());
   document.querySelector<HTMLInputElement>('#catalog-search')?.addEventListener('input',event=>{catalogSearch=(event.target as HTMLInputElement).value;const matches=cloudModels.filter(model=>`${model.name} ${model.id}`.toLocaleLowerCase().includes(catalogSearch.toLocaleLowerCase()));document.querySelector('#catalog-results')!.innerHTML=catalogResults(matches);bindCatalogOptions();});
@@ -365,20 +395,66 @@ async function newRecord() {
   if(busy||!await mayLeaveSettings()||!await mayReplaceRecord())return;
   resetPlayback();settingsDraft=null;active=null;restoreConfiguration();text='';resultSaved=false;previousResult=null;status='';view='work';render();
 }
+async function discardPendingRecording():Promise<boolean> {
+  if(!pendingRecording)return true;
+  if(!await confirmAction(tr('Удалить записанное аудио?'),tr('Эта запись ещё не добавлена в архив и будет потеряна.'),tr('Удалить запись')))return false;
+  busy=true;render();
+  try{await discardAudioRecording(pendingRecording);pendingRecording=null;return true;}
+  catch(error){notice(errorText(error),true);return false;}
+  finally{busy=false;render();}
+}
+function clearRecordingTimer(){if(recordingTimer)clearInterval(recordingTimer);recordingTimer=null;}
+async function startRecording(){
+  if(busy||active||!platform.audioRecording||!await mayLeaveSettings()||!await mayReplaceRecord())return;
+  if(busy||active)return;
+  settingsDraft=null;view='work';recordingPhase='starting';busy=true;status='';recordingStarted=0;render();
+  try{await startAudioRecording();recordingStarted=Date.now();recordingPhase='recording';recordingTimer=setInterval(()=>{const timer=document.querySelector('#recording-duration');if(timer)timer.textContent=recordingDuration();},250);render();}
+  catch(error){recordingPhase='idle';busy=false;render();notice(errorText(error),true);}
+}
+function recordingName(selected:AudioSelection):string {
+  const date=new Date(recordingStarted||Date.now()),pad=(value:number)=>String(value).padStart(2,'0');
+  const day=currentLanguage()==='ru'?`${pad(date.getDate())}.${pad(date.getMonth()+1)}.${date.getFullYear()}`:`${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}`;
+  const extension=(selected.name||selected.path).match(/\.(wav|m4a|webm|ogg|mp3|aac)$/i)?.[1]?.toLowerCase()||(platform.os==='android'?'m4a':'wav');
+  return `${tr('Запись')} ${day} ${pad(date.getHours())}.${pad(date.getMinutes())}.${extension}`;
+}
+async function stopRecording(){
+  if(recordingPhase!=='recording')return;
+  clearRecordingTimer();recordingPhase='stopping';render();
+  try{
+    pendingRecording=await stopAudioRecording();recordingPhase='idle';
+    if(!pendingRecording)throw new Error('errors.recordingEmpty');
+    pendingRecording={...pendingRecording,name:recordingName(pendingRecording)};
+    await importSelection(pendingRecording);
+  }catch(error){await cancelAudioRecording().catch(()=>{});recordingPhase='idle';busy=false;render();notice(errorText(error),true);}
+}
+async function cancelRecording(){
+  if(recordingPhase!=='recording')return;
+  clearRecordingTimer();recordingPhase='cancelling';render();
+  try{await cancelAudioRecording();}catch(error){notice(errorText(error),true);}
+  finally{recordingPhase='idle';recordingStarted=0;busy=false;render();}
+}
+async function importSelection(selected:AudioSelection):Promise<boolean>{
+  beginOperation('import',tr('Добавляем запись'));settingsDraft=null;view='work';render();
+  let imported=false;
+  try{
+    const entry=await call<Entry>('import_audio',{path:selected.path,...(selected.name?{name:selected.name}:{}),configuration:{...(configuration.model.trim()?configuration:settings.lastConfiguration)}});
+    imported=true;pendingRecording=null;resetPlayback();active=entry;restoreConfiguration(entry);text='';resultSaved=false;previousResult=null;
+    const refreshed=await Promise.allSettled([call<Settings>('get_settings'),call<Entry[]>('list_history')]);
+    if(refreshed[0].status==='fulfilled')settings=refreshed[0].value;
+    if(refreshed[1].status==='fulfilled')history=sortHistory(refreshed[1].value);
+    else notice(errorText(refreshed[1].reason),true);
+  }catch(error){notice(`${tr('Не удалось добавить запись: ')}${errorText(error)}`,true);}
+  finally{endOperation();render();}
+  return imported;
+}
 async function choose(path?:string) {
   if(busy||pickingAudio||platform.os==='unknown')return;
-  if(active){notice(tr("Для другого файла создайте новую запись."));return;}
+  if(active){notice(tr('Для другого файла создайте новую запись.'));return;}
   if(!await mayLeaveSettings()||!await mayReplaceRecord())return;
-  pickingAudio=true;let importStarted=false;
-  try {
-    const selected=path?{path}:await pickAudio();if(!selected)return;
-    if(busy||active){if(active)notice(tr("Для другого файла создайте новую запись."));return;}
-    importStarted=true;beginOperation('import',tr("Добавляем запись"));settingsDraft=null;view='work';render();
-    const entry=await call<Entry>('import_audio',{path:selected.path,...('name' in selected&&selected.name?{name:selected.name}:{}),configuration:{...(configuration.model.trim()?configuration:settings.lastConfiguration)}});resetPlayback();active=entry;restoreConfiguration(entry);text='';resultSaved=false;previousResult=null;
-    settings=await call<Settings>('get_settings');
-    history=sortHistory(await call<Entry[]>('list_history'));
-  } catch(error) {notice(`${tr("Не удалось добавить запись: ")}${errorText(error)}`,true);}
-  finally {pickingAudio=false;if(importStarted){endOperation();render();}}
+  pickingAudio=true;
+  try{const selected=path?{path}:await pickAudio();if(selected&&!busy&&!active)await importSelection(selected);}
+  catch(error){notice(`${tr('Не удалось добавить запись: ')}${errorText(error)}`,true);}
+  finally{pickingAudio=false;}
 }
 async function loadHistory(id:string) {
   if(busy||!await mayLeaveSettings())return;
@@ -497,7 +573,7 @@ if(preview&&!previewCapabilities.mobile){
 }
 document.addEventListener('keydown',event=>{
   if(document.querySelector('dialog[open]'))return;
-  if(event.key==='Escape'&&catalogOpen){catalogOpen=false;render();return;}
+  if(event.key==='Escape'&&catalogOpen){closeCatalog();return;}
   if(!(event.metaKey||event.ctrlKey))return;
   const key=event.key.toLowerCase();
   if(key==='o'){event.preventDefault();if(!busy)choose();}
@@ -506,4 +582,7 @@ document.addEventListener('keydown',event=>{
   if(key==='enter'&&view==='work'){event.preventDefault();run();}
   if(key==='b'){event.preventDefault();setSidebar(!sidebarCollapsed);}
 });
-window.addEventListener('beforeunload',event=>{if(settingsDraft||busy||(text&&!resultSaved))event.preventDefault();});
+window.addEventListener('beforeunload',event=>{if(settingsDraft||pendingRecording||busy||(text&&!resultSaved))event.preventDefault();});
+
+function updateCatalogViewport(){const viewport=window.visualViewport;document.documentElement.style.setProperty('--catalog-height',`${viewport?.height||window.innerHeight}px`);document.documentElement.style.setProperty('--catalog-top',`${viewport?.offsetTop||0}px`);}
+updateCatalogViewport();window.visualViewport?.addEventListener('resize',updateCatalogViewport);window.visualViewport?.addEventListener('scroll',updateCatalogViewport);window.addEventListener('resize',updateCatalogViewport);

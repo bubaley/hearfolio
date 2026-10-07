@@ -7,6 +7,7 @@ runs:
       with:
         node-version: '24'
         cache: npm
+        cache-dependency-path: package-lock.json
     - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
       with:
         toolchain: stable
@@ -14,15 +15,51 @@ runs:
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         workspaces: src-tauri -> target
+        shared-key: android-aarch64-ndk27.2.12479018
+        cache-workspace-crates: false
+        cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/main' }}
     - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
       with:
         distribution: temurin
         java-version: '21'
     - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+    - name: Restore fixed Android SDK components
+      id: android-tools
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ env.ANDROID_HOME }}/platforms/android-36
+          ${{ env.ANDROID_HOME }}/build-tools/36.0.0
+          ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+        key: android-tools-v1-${{ runner.os }}-${{ runner.arch }}-sdk36-build36.0.0-ndk27.2.12479018
     - shell: bash
       run: |
         sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;27.2.12479018' 'platform-tools'
         echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
         npm ci
+    - name: Save fixed Android SDK components
+      if: github.ref == 'refs/heads/main' && steps.android-tools.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ env.ANDROID_HOME }}/platforms/android-36
+          ${{ env.ANDROID_HOME }}/build-tools/36.0.0
+          ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+        key: android-tools-v1-${{ runner.os }}-${{ runner.arch }}-sdk36-build36.0.0-ndk27.2.12479018
     - shell: bash
       run: npm run tauri -- android init --ci --skip-targets-install
+    - name: Prepare branded Android resources
+      shell: bash
+      run: node scripts/prepare-android.mjs
+    - name: Restore Gradle dependencies and validate generated wrapper
+      # v5 uses GitHub's cache and supports narrow include/exclude paths.
+      uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
+      with:
+        cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+        gradle-home-cache-includes: |
+          caches
+          wrapper/dists
+        gradle-home-cache-excludes: |
+          caches/build-cache-*
+        validate-wrappers: true

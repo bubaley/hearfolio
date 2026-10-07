@@ -114,12 +114,28 @@ test('Desktop staging fails on missing signatures or ambiguous build products', 
   assert.throws(() => stageDesktop('0.2.0', 'linux_x86_64', bundle, output), /found 2/);
 });
 
-test('Complete manifest maps both Mac architectures, embeds signatures, hashes assets, rejects omissions', t => {
+test('Windows staging requires one NSIS installer and its signature, ignoring application executables', t => {
+  const root = temporary(t);
+  const bundle = join(root, 'bundle');
+  const output = join(root, 'assets');
+  mkdirSync(join(bundle, 'nsis'), { recursive: true });
+  writeFileSync(join(bundle, 'speechdesk.exe'), 'application executable');
+  writeFileSync(join(bundle, 'nsis/Hearfolio_0.2.0_x64-setup.exe'), 'installer');
+  assert.throws(() => stageDesktop('0.2.0', 'windows_x86_64', bundle, output), /\.sig/);
+  writeFileSync(join(bundle, 'nsis/Hearfolio_0.2.0_x64-setup.exe.sig'), 'signature');
+  stageDesktop('0.2.0', 'windows_x86_64', bundle, output);
+  assert.equal(readFileSync(join(output, assetName('0.2.0', 'windows_x86_64', '-setup.exe')), 'utf8'), 'installer');
+  writeFileSync(join(bundle, 'nsis/stale-setup.exe'), 'installer');
+  assert.throws(() => stageDesktop('0.2.0', 'windows_x86_64', bundle, output), /found 2/);
+});
+
+test('Complete manifest maps all desktop targets, embeds signatures, hashes assets, rejects omissions', t => {
   const root = temporary(t);
   const version = '0.2.0';
   for (const [platform, extensions] of Object.entries({
     darwin_universal: ['.dmg', '.app.tar.gz', '.app.tar.gz.sig'],
     linux_x86_64: ['.AppImage', '.AppImage.sig', '.deb', '.deb.sig', '.rpm', '.rpm.sig'],
+    windows_x86_64: ['-setup.exe', '-setup.exe.sig'],
     android_aarch64: ['.apk', '.aab'],
   })) for (const extension of extensions) {
     // Only metadata/schema is under test; real signatures are produced by Tauri.
@@ -129,6 +145,10 @@ test('Complete manifest maps both Mac architectures, embeds signatures, hashes a
   rmSync(aab);
   assert.throws(() => createManifests(version, 'example/hearfolio', root, 'Notes'), /ENOENT/);
   writeFileSync(aab, 'binary');
+  const windowsSignature = join(root, assetName(version, 'windows_x86_64', '-setup.exe.sig'));
+  rmSync(windowsSignature);
+  assert.throws(() => createManifests(version, 'example/hearfolio', root, 'Notes'), /ENOENT/);
+  writeFileSync(windowsSignature, 'A'.repeat(100));
   const v4Sidecar = join(root, `${assetName(version, 'android_aarch64', '.apk')}.idsig`);
   writeFileSync(v4Sidecar, 'optional Android V4 signature');
   writeFileSync(join(root, 'unexpected.txt'), 'unknown file');
@@ -136,15 +156,20 @@ test('Complete manifest maps both Mac architectures, embeds signatures, hashes a
   assert.equal(existsSync(v4Sidecar), false);
   rmSync(join(root, 'unexpected.txt'));
   const result = createManifests(version, 'example/hearfolio', root, 'Notes', '2026-10-07T00:00:00Z');
-  assert.deepEqual(Object.keys(result.manifest.platforms), ['darwin-aarch64', 'darwin-x86_64', 'linux-x86_64', 'linux-x86_64-appimage', 'linux-x86_64-deb', 'linux-x86_64-rpm']);
+  assert.deepEqual(Object.keys(result.manifest.platforms), ['darwin-aarch64', 'darwin-x86_64', 'linux-x86_64', 'linux-x86_64-appimage', 'linux-x86_64-deb', 'linux-x86_64-rpm', 'windows-x86_64', 'windows-x86_64-nsis']);
   assert.deepEqual(result.manifest.platforms['darwin-aarch64'], result.manifest.platforms['darwin-x86_64']);
   assert.match(result.manifest.platforms['linux-x86_64'].url, /releases\/download\/v0\.2\.0\//);
   assert.equal(result.manifest.platforms['linux-x86_64'].signature, 'A'.repeat(100));
   assert.match(result.manifest.platforms['linux-x86_64-deb'].url, /linux_x86_64\.deb$/);
   assert.match(result.manifest.platforms['linux-x86_64-rpm'].url, /linux_x86_64\.rpm$/);
+  assert.match(result.manifest.platforms['windows-x86_64'].url, /windows_x86_64-setup\.exe$/);
+  assert.deepEqual(result.manifest.platforms['windows-x86_64'], result.manifest.platforms['windows-x86_64-nsis']);
   assert.match(result.android.sha256, /^[a-f0-9]{64}$/);
   assert.match(readFileSync(join(root, 'SHA256SUMS.txt'), 'utf8'), /latest-android\.json/);
-  assert.equal(result.assets.length, 14);
+  const windowsInstaller = assetName(version, 'windows_x86_64', '-setup.exe');
+  const binaryHash = createHash('sha256').update('binary').digest('hex');
+  assert.match(readFileSync(join(root, 'SHA256SUMS.txt'), 'utf8'), new RegExp(`${binaryHash}  ${windowsInstaller.replaceAll('.', '\\.')}\\n`));
+  assert.equal(result.assets.length, 16);
 });
 
 test('Minisign verifies the artifact, configured key, and trusted comment; tampering fails', () => {
@@ -165,4 +190,44 @@ test('Minisign verifies the artifact, configured key, and trusted comment; tampe
   key[2] ^= 1;
   const wrongKey = Buffer.from(`untrusted comment: minisign public key\n${key.toString('base64')}\n`).toString('base64');
   assert.throws(() => verifyUpdaterSignature(bytes, encoded, wrongKey), /does not match/);
+});
+
+test('Publisher verifies all five desktop signatures and refuses a tampered Windows installer', t => {
+  const root = temporary(t);
+  const assets = join(root, 'assets');
+  mkdirSync(assets);
+  mkdirSync(join(root, 'src-tauri'));
+  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+  const keyId = randomBytes(8);
+  const key = Buffer.concat([Buffer.from('Ed'), keyId, publicKey.export({ format: 'der', type: 'spki' }).subarray(-32)]);
+  const pubkey = Buffer.from(`untrusted comment: fixture key\n${key.toString('base64')}\n`).toString('base64');
+  writeFileSync(join(root, 'src-tauri/tauri.conf.json'), JSON.stringify({ plugins: { updater: { pubkey } } }));
+  const signed = [
+    ['darwin_universal', '.app.tar.gz'],
+    ['linux_x86_64', '.AppImage'],
+    ['linux_x86_64', '.deb'],
+    ['linux_x86_64', '.rpm'],
+    ['windows_x86_64', '-setup.exe'],
+  ];
+  for (const [platform, extension] of signed) {
+    const name = assetName('0.2.0', platform, extension);
+    const bytes = Buffer.from(`installer ${name}`);
+    const signature = sign(null, createHash('blake2b512').update(bytes).digest(), privateKey);
+    const comment = `file:${name}`;
+    const signatureBytes = Buffer.concat([Buffer.from('ED'), keyId, signature]);
+    const globalSignature = sign(null, Buffer.concat([signature, Buffer.from(comment)]), privateKey);
+    const text = `untrusted comment: fixture signature\n${signatureBytes.toString('base64')}\ntrusted comment: ${comment}\n${globalSignature.toString('base64')}\n`;
+    writeFileSync(join(assets, name), bytes);
+    writeFileSync(join(assets, `${name}.sig`), Buffer.from(text).toString('base64'));
+  }
+  for (const [platform, extension] of [['darwin_universal', '.dmg'], ['android_aarch64', '.apk'], ['android_aarch64', '.aab']]) {
+    writeFileSync(join(assets, assetName('0.2.0', platform, extension)), 'installer');
+  }
+  const notes = join(root, 'notes.md');
+  writeFileSync(notes, 'Notes');
+  const script = resolve(dirname(fileURLToPath(import.meta.url)), 'release-artifacts.mjs');
+  const run = () => execFileSync(process.execPath, [script, 'manifest', '0.2.0', 'example/hearfolio', assets, notes], { cwd: root, encoding: 'utf8', stdio: 'pipe' });
+  assert.match(run(), /Validated 16 release assets/);
+  writeFileSync(join(assets, assetName('0.2.0', 'windows_x86_64', '-setup.exe')), 'tampered installer');
+  assert.throws(run, error => error.status === 1 && /artifact signature verification failed/.test(error.stderr));
 });

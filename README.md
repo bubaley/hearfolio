@@ -4,13 +4,13 @@
 
 Turn audio recordings into text and keep them in a personal archive.
 
-Hearfolio is a compact desktop app for transcribing meetings, interviews, and voice notes. Import a recording, choose an on-device model or OpenRouter, and read the transcript as it becomes available. Return to recordings later to listen, rename them, export their text, or transcribe them again.
+Hearfolio is a compact desktop and Android app for transcribing meetings, interviews, and voice notes. Record audio or import a file, choose an on-device model or OpenRouter, and read the transcript as it becomes available. Return to recordings later to listen, rename them, export their text, or transcribe them again.
 
 Built with Tauri 2, Rust, TypeScript, and Vite. The interface supports English and Russian, follows the device language by default, and can be changed in Settings.
 
 ## Downloads and updates
 
-Download installers from [GitHub Releases](https://github.com/bubaley/hearfolio/releases/latest): macOS (Apple Silicon and Intel), Linux x86_64, and Android arm64. Android uses OpenRouter; on-device Whisper and Nemotron are desktop features. iOS is not distributed.
+Download installers from [GitHub Releases](https://github.com/bubaley/hearfolio/releases/latest): macOS (Apple Silicon and Intel), Windows x86_64 (NSIS installer), Linux x86_64, and Android arm64. Android uses OpenRouter; on-device Whisper and Nemotron are desktop features. iOS is not distributed.
 
 Desktop apps check GitHub for signed updates automatically. Installation and restart are explicit actions, and are unavailable while a recording is being processed. Android offers the new APK for installation through the operating system.
 
@@ -19,6 +19,7 @@ Releases use SemVer derived from Conventional Commits, with a changelog and down
 ## Features
 
 - Import M4A, MP3, WAV, AAC, FLAC, OGG, and MP4 files.
+- Record with the microphone, stop and save the audio, or cancel it. Android records AAC/M4A; desktop records WAV.
 - Transcribe locally with Whisper Tiny, Base, or Small, or Nemotron 3.5 Streaming.
 - Download models from the app with download size, percentage, and estimated time remaining.
 - Connect OpenRouter using a base URL and API token, then choose an audio model from the searchable catalog in the recording. The supported endpoint is selected automatically.
@@ -89,7 +90,11 @@ npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-## Linux and Android
+## Windows, Linux, and Android
+
+On Windows x86_64, run `Hearfolio_VERSION_windows_x86_64-setup.exe` from Releases. The installer downloads WebView2 if it is missing. Updates use the signed installer through the app's update settings. The installer currently has no Microsoft code signing certificate, so SmartScreen can warn on the initial download; see [release signing](docs/releases.md#signing-setup).
+
+Windows source builds require [Tauri's Windows prerequisites](https://tauri.app/start/prerequisites/#windows): Visual Studio C++ Build Tools, WebView2, Node.js, and Rust. Run `npm ci` and `npm run tauri -- build --bundles nsis` in the repository. Local recognition also needs the selected engine runtime on `PATH`.
 
 On Linux x86_64, use the AppImage or install the DEB/RPM package from Releases. For an AppImage, make it executable and run it:
 
@@ -100,9 +105,15 @@ chmod +x Hearfolio_*_linux_x86_64.AppImage
 
 OpenRouter works without additional audio tools. Local recognition needs `ffmpeg` and a built `whisper-cli` or `nemo-speech` on `PATH`; see the [whisper.cpp build instructions](https://github.com/ggml-org/whisper.cpp#quick-start) and [NeMo-Speech.cpp](https://github.com/NVIDIA/NeMo-Speech.cpp). Building the app itself requires the [Tauri Linux prerequisites](https://v2.tauri.app/start/prerequisites/#linux).
 
-On Android arm64, install the signed APK from Releases. Choose an audio document with the system picker, configure OpenRouter, and select a model in the recording. Audio is decoded in the app and text can be exported through the system document picker. The archive is stored in the app's private storage; choosing another archive parent folder is a desktop feature. Removing the Android app removes its private archive, so export transcripts you want to keep.
+On Android arm64, install the signed APK from Releases. Record a voice note or choose an audio document with the system picker, configure OpenRouter, and select a model in the recording. Audio is decoded in the app and text can be exported through the system document picker. The archive is stored in the app's private storage; choosing another archive parent folder is a desktop feature. Removing the Android app removes its private archive, so export transcripts you want to keep.
 
-Android source builds require the [Tauri Android prerequisites](https://v2.tauri.app/start/prerequisites/#android), then `npm run tauri -- android init` and `npm run tauri -- android build --apk --target aarch64`.
+Android source builds require the [Tauri Android prerequisites](https://v2.tauri.app/start/prerequisites/#android), then `npm run tauri -- android init`, `node scripts/prepare-android.mjs`, and `npm run tauri -- android build --apk --target aarch64`.
+
+## Microphone recording
+
+Select **Record audio** on the new recording screen. Allow microphone access when the operating system asks, then select **Stop and save** to review the audio and choose a transcription model. Cancel discards the capture. A failed save keeps the recording available for another attempt.
+
+Keep the app open while recording; background recording is not supported. Recording audio does not send it to OpenRouter until you start transcription with that service selected.
 
 ## Transcription engines
 

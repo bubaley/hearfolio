@@ -31,4 +31,4 @@ cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
 
-The release pipeline builds the exact tagged source and publishes only after every platform artifact is ready. Never commit API tokens, signing keys, recording data, or generated build output.
+The release pipeline builds the exact tagged source for macOS universal, Linux x86_64, Windows x86_64 (NSIS), and Android arm64, then publishes only after every artifact and updater signature is verified. CI compiles Linux and Windows and builds Android without release secrets. Dependency caches are shared across compatible CI/release targets; application bundles and signing keys are not cached. See [release artifacts and caches](docs/releases.md). Never commit API tokens, signing keys, recording data, or generated build output.

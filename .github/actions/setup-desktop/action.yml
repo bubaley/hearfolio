@@ -1,5 +1,10 @@
 name: Set up desktop build
 description: Install pinned Node, Rust, and the Tauri Linux libraries
+inputs:
+  cache-target:
+    description: Rust target or target group shared by CI and release builds
+    required: false
+    default: native
 runs:
   using: composite
   steps:
@@ -7,6 +12,7 @@ runs:
       with:
         node-version: '24'
         cache: npm
+        cache-dependency-path: package-lock.json
     - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
       with:
         toolchain: stable
@@ -14,7 +20,10 @@ runs:
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         workspaces: src-tauri -> target
+        shared-key: desktop-${{ inputs.cache-target }}
+        cache-workspace-crates: false
         cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/main' }}
     - if: runner.os == 'Linux'
       shell: bash
       run: |

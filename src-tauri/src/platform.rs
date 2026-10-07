@@ -17,6 +17,7 @@ pub struct RuntimePlatform {
     local_recognition: bool,
     custom_storage: bool,
     native_audio: bool,
+    audio_recording: bool,
 }
 #[tauri::command]
 pub fn get_runtime_platform() -> RuntimePlatform {
@@ -26,6 +27,7 @@ pub fn get_runtime_platform() -> RuntimePlatform {
         local_recognition: !cfg!(mobile),
         custom_storage: !cfg!(mobile),
         native_audio: true,
+        audio_recording: !cfg!(target_os = "ios"),
     }
 }
 

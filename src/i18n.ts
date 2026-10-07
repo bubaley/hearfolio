@@ -8,6 +8,14 @@ export function setLanguage(value: LanguagePreference,system?:'ru'|'en') { prefe
 export function locale() { return currentLanguage()==='ru'?'ru-RU':'en-US'; }
 // Only translate static UI fragments. User names, transcripts, model IDs and paths never pass through this table.
 const messages: Record<string,string> = {
+  'Запись':'Recording','Начните с аудио':'Start with audio','Запишите голосовую заметку или выберите готовый файл.':'Record a voice memo or choose an existing file.',
+  'Записать аудио':'Record audio','Запись аудио':'Recording audio','Идёт запись':'Recording','Подключаем микрофон…':'Connecting microphone…','Сохраняем аудио…':'Saving audio…','Отменяем запись…':'Cancelling recording…',
+  'Длительность записи':'Recording duration','После остановки выберите модель и распознайте аудио.':'After stopping, choose a model and transcribe the audio.',
+  'Остановить и сохранить':'Stop and save','Отменить запись':'Cancel recording','Аудио записано':'Audio recorded',
+  'Добавьте запись в архив, чтобы перейти к распознаванию.':'Add the recording to your archive to start transcription.',
+  'Добавить в архив':'Add to archive','Удалить эту запись':'Delete this recording','Удалить записанное аудио?':'Delete recorded audio?',
+  'Эта запись ещё не добавлена в архив и будет потеряна.':'This recording has not been added to the archive and will be lost.',
+  'Сервис':'Service','Модель':'Model','Режим':'Mode','Выбирается автоматически':'Selected automatically',
   'Расшифровка':'Transcript','Записи':'Recordings','Модели':'Models','Настройки':'Settings',
   'Модель не выбрана':'No model selected','Проверяем готовность…':'Checking readiness…',
   'Установите FFmpeg для подготовки аудио.':'Install FFmpeg to prepare audio.',
@@ -121,6 +129,12 @@ export function countLabel(count:number,kind:'record'|'word') {
   return `${count} ${forms[form as keyof typeof forms]||forms.other}`;
 }
 const errorMessages:Record<string,[string,string]>={
+  microphonePermissionDenied:['Разрешите доступ к микрофону в настройках устройства.','Allow microphone access in your device settings.'],
+  recordingUnavailable:['Запись с микрофона недоступна на этом устройстве.','Microphone recording is unavailable on this device.'],
+  recordingStart:['Не удалось начать запись. Проверьте доступ к микрофону и повторите попытку.','Could not start recording. Check microphone access and try again.'],
+  recordingStop:['Не удалось сохранить запись. Повторите попытку.','Could not save the recording. Try again.'],
+  recordingDiscard:['Не удалось удалить записанное аудио. Повторите попытку.','Could not delete the recorded audio. Try again.'],
+  recordingEmpty:['Запись не содержит аудио. Запишите ещё раз.','The recording contains no audio. Record again.'],
   localUnavailableMobile:['На Android доступно распознавание через OpenRouter.','Transcription on Android is available through OpenRouter.'],
   storageChangeUnavailableMobile:['На Android архив хранится в папке приложения.','On Android, the archive is stored in the app folder.'],
   audioPathInvalid:['Не удалось открыть выбранный аудиофайл. Выберите его снова.','Could not open the selected audio file. Choose it again.'],

@@ -16,12 +16,12 @@ export type Progress = { kind: 'download' | 'transcribe' | 'import' | 'storage' 
 export type Settings = {language:LanguagePreference;systemLanguage:'ru'|'en';openrouterUrl:string;hasToken:boolean;storageParent:string;storagePath:string;lastConfiguration:RecognitionConfig};
 export type CloudModel = {id:string;name:string;modes:('streaming'|'transcription')[];preferredMode:'streaming'|'transcription'};
 export type RuntimePlatform = 'android'|'macos'|'linux'|'windows'|'ios'|'unknown';
-export type RuntimeCapabilities={os:RuntimePlatform;mobile:boolean;localRecognition:boolean;customStorage:boolean;nativeAudio:boolean};
+export type RuntimeCapabilities={os:RuntimePlatform;mobile:boolean;localRecognition:boolean;customStorage:boolean;nativeAudio:boolean;audioRecording:boolean};
 export type AudioSelection={path:string;name?:string|null};
 export type AndroidRelease = {version:string;url:string;notes?:string;pub_date?:string;sha256?:string};
 export const preview = import.meta.env.DEV && !('__TAURI_INTERNALS__' in window);
 export const previewPlatform:RuntimePlatform = preview&&new URLSearchParams(window.location.search).get('platform')==='android'?'android':'macos';
-export const previewCapabilities:RuntimeCapabilities={os:previewPlatform,mobile:previewPlatform==='android',localRecognition:previewPlatform!=='android',customStorage:previewPlatform!=='android',nativeAudio:true};
+export const previewCapabilities:RuntimeCapabilities={os:previewPlatform,mobile:previewPlatform==='android',localRecognition:previewPlatform!=='android',customStorage:previewPlatform!=='android',nativeAudio:true,audioRecording:true};
 let nativePlatform:RuntimeCapabilities|null=preview?previewCapabilities:null;
 export async function loadRuntimePlatform():Promise<RuntimeCapabilities> {nativePlatform=await call<RuntimeCapabilities>('get_runtime_platform');return nativePlatform;}
 const previewListeners = new Map<string, Set<(payload: unknown) => void>>();
@@ -69,7 +69,7 @@ export async function call<T>(command: string, args: Record<string, unknown> = {
     }
     case 'import_audio': {
       const path = String(args.path); const selected = previewFiles.get(path);
-      const entry: Entry = {id:crypto.randomUUID(),name:selected?.file.name || (args.name?String(args.name):'') || path.split('/').pop() || 'Recording.m4a',configuration:{...(args.configuration as RecognitionConfig || previewSettings.lastConfiguration)},inputPath:path,outputPath:null,model:null,createdAt:Date.now(),sizeBytes:selected?.file.size};
+      const entry: Entry = {id:crypto.randomUUID(),name:(args.name?String(args.name):'') || selected?.file.name || path.split('/').pop() || 'Recording.m4a',configuration:{...(args.configuration as RecognitionConfig || previewSettings.lastConfiguration)},inputPath:path,outputPath:null,model:null,createdAt:Date.now(),sizeBytes:selected?.file.size};
       previewEntries.unshift(entry); value = {...entry}; break;
     }
     case 'get_history': {
@@ -111,6 +111,82 @@ export async function call<T>(command: string, args: Record<string, unknown> = {
 }
 function releasePreviewFile(path: string) { const selected=previewFiles.get(path); if (selected) URL.revokeObjectURL(selected.url); previewFiles.delete(path); }
 export function registerPreviewFile(file: File) { const path=`preview:${crypto.randomUUID()}`; previewFiles.set(path,{file,url:URL.createObjectURL(file)}); return path; }
+
+type BrowserRecording={stream:MediaStream;context:AudioContext;source:MediaStreamAudioSourceNode;processor:ScriptProcessorNode;mute:GainNode;queue:Promise<void>;pending:number;error:Error|null;chunks:Int16Array[]};
+let browserRecording:BrowserRecording|null=null;
+let recordingGeneration=0, recordingStarting=false, fixtureRecording=false;
+let nativeRecordingActive=false;
+function microphoneError(error:unknown):Error {
+  if(typeof error==='string'&&error.startsWith('errors.'))return new Error(error);
+  if(error instanceof Error&&error.message.startsWith('errors.'))return error;
+  const name=error instanceof DOMException?error.name:'';
+  return new Error(name==='NotAllowedError'||name==='SecurityError'?'errors.microphonePermissionDenied':name==='NotFoundError'||name==='NotSupportedError'?'errors.recordingUnavailable':'errors.recordingStart');
+}
+function closeBrowserRecording(recording:BrowserRecording) {
+  recording.processor.onaudioprocess=null;recording.processor.disconnect();recording.source.disconnect();recording.mute.disconnect();
+  recording.stream.getTracks().forEach(track=>track.stop());void recording.context.close().catch(()=>{});
+}
+function recordingWav(chunks:Int16Array[],rate:number):File {
+  const length=chunks.reduce((sum,chunk)=>sum+chunk.length*2,0),header=new ArrayBuffer(44),view=new DataView(header);
+  const text=(offset:number,value:string)=>{for(let index=0;index<value.length;index++)view.setUint8(offset+index,value.charCodeAt(index));};
+  text(0,'RIFF');view.setUint32(4,length+36,true);text(8,'WAVE');text(12,'fmt ');view.setUint32(16,16,true);view.setUint16(20,1,true);view.setUint16(22,1,true);view.setUint32(24,rate,true);view.setUint32(28,rate*2,true);view.setUint16(32,2,true);view.setUint16(34,16,true);text(36,'data');view.setUint32(40,length,true);
+  return new File([header,...chunks.map(chunk=>new Uint8Array(chunk.buffer) as BlobPart)],`Recording-${Date.now()}.wav`,{type:'audio/wav'});
+}
+export async function startAudioRecording():Promise<void> {
+  if(recordingStarting||browserRecording||fixtureRecording||nativeRecordingActive)throw new Error('errors.operationBusy');
+  if(!preview&&nativePlatform?.os==='android'){recordingStarting=true;const generation=++recordingGeneration;try{await call('start_audio_recording');if(generation!==recordingGeneration){await call('cancel_audio_recording');throw new Error('errors.recordingUnavailable');}nativeRecordingActive=true;}finally{recordingStarting=false;}return;}
+  if(preview&&new URLSearchParams(location.search).get('recording')==='fixture'){fixtureRecording=true;return;}
+  if(!navigator.mediaDevices?.getUserMedia||typeof AudioContext==='undefined')throw new Error('errors.recordingUnavailable');
+  recordingStarting=true;const generation=++recordingGeneration;
+  let stream:MediaStream|null=null,context:AudioContext|null=null;
+  try {
+    stream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});
+    if(generation!==recordingGeneration)throw new Error('errors.recordingUnavailable');
+    context=new AudioContext();await context.resume();
+    if(generation!==recordingGeneration)throw new Error('errors.recordingUnavailable');
+    if(!preview)await call('start_audio_recording',{sampleRate:context.sampleRate});
+    if(generation!==recordingGeneration)throw new Error('errors.recordingUnavailable');
+    const source=context.createMediaStreamSource(stream),processor=context.createScriptProcessor(4096,1,1),mute=context.createGain();mute.gain.value=0;
+    const recording:BrowserRecording={stream,context,source,processor,mute,queue:Promise.resolve(),pending:0,error:null,chunks:[]};
+    browserRecording=recording;
+    processor.onaudioprocess=event=>{
+      if(recording.error)return;
+      const input=event.inputBuffer.getChannelData(0),samples=new Int16Array(input.length);
+      for(let i=0;i<input.length;i++){const sample=Math.max(-1,Math.min(1,input[i]));samples[i]=Math.round(sample*(sample<0?32768:32767));}
+      if(preview){recording.chunks.push(samples);return;}
+      // Bound queued IPC chunks; a stalled disk must never buffer an hour in RAM.
+      if(recording.pending>=8){recording.error=new Error('errors.recordingStop');recording.stream.getTracks().forEach(track=>track.stop());return;}
+      recording.pending++;
+      recording.queue=recording.queue.then(()=>call<void>('append_audio_recording',{samples:Array.from(samples)})).catch(()=>{recording.error=new Error('errors.recordingStop');recording.stream.getTracks().forEach(track=>track.stop());}).finally(()=>{recording.pending--;});
+    };
+    source.connect(processor);processor.connect(mute);mute.connect(context.destination);
+  } catch(error) {
+    stream?.getTracks().forEach(track=>track.stop());void context?.close().catch(()=>{});
+    if(!preview)await call('cancel_audio_recording').catch(()=>{});
+    throw microphoneError(error);
+  } finally {recordingStarting=false;}
+}
+export async function stopAudioRecording():Promise<AudioSelection|null> {
+  if(!preview&&nativePlatform?.os==='android'){try{return await call<AudioSelection>('stop_audio_recording');}finally{nativeRecordingActive=false;}}
+  if(fixtureRecording){fixtureRecording=false;const samples=Int16Array.from({length:1600},(_,index)=>Math.round(Math.sin(index*2*Math.PI*440/16000)*1000));const file=recordingWav([samples],16000);return {path:registerPreviewFile(file),name:file.name};}
+  const recording=browserRecording;if(!recording)throw new Error('errors.recordingUnavailable');browserRecording=null;
+  closeBrowserRecording(recording);await recording.queue;
+  if(recording.error){if(!preview)await call('cancel_audio_recording').catch(()=>{});throw recording.error;}
+  if(!preview)return call<AudioSelection>('stop_audio_recording');
+  if(!recording.chunks.length)throw new Error('errors.recordingEmpty');
+  const file=recordingWav(recording.chunks,recording.context.sampleRate);return {path:registerPreviewFile(file),name:file.name};
+}
+export async function cancelAudioRecording():Promise<void> {
+  recordingGeneration++;fixtureRecording=false;
+  nativeRecordingActive=false;
+  const recording=browserRecording;browserRecording=null;
+  if(recording){closeBrowserRecording(recording);await recording.queue;}
+  if(!preview)await call('cancel_audio_recording');
+}
+export async function discardAudioRecording(selection:AudioSelection):Promise<void> {
+  if(preview){releasePreviewFile(selection.path);return;}
+  await call('discard_audio_recording',{path:selection.path});
+}
 export function audioSource(entry: Entry) { return preview ? previewFiles.get(entry.inputPath)?.url || '' : convertFileSrc(entry.inputPath); }
 export async function pickAudio(): Promise<AudioSelection | null> {
   if(!preview&&nativePlatform?.mobile&&nativePlatform.nativeAudio)return call<AudioSelection|null>('pick_audio_file');

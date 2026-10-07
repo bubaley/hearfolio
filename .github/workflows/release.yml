@@ -82,13 +82,22 @@ jobs:
             target: x86_64-unknown-linux-gnu
             platform: linux_x86_64
             bundles: appimage,deb,rpm
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows_x86_64
+            bundles: nsis
     runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-desktop
+        with:
+          cache-target: ${{ matrix.target }}
       - if: runner.os == 'macOS'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Build signed desktop updater and installers

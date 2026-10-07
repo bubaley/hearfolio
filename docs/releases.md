@@ -1,10 +1,10 @@
 # Releases and updates
 
-Hearfolio releases are built by [GitHub Actions](https://github.com/bubaley/hearfolio/actions) and distributed through [GitHub Releases](https://github.com/bubaley/hearfolio/releases). macOS and Linux support signed Tauri updates. Android offers a signed APK download and requires confirmation in Android's installer.
+Hearfolio releases are built by [GitHub Actions](https://github.com/bubaley/hearfolio/actions) and distributed through [GitHub Releases](https://github.com/bubaley/hearfolio/releases). macOS, Windows, and Linux support signed Tauri updates. Android offers a signed APK download and requires confirmation in Android's installer.
 
 ## Automatic release flow
 
-Every push to `main` runs the reusable CI workflow. It validates application versions and Conventional Commits, checks TypeScript/Vite, runs Rust formatting and tests, compiles Linux, and builds an Android arm64 debug APK without release secrets.
+Every push to `main` runs the reusable CI workflow. It validates application versions and Conventional Commits, checks TypeScript/Vite, runs Rust formatting and tests, compiles Linux and Windows, and builds an Android arm64 debug APK without release secrets.
 
 After CI passes, `release.yml` reads commits since the latest stable `vMAJOR.MINOR.PATCH` tag. Its policy is:
 
@@ -31,12 +31,13 @@ Names include the version, such as `Hearfolio_0.2.0_linux_x86_64.AppImage`.
 | --- | --- |
 | macOS Intel and Apple Silicon | Universal `.dmg`, `.app.tar.gz`, `.app.tar.gz.sig` |
 | Linux x86_64 | `.AppImage`, `.deb`, `.rpm`, and a `.sig` for each |
+| Windows x86_64 | NSIS `-setup.exe` and `-setup.exe.sig` |
 | Android arm64 | Signed `.apk` and signed `.aab` |
 | Update metadata | `latest.json`, `latest-android.json`, `SHA256SUMS.txt` |
 
 Per-platform release artifacts and the assembled release are retained in Actions for 30 days. The CI debug APK is retained for 7 days. Published releases retain the downloadable assets independently of Actions retention. The AAB is a distribution artifact for a future store submission; this workflow does not upload to Google Play.
 
-`latest.json` contains `darwin-aarch64`, `darwin-x86_64`, and Linux entries for `linux-x86_64-appimage`, `linux-x86_64-deb`, and `linux-x86_64-rpm`, plus the generic `linux-x86_64` AppImage fallback. Both Mac entries use the same universal archive. Each URL names a concrete version tag; each signature embeds the corresponding `.sig` content, as required by the [Tauri updater contract](https://v2.tauri.app/plugin/updater/#static-json-file). The desktop endpoint is `https://github.com/bubaley/hearfolio/releases/latest/download/latest.json`.
+The complete release contains 16 files and five desktop updater signatures. `latest.json` contains `darwin-aarch64`, `darwin-x86_64`, Linux entries for `linux-x86_64-appimage`, `linux-x86_64-deb`, and `linux-x86_64-rpm`, plus the generic `linux-x86_64` AppImage fallback. Windows entries `windows-x86_64` and `windows-x86_64-nsis` both select the NSIS installer. Both Mac entries use the same universal archive. Each URL names a concrete version tag; each signature embeds the corresponding `.sig` content, as required by the [Tauri updater contract](https://tauri.app/plugin/updater/#static-json-file). The desktop endpoint is `https://github.com/bubaley/hearfolio/releases/latest/download/latest.json`.
 
 `latest-android.json` contains `version`, `notes`, `pub_date`, a tag-specific signed APK `url`, and its `sha256`. Android can check `https://github.com/bubaley/hearfolio/releases/latest/download/latest-android.json`; installing the APK still uses Android's explicit installation flow. Tauri's updater plugin is initialized only on desktop. Android packages are signed with the same certificate across releases so that Android accepts installation over an existing version.
 
@@ -61,17 +62,34 @@ The Android signing script decodes the keystore into runner temporary storage, a
 
 macOS currently uses the ad-hoc signing identity `-`, configured in the application. This supports the universal build without an Apple Developer certificate, following [Tauri's GitHub distribution guidance](https://v2.tauri.app/distribute/pipelines/github/). Updater signatures remain enabled. The app is not notarized by Apple: Gatekeeper can require the user to allow the downloaded app. Apple Developer ID signing and notarization require an Apple account, certificate, and additional credentials; follow the [macOS signing guide](https://v2.tauri.app/distribute/sign/macos/) when those become available.
 
+Windows uses an NSIS installer on the native Windows runner. Tauri reuses this installer for updates and produces its `.sig`, following the [Windows updater artifact contract](https://tauri.app/plugin/updater/#building). The existing updater key signs Windows updates; no additional updater secret is needed. The executable currently has no Windows Authenticode certificate. SmartScreen can warn on a browser download; updater signature verification does not establish Microsoft publisher reputation. See [Tauri's Windows code signing guide](https://tauri.app/distribute/sign/windows/) for adding a certificate later. The installer uses Tauri's default WebView2 bootstrapper and downloads the runtime if it is missing; this requires internet access. See the [Windows installer guide](https://tauri.app/distribute/windows-installer/#webview2-installation-options).
+
 ## Repository settings and build environment
 
 The preparation and publication jobs grant their repository `GITHUB_TOKEN` `contents: write`. Checks and build jobs use read permission. Fork PRs run only `pull_request` checks, receive no release secrets, and do not publish. No `pull_request_target` job is used. Actions are pinned to verified commit SHAs.
 
 The repository must permit Actions and allow the release bot to push its version commit to main and create tags. If branch rules require all changes to arrive through PRs, explicitly configure a permitted bot path or adopt a release PR workflow before enabling the automatic release. The workflow fails on a rejected push and does not bypass branch rules. Configure squash merges and use the checked PR title as the squash commit message.
 
-The hosted build environment uses Node.js 24, Rust stable, Ubuntu 24.04 with Tauri's WebKit/GTK libraries, and the current GitHub macOS runner with both Apple Rust targets. Android uses Temurin Java 21, SDK platform 36, build tools 36.0.0, and NDK 27.2.12479018 with the `aarch64-linux-android` Rust target. `tauri android init` creates the generated Android project on each runner; native project overrides should be added to the source workflow if introduced later. Dependency locks are checked for drift after Android builds. Desktop builds use Cargo `--locked`.
+The hosted build environment uses Node.js 24, Rust stable, Ubuntu 24.04 with Tauri's WebKit/GTK libraries, the current GitHub macOS runner with both Apple Rust targets, and the Windows runner's Visual Studio C++ tools with `x86_64-pc-windows-msvc`. Android uses Temurin Java 21, SDK platform 36, build tools 36.0.0, and NDK 27.2.12479018 with the `aarch64-linux-android` Rust target. `tauri android init` creates the generated Android project on each runner, then `scripts/prepare-android.mjs` copies the tracked brand icons and validates launcher resources before compilation. Dependency locks are checked for drift after Android builds. Desktop builds use Cargo `--locked`.
 
 Linux installs GStreamer tools and the `base`, `good`, and `libav` plugin packages. Setup checks M4A demuxing, AAC/MP3 parsers and decoders, and the basic playback pipeline. AppImage's `bundleMediaFramework` setting packages those installed plugins, following [Tauri's media bundling instructions](https://tauri.app/distribute/appimage/#multimedia-support-via-gstreamer). The plugin source directory is assembled from only those three packages, so the bundler does not include unrelated preinstalled `bad` or `ugly` plugins. The exact [CLI 2.11.4 bundler script](https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.11.4/crates/tauri-bundler/src/bundle/linux/appimage/linuxdeploy-plugin-gstreamer.sh) copies that directory and has no hard requirement for the `bad` plugin package. Debian/RPM installations use the system's GStreamer packages.
 
 Application runtime dependencies are separate from these build tools. A successful installer build does not prove that every transcription engine works on every supported device; platform behavior and external audio runtimes are covered in the application documentation.
+
+## Build caches
+
+Subsequent builds restore dependencies from GitHub Actions caches:
+
+| Cache | Scope and invalidation |
+| --- | --- |
+| npm download cache | Runner OS and `package-lock.json`; each build still runs `npm ci` |
+| Rust registry and compiled dependency crates | OS, Rust toolchain, target group, compiler environment, Cargo manifests and lock; CI and release share the same target key |
+| Android SDK platform, build tools, NDK | Runner OS/architecture and the exact SDK/NDK versions listed above |
+| Gradle dependencies, compiled build scripts, wrapper distributions | Gradle's official setup action; restores compatible dependency entries across CI and release jobs |
+
+Rust uses [rust-cache](https://github.com/Swatinem/rust-cache), which removes the application's workspace crate and nondependency build output before saving. Release builds always compile the current application and package new installers. A lock change can restore compatible dependency crates and recompile changed ones; a Rust toolchain change starts a new cache. Gradle setup is pinned to v5.0.2, which uses GitHub's cache directly and permits the selected `caches` and `wrapper/dists` paths while excluding local task output caches. Its wrapper validator checks the Android wrapper created by Tauri. Configuration cache is not saved because no encryption key is supplied. See the [setup-gradle v5 caching contract](https://github.com/gradle/actions/blob/v5.0.2/docs/setup-gradle.md#caching-build-state-between-jobs).
+
+Rust, Gradle, and Android tool caches are written only by main runs. PRs can restore those caches. Generated Android project directories, app bundles, installers, and signing keys are never cached. The first build for a new target, toolchain, or SDK version remains a cold build; cache hits reduce dependency downloads and compilation without promising a fixed build duration. Inspect each cache step and the Gradle job summary for restore receipts.
 
 ## Retry and local validation
 

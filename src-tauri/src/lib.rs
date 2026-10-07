@@ -1,6 +1,7 @@
 mod audio;
 mod cloud;
 mod platform;
+mod recording;
 mod records;
 mod storage;
 use cloud::RecognitionConfig;
@@ -87,6 +88,12 @@ fn bin(name: &str) -> Option<PathBuf> {
     if cfg!(mobile) {
         return None;
     }
+    let executable = if cfg!(windows) && Path::new(name).extension().is_none() {
+        format!("{name}.exe")
+    } else {
+        name.into()
+    };
+    let name = executable.as_str();
     let mut paths = std::env::var_os("PATH")
         .map(|path| {
             std::env::split_paths(&path)
@@ -103,8 +110,8 @@ fn bin(name: &str) -> Option<PathBuf> {
     ] {
         paths.push(PathBuf::from(dir).join(name));
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        paths.push(PathBuf::from(home).join(".local/bin").join(name));
+    if let Ok(home) = storage::home_dir() {
+        paths.push(home.join(".local/bin").join(name));
     }
     paths
         .into_iter()
@@ -199,7 +206,7 @@ fn nemo_downloaded_bytes() -> u64 {
     let root = std::env::var_os("NEMO_SPEECH_MODEL_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+            let home = storage::home_dir().unwrap_or_default();
             #[cfg(target_os = "macos")]
             {
                 home.join("Library/Caches/NeMoSpeech/models")
@@ -535,6 +542,7 @@ async fn import_audio(
             let _ = fs::remove_file(target);
             return Err(e);
         }
+        recording::imported(source);
         Ok(entry)
     })
     .await
@@ -1120,6 +1128,8 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(tauri_plugin_recording::init());
     #[cfg(desktop)]
     let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1134,6 +1144,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            recording::start_audio_recording,
+            recording::append_audio_recording,
+            recording::stop_audio_recording,
+            recording::cancel_audio_recording,
+            recording::discard_audio_recording,
             platform::get_runtime_platform,
             platform::pick_audio_file,
             platform::export_text,

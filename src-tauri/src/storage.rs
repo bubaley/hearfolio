@@ -58,7 +58,7 @@ pub fn config_dir() -> Result<PathBuf, String> {
     }
     #[cfg(not(mobile))]
     {
-        let home = PathBuf::from(std::env::var_os("HOME").ok_or("errors.homeMissing")?);
+        let home = home_dir()?;
         #[cfg(target_os = "macos")]
         let path = home.join("Library/Application Support/Hearfolio");
         #[cfg(not(target_os = "macos"))]
@@ -70,6 +70,21 @@ pub fn config_dir() -> Result<PathBuf, String> {
         fs::create_dir_all(&path).map_err(|e| format!("errors.settingsSave|{e}"))?;
         Ok(path)
     }
+}
+
+pub fn home_dir() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME");
+    #[cfg(windows)]
+    let home = home
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .or_else(|| {
+            let mut drive = std::env::var_os("HOMEDRIVE")?;
+            drive.push(std::env::var_os("HOMEPATH")?);
+            Some(drive)
+        });
+    home.filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| "errors.homeMissing".into())
 }
 
 pub fn ensure_dirs(root: &Path) -> Result<(), String> {
@@ -143,7 +158,7 @@ pub fn active_root() -> Result<PathBuf, String> {
         let _lock = STORAGE_LOCK
             .lock()
             .map_err(|_| "errors.storageUnavailable")?;
-        let home = PathBuf::from(std::env::var_os("HOME").ok_or("errors.homeMissing")?);
+        let home = home_dir()?;
         active_root_at(&home, &config_dir()?)
     }
 }
