@@ -3,6 +3,7 @@ mod cloud;
 mod platform;
 mod recording;
 mod records;
+mod restart;
 mod storage;
 use cloud::RecognitionConfig;
 use records::{
@@ -1137,6 +1138,8 @@ pub fn run() {
     builder
         .setup(|app| {
             storage::initialize(app.handle()).map_err(std::io::Error::other)?;
+            #[cfg(target_os = "macos")]
+            restart::install_menu(app.handle())?;
             if let Ok(root) = base() {
                 app.asset_protocol_scope()
                     .allow_directory(root.join("input"), false)?;
@@ -1144,6 +1147,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            restart::restart_application,
             recording::start_audio_recording,
             recording::append_audio_recording,
             recording::stop_audio_recording,

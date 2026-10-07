@@ -241,7 +241,7 @@ export async function checkDesktopUpdate():Promise<AppUpdate|null> {
     });
   },close:()=>update.close()};
 }
-export async function restartApp() {if(preview)return;const {relaunch}=await import('@tauri-apps/plugin-process');await relaunch();}
+export async function restartApp() {if(preview)return;const platform=nativePlatform||await loadRuntimePlatform();if(platform.os==='macos'){await call('restart_application');return;}const {relaunch}=await import('@tauri-apps/plugin-process');await relaunch();}
 export async function latestAndroidRelease():Promise<AndroidRelease|null> {return call<AndroidRelease|null>('get_latest_android_release');}
 export function isNewerVersion(candidate:string,current:string):boolean {
   const parse=(value:string)=>/^v?(\d+)\.(\d+)\.(\d+)(?:-([\w.-]+))?$/.exec(value);

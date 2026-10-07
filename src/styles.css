@@ -390,15 +390,15 @@ main { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: colu
   .mobile-platform .run-button.with-label { padding: 0 10px; font-size: 11px; }
 }
 
-/* Phone capture and recognition stay in separate, readable steps. */
-.mobile-platform .capture-panel { width: min(100%, 390px); margin: auto; padding: 32px 24px; display: flex; flex-direction: column; align-items: stretch; text-align: center; }
-.mobile-platform .capture-panel .empty-symbol { align-self: center; margin-bottom: 22px; }
-.mobile-platform .capture-panel h1 { font-size: 25px; }
-.mobile-platform .capture-panel p { color: var(--muted); font-size: 13px; line-height: 1.65; margin: 12px 0 27px; }
-.mobile-platform .capture-panel>.primary, .mobile-platform .capture-panel>.secondary { min-height: 48px; font-size: 14px; border-radius: 9px; }
-.mobile-platform .capture-file { margin-top: 10px; }
-.mobile-platform .capture-panel small { color: var(--muted); font-size: 10px; line-height: 1.8; margin-top: 20px; }
-.mobile-platform .capture-cancel { align-self: center; padding: 13px 10px; min-height: 44px; margin-top: 8px; }
+/* Capture uses the same compact controls on desktop and phones. */
+.capture-panel { width: min(100%, 390px); margin: auto; padding: 32px 24px; display: flex; flex-direction: column; align-items: stretch; text-align: center; }
+.capture-panel .empty-symbol { align-self: center; margin-bottom: 22px; }
+.capture-panel h1 { font-size: 25px; }
+.capture-panel p { color: var(--muted); font-size: 13px; line-height: 1.65; margin: 12px 0 27px; }
+.capture-panel>.primary, .capture-panel>.secondary { min-height: 48px; font-size: 14px; border-radius: 9px; }
+.capture-file { margin-top: 10px; }
+.capture-panel small { color: var(--muted); font-size: 10px; line-height: 1.8; margin-top: 20px; }
+.capture-cancel { align-self: center; padding: 13px 10px; min-height: 44px; margin-top: 8px; }
 .recording-indicator { display: flex; align-items: center; justify-content: center; gap: 9px; color: var(--text); font-size: 13px; }
 .recording-indicator svg { color: var(--accent); width: 22px; height: 22px; }
 .recording-duration { font-size: 59px; letter-spacing: -2px; font-weight: 400; font-variant-numeric: tabular-nums; margin-top: 20px; line-height: 1.2; }
@@ -438,18 +438,21 @@ main { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: colu
   .catalog-backdrop { align-items: center; }
   .catalog-backdrop .model-catalog { padding: 8px 14px; }
   .catalog-backdrop .catalog-heading { margin-bottom: 3px; }
-  .mobile-platform .capture-panel { padding-top: 18px; padding-bottom: 18px; }
-  .mobile-platform .capture-panel .empty-symbol { display: none; }
+  .capture-panel { padding-top: 18px; padding-bottom: 18px; }
+  .capture-panel .empty-symbol { display: none; }
   .recording-duration { font-size: 42px; margin-top: 8px; }
-  .mobile-platform .capture-panel p { margin: 10px 0 16px; }
+  .capture-panel p { margin: 10px 0 16px; }
   .mobile-platform .composer-controls { gap: 8px; }
   .mobile-recognition { gap: 6px; }
 }
 
-.mobile-platform .transcript-scroll:has(.capture-panel) { display: flex; }
+.transcript-scroll:has(.capture-panel) { display: flex; }
 @media (max-height: 480px) {
   .mobile-platform .workspace { overflow-y: auto; overscroll-behavior: contain; }
   .mobile-platform .transcript-scroll { flex: none; overflow: visible; }
   .mobile-platform .record-empty { height: auto; min-height: 120px; }
   .mobile-platform .record-toolbar, .mobile-platform .audio-bar { flex: none; }
 }
+
+.welcome-actions { display: flex; justify-content: center; flex-wrap: wrap; gap: 9px; }
+.welcome-actions .choose-file { margin: 0; }

@@ -98,16 +98,16 @@ function sidebarHtml():string {
   const recent=history.slice(0,window.innerHeight<700?4:6);
   return `${tr("<aside class=\"sidebar\" aria-label=\"Навигация\"><div class=\"sidebar-chrome\" data-tauri-drag-region><button class=\"icon-button\" id=\"collapse\" title=\"Свернуть боковую панель\" aria-label=\"Свернуть боковую панель\" aria-expanded=\"true\">")}${icon('panel')}${tr("</button></div><div class=\"sidebar-body\"><div class=\"brand-row\"><button class=\"brand\" data-view=\"work\" title=\"Hearfolio — расшифровка аудио\">")}${icon('wave')}Hearfolio</button></div><div class="primary-nav"><button class="nav-item" id="new" ${disabled()}>${icon('plus')}${tr("<span>Новая запись</span><kbd>⌘ N</kbd></button><button class=\"nav-item ")}${view==='history'?'active':''}" data-view="history">${icon('search')}${tr("<span>Найти запись</span><kbd>⌘ K</kbd></button></div><div class=\"recent-records\"><div class=\"recent-heading\"><span>Недавние записи</span>")}${history.length?`${tr("<button class=\"text-button\" data-view=\"history\">Все ")}${history.length}</button>`:''}</div>${loading?tr("<div class=\"sidebar-empty\">Загружаем записи…</div>"):historyError?tr("<button class=\"text-button\" id=\"retry-history\">Повторить загрузку</button>"):recent.length?historyItems(recent,true):tr("<div class=\"sidebar-empty\">Здесь появятся ваши записи</div>")}</div><nav class="bottom-nav" aria-label="${tr('Приложение')}">${desktopModelsNav()}<button class="nav-item ${view==='settings'?'active':''}" data-view="settings">${icon('settings')}${tr("<span>Настройки</span></button></nav><div class=\"sidebar-footer\"><span>")}${icon('headphones')}${tr("Личный аудиоархив</span><button class=\"icon-button\" data-theme title=\"")}${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}" aria-label="${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}">${icon(theme==='dark'?'sun':'moon')}</button></div></div></aside>`;
 }
-function mobileCaptureHtml():string {
+function captureHtml():string {
   if(recordingPhase!=='idle')return `<div class="capture-panel recording-panel"><div class="recording-indicator">${microphone()}<span>${tr(recordingPhase==='starting'?'Подключаем микрофон…':recordingPhase==='stopping'?'Сохраняем аудио…':recordingPhase==='cancelling'?'Отменяем запись…':'Идёт запись')}</span></div><div class="recording-duration" id="recording-duration" aria-label="${tr('Длительность записи')}">${recordingDuration()}</div><p>${tr('После остановки выберите модель и распознайте аудио.')}</p><button class="primary capture-stop" id="stop-recording" ${recordingPhase!=='recording'?'disabled':''}><span class="stop-symbol"></span>${tr('Остановить и сохранить')}</button><button class="text-button capture-cancel" id="cancel-recording" ${recordingPhase!=='recording'?'disabled':''}>${tr('Отменить запись')}</button></div>`;
   if(pendingRecording)return `<div class="capture-panel"><div class="empty-symbol">${microphone()}</div><h1>${tr('Аудио записано')}</h1><p>${tr('Добавьте запись в архив, чтобы перейти к распознаванию.')}</p><button class="primary" id="retry-recording" ${disabled()}>${tr('Добавить в архив')}</button><button class="text-button capture-cancel" id="discard-recording" ${disabled()}>${tr('Удалить эту запись')}</button></div>`;
   return `<div class="capture-panel"><div class="empty-symbol">${icon('wave')}</div><h1>${tr('Начните с аудио')}</h1><p>${tr('Запишите голосовую заметку или выберите готовый файл.')}</p>${platform.audioRecording?`<button class="primary capture-start" id="start-recording" ${disabled()}>${microphone()}${tr('Записать аудио')}</button>`:''}<button class="secondary capture-file" data-choose ${disabled()}>${icon('plus')}${tr('Выбрать аудиофайл')}</button><small>${audioFormats}</small></div>`;
 }
 function outputHtml():string {
-  if(platform.mobile&&!active)return mobileCaptureHtml();
+  if(!active&&(platform.mobile||recordingPhase!=='idle'||pendingRecording))return captureHtml();
   if (text) return `<article class="transcript">${esc(text)}</article>`;
   if (active) return `<div class="record-empty"><div class="empty-symbol">${icon('wave')}</div><h2>${busy&&progress?.kind==='transcribe'?tr("Распознаём запись…"):tr("Запись готова к распознаванию")}</h2><p>${busy&&progress?.kind==='transcribe'?tr("Текст будет появляться здесь по мере обработки."):tr("Выберите способ распознавания внизу и нажмите «Распознать».")}</p></div>`;
-  return `<div class="welcome" id="drop-area"><div class="empty-symbol">${icon('wave')}${tr("</div><h1>Превратите запись в текст</h1><p>Встреча, интервью или голосовая заметка —<br>добавьте аудиофайл, чтобы начать.</p><button class=\"secondary choose-file\" data-choose ")}${disabled()}>${icon('plus')}${tr("Выбрать аудиофайл<kbd>⌘ O</kbd></button><small>")}${platform.mobile?'':tr("Или перетащите файл сюда")+' · '}${audioFormats}</small></div>`;
+  return `<div class="welcome" id="drop-area"><div class="empty-symbol">${icon('wave')}</div><h1>${tr('Превратите запись в текст')}</h1><p>${tr('Встреча, интервью или голосовая заметка —')}<br>${tr(platform.audioRecording?'выберите аудиофайл или запишите голос.':'добавьте аудиофайл, чтобы начать.')}</p><div class="welcome-actions"><button class="secondary choose-file" data-choose ${disabled()}>${icon('plus')}${tr('Выбрать аудиофайл')}<kbd>⌘ O</kbd></button>${platform.audioRecording?`<button class="secondary choose-file" id="start-recording" ${disabled()}>${microphone()}${tr('Записать аудио')}</button>`:''}</div><small>${tr('Или перетащите файл сюда')} · ${audioFormats}</small></div>`;
 }
 function resultMeta():string {return busy&&progress?.kind==='transcribe'?tr("Распознавание…"):text?`${countLabel(words(),'word')} · ${resultSaved?tr("Сохранено в архиве"):tr("Неполный текст · не сохранён")}`:tr("Аудиофайл");}
 function providerControlsHtml():string {
@@ -137,7 +137,7 @@ function runButtonHtml(issue:string):string {
   return `<button class="run-button ${active&&!busy?'with-label':''}" id="run" ${busy||!active||issue?'disabled':''} title="${esc(issue||(!active?tr("Добавьте аудиофайл"):label+' · ⌘ Enter'))}" aria-label="${label}">${active&&!busy?`<span>${label}</span>`:''}${busy&&progress?.kind==='transcribe'?'<span class="spinner"></span>':icon('arrow')}</button>`;
 }
 function composerHtml(issue:string):string {
-  if(platform.mobile&&!active)return progress?`<div class="composer-area"><div id="progress">${progressHtml()}</div></div>`:'';
+  if(!active&&(platform.mobile||recordingPhase!=='idle'||pendingRecording))return progress?`<div class="composer-area"><div id="progress">${progressHtml()}</div></div>`:'';
   const needsDownload=configuration.provider==='local'&&runtime.ffmpeg&&!models.find(model=>model.id===localChoice)?.installed;
   const needsCatalog=configuration.provider==='openrouter'&&(platform.nativeAudio||runtime.ffmpeg)&&settings.hasToken;
   const action=needsDownload?`data-download="${localChoice}"`:needsCatalog?'id="open-catalog"':configuration.provider==='openrouter'&&(platform.nativeAudio||runtime.ffmpeg)?'data-view="settings"':'data-view="models"';
@@ -228,18 +228,18 @@ async function installUpdate() {
   }catch(error){notice(`${tr('Не удалось установить обновление: ')}${errorText(error)}`,true);}
   finally{endOperation();render();}
 }
-async function restartAfterUpdate() {
-  if(busy||!updateInstalled)return;
-  if(!await mayLeaveSettings()||!await mayReplaceRecord())return;
+async function restartAfterUpdate(requireUpdate=true) {
+  if(busy||(requireUpdate&&!updateInstalled)||!['macos','linux','windows'].includes(platform.os))return;
+  if(!await mayLeaveSettings()||!await mayReplaceRecord(false))return;
   if(!await confirmAction(tr('Перезапустить приложение?'),tr('Текущая работа будет завершена. Сохранённые записи останутся в архиве.'),tr('Перезапустить'),false))return;
   if(busy)return;
   busy=true;render();
-  try{await restartApp();if(preview){applicationVersion=installedUpdateVersion;updateInstalled=false;busy=false;render();}}catch(error){busy=false;render();notice(`${tr('Не удалось перезапустить приложение: ')}${errorText(error)}`,true);}
+  try{await settingsSaveQueue;await configurationSaveQueue;if(pendingRecording){await discardAudioRecording(pendingRecording);pendingRecording=null;}await restartApp();if(preview){if(updateInstalled)applicationVersion=installedUpdateVersion;updateInstalled=false;busy=false;render();}}catch(error){busy=false;render();notice(`${tr('Не удалось перезапустить приложение: ')}${errorText(error)}`,true);}
 }
 function bindUpdates() {
   document.querySelector('#check-update')?.addEventListener('click',()=>checkUpdates(true));
   document.querySelector('#install-update')?.addEventListener('click',installUpdate);
-  document.querySelector('#restart-update')?.addEventListener('click',restartAfterUpdate);
+  document.querySelector('#restart-update')?.addEventListener('click',()=>restartAfterUpdate());
 }
 function preservePlayback() {
   const audio=document.querySelector<HTMLAudioElement>('#audio');
@@ -258,7 +258,7 @@ function restorePlayback() {
   audio.addEventListener('error',()=>{const bar=document.querySelector('.audio-bar');if(bar)bar.innerHTML=tr("<span class=\"playback-error\">Не удалось воспроизвести этот формат. Файл можно распознать.</span>");});
 }
 function resetPlayback() {audioPosition=0;audioWasPlaying=false;const audio=document.querySelector<HTMLAudioElement>('#audio');if(audio){audio.pause();audio.currentTime=0;}}
-async function mayReplaceRecord() {if(!await discardPendingRecording())return false;return !text||resultSaved||await confirmAction(tr("Неполный текст не сохранён"),tr("Скопируйте или экспортируйте текст, чтобы сохранить его. При переходе к другой записи этот результат будет потерян."),tr("Продолжить без текста"),false);}
+async function mayReplaceRecord(discardRecording=true) {if(pendingRecording){if(discardRecording){if(!await discardPendingRecording())return false;}else if(!await confirmAction(tr('Удалить записанное аудио?'),tr('Эта запись ещё не добавлена в архив и будет потеряна.'),tr('Продолжить без записи'),false))return false;}return !text||resultSaved||await confirmAction(tr("Неполный текст не сохранён"),tr("Скопируйте или экспортируйте текст, чтобы сохранить его. При переходе к другой записи этот результат будет потерян."),tr("Продолжить без текста"),false);}
 async function mayLeaveSettings() {return !settingsDraft||await confirmAction(tr("Изменения не применены"),tr("Примените настройки перед уходом или продолжите без этих изменений."),tr("Продолжить без изменений"),false);}
 async function changeView(target:View) {
   if(recordingPhase!=='idle')return;
@@ -556,6 +556,7 @@ async function initialize() {
   if(!preview)void checkUpdates();
 }
 void initialize();
+subscribe<null>('hearfolio-request-restart',()=>{void restartAfterUpdate(false);}).catch(error=>notice(errorText(error),true));
 setInterval(()=>{if(!preview&&Date.now()-lastUpdateCheck>=4*60*60*1000)void checkUpdates();},4*60*60*1000);
 document.addEventListener('visibilitychange',()=>{if(!preview&&document.visibilityState==='visible'&&Date.now()-lastUpdateCheck>=4*60*60*1000)void checkUpdates();});
 subscribe<Progress>('task-progress',payload=>{if(!busy)return;progress={...payload,stage:errorText(payload.stage),elapsed:Math.max(payload.elapsed,Math.floor((Date.now()-operationStarted)/1000))};updateProgress();}).catch(error=>notice(errorText(error),true));

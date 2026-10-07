@@ -8,7 +8,7 @@ export function setLanguage(value: LanguagePreference,system?:'ru'|'en') { prefe
 export function locale() { return currentLanguage()==='ru'?'ru-RU':'en-US'; }
 // Only translate static UI fragments. User names, transcripts, model IDs and paths never pass through this table.
 const messages: Record<string,string> = {
-  'Запись':'Recording','Начните с аудио':'Start with audio','Запишите голосовую заметку или выберите готовый файл.':'Record a voice memo or choose an existing file.',
+  'выберите аудиофайл или запишите голос.':'choose an audio file or record your voice.','Запись':'Recording','Начните с аудио':'Start with audio','Запишите голосовую заметку или выберите готовый файл.':'Record a voice memo or choose an existing file.',
   'Записать аудио':'Record audio','Запись аудио':'Recording audio','Идёт запись':'Recording','Подключаем микрофон…':'Connecting microphone…','Сохраняем аудио…':'Saving audio…','Отменяем запись…':'Cancelling recording…',
   'Длительность записи':'Recording duration','После остановки выберите модель и распознайте аудио.':'After stopping, choose a model and transcribe the audio.',
   'Остановить и сохранить':'Stop and save','Отменить запись':'Cancel recording','Аудио записано':'Audio recorded',
@@ -68,7 +68,7 @@ const messages: Record<string,string> = {
   'Не удалось воспроизвести этот формат. Файл можно распознать.':'This format cannot be played. You can still transcribe it.',
   'Неполный текст не сохранён':'Partial text is unsaved',
   'Скопируйте или экспортируйте текст, чтобы сохранить его. При переходе к другой записи этот результат будет потерян.':'Copy or export the text to save it. Opening another recording will discard this result.',
-  'Продолжить без текста':'Continue without text','Изменения не применены':'Changes have not been applied',
+  'Продолжить без записи':'Continue without recording','Продолжить без текста':'Continue without text','Изменения не применены':'Changes have not been applied',
   'Примените настройки перед уходом или продолжите без этих изменений.':'Apply your settings before leaving, or continue without these changes.',
   'Продолжить без изменений':'Continue without changes','Скопировано':'Copied','Не удалось скопировать текст: ':'Could not copy text: ',
   'Удалить API token?':'Remove API token?','Для распознавания через OpenRouter потребуется подключить токен снова.':'You will need to reconnect your token to transcribe with OpenRouter.',
@@ -133,6 +133,8 @@ const errorMessages:Record<string,[string,string]>={
   recordingUnavailable:['Запись с микрофона недоступна на этом устройстве.','Microphone recording is unavailable on this device.'],
   recordingStart:['Не удалось начать запись. Проверьте доступ к микрофону и повторите попытку.','Could not start recording. Check microphone access and try again.'],
   recordingStop:['Не удалось сохранить запись. Повторите попытку.','Could not save the recording. Try again.'],
+  restartUnavailable:['Перезапуск недоступен. Закройте приложение и откройте его снова.','Restart is unavailable. Close the app and open it again.'],
+  restartFailed:['Не удалось перезапустить приложение. Закройте его и откройте снова.','Could not restart the app. Close it and open it again.'],
   recordingDiscard:['Не удалось удалить записанное аудио. Повторите попытку.','Could not delete the recorded audio. Try again.'],
   recordingEmpty:['Запись не содержит аудио. Запишите ещё раз.','The recording contains no audio. Record again.'],
   localUnavailableMobile:['На Android доступно распознавание через OpenRouter.','Transcription on Android is available through OpenRouter.'],
