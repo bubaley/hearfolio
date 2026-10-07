@@ -245,6 +245,15 @@ pub fn migrate_at(
             {
                 return Err("errors.storagePathInvalid".into());
             }
+            // Legacy archives used the original transcript mtime as completion
+            // order. Persist it before copying or retargeting the output path.
+            if entry.completed_at.is_none() {
+                entry.completed_at = fs::metadata(source.join(output))
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_millis() as u64);
+            }
             entry.output_path = Some(target.join(output).to_string_lossy().into_owned());
         }
     }
@@ -274,6 +283,12 @@ pub fn migrate_at(
                 .map_err(|e| format!("errors.storageCopy|{e}"))?;
             let mut input =
                 fs::File::open(&original).map_err(|e| format!("errors.storageCopy|{e}"))?;
+            let metadata = input
+                .metadata()
+                .map_err(|e| format!("errors.storageCopy|{e}"))?;
+            let modified = metadata
+                .modified()
+                .map_err(|e| format!("errors.storageCopy|{e}"))?;
             let mut options = fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -300,16 +315,11 @@ pub fn migrate_at(
                 progress(copied + bytes, total);
             }
             output
-                .sync_all()
+                .set_modified(modified)
+                .and_then(|_| output.sync_all())
                 .map_err(|e| format!("errors.storageCopy|{e}"))?;
-            fs::set_permissions(
-                &destination,
-                input
-                    .metadata()
-                    .map_err(|e| format!("errors.storageCopy|{e}"))?
-                    .permissions(),
-            )
-            .map_err(|e| format!("errors.storageCopy|{e}"))?;
+            fs::set_permissions(&destination, metadata.permissions())
+                .map_err(|e| format!("errors.storageCopy|{e}"))?;
             if bytes != size {
                 return Err("errors.storageCopy".into());
             }

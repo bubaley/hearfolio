@@ -880,6 +880,74 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn migration_preserves_legacy_completion_order_and_working_model() {
+        let root = fixture();
+        let source = root.join(".hearing");
+        crate::storage::ensure_dirs(&source).unwrap();
+        let parent = root.join("destination");
+        fs::create_dir(&parent).unwrap();
+        let mut entries = Vec::new();
+        for (id, model, seconds) in [
+            (
+                "hearing-fish",
+                "openrouter/fish-audio/transcribe-1-pro",
+                200,
+            ),
+            ("hearing-nemo", "nemotron-3.5", 100),
+        ] {
+            let input = source.join(format!("input/{id}.wav"));
+            let output = source.join(format!("output/{id}.txt"));
+            for (path, content) in [(&input, "synthetic audio"), (&output, "saved transcript")] {
+                fs::write(path, content).unwrap();
+                fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds))
+                    .unwrap();
+            }
+            entries.push(serde_json::json!({
+                "id": id, "name": id, "inputPath": input, "outputPath": output,
+                "model": model, "createdAt": 1000 - seconds
+            }));
+        }
+        fs::write(
+            source.join("history.json"),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        let target =
+            crate::storage::migrate_at(&source, &parent, &root.join("storage.json"), |_, _| {})
+                .unwrap();
+        let migrated = crate::records::read_history_at(&target).unwrap();
+        for entry in &migrated {
+            let seconds = if entry.id == "hearing-fish" { 200 } else { 100 };
+            assert_eq!(entry.completed_at, Some(seconds * 1000));
+            for path in [&entry.input_path, entry.output_path.as_ref().unwrap()] {
+                assert_eq!(
+                    fs::metadata(path).unwrap().modified().unwrap(),
+                    std::time::UNIX_EPOCH + Duration::from_secs(seconds)
+                );
+            }
+        }
+        // Even subsequent filesystem timestamp changes cannot alter defaults
+        // now that legacy completion times have been recorded in history.
+        fs::File::options()
+            .write(true)
+            .open(target.join("output/hearing-nemo.txt"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now())
+            .unwrap();
+        let mut settings = Settings::default();
+        recover_last_working(&mut settings, &target).unwrap();
+        assert_eq!(settings.last_configuration.provider, "openrouter");
+        assert_eq!(
+            settings.last_configuration.model,
+            "fish-audio/transcribe-1-pro"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn preferences_and_failed_promotion_preserve_token_and_last_working_configuration() {
         let root = fixture();
         let path = root.join("settings.json");
