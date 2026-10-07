@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 (2026-10-07)
+
+### Fixes and performance
+
+- **storage:** preserve completion order when moving recordings ([8a4fc9c](https://github.com/bubaley/hearfolio/commit/8a4fc9c6c274878a0fa338deee9ea0caeca1c918))
+- **release:** package signed Android and Linux media artifacts ([455085c](https://github.com/bubaley/hearfolio/commit/455085cbc673738341ac614838fadae3b075816e))
+- **app:** restore compatible recording modes and Linux media support ([665d2b0](https://github.com/bubaley/hearfolio/commit/665d2b0c37d73440f0b702b9d721cb8e81469f63))
+
 ## 0.2.0 (2026-10-07)
 
 ### Features
