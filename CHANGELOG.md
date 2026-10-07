@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1 (2026-10-07)
+
+### Fixes and performance
+
+- **app:** restore macOS restart and desktop recording ([b814826](https://github.com/bubaley/hearfolio/commit/b81482691dff158e866b4ccf67d4ac3586118f7f))
+
+### Maintenance
+
+- **android:** make cached SDK components writable ([49185d2](https://github.com/bubaley/hearfolio/commit/49185d21687d897fb0dfd7ae4d4d8cabb935d02b))
+
 ## 0.3.0 (2026-10-07)
 
 ### Features
