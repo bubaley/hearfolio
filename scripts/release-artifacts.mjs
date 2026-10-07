@@ -1,5 +1,5 @@
 import { createHash, createPublicKey, verify } from 'node:crypto';
-import { copyFileSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -64,6 +64,14 @@ export function createManifests(version, repository, directory, notes, date = ne
   for (const file of required) {
     const path = join(directory, file);
     if (!statSync(path).isFile() || statSync(path).size === 0) throw new Error(`Missing or empty release asset: ${file}`);
+  }
+  // apksigner enables its optional V4 sidecar by default. It is only needed for
+  // incremental ADB installation, not normal installation of the signed APK.
+  // Older tagged builds may include this one proven extra file; remove only it.
+  const androidV4Sidecar = join(directory, `${assetName(version, 'android_aarch64', '.apk')}.idsig`);
+  if (existsSync(androidV4Sidecar)) {
+    if (!lstatSync(androidV4Sidecar).isFile()) throw new Error('Android V4 sidecar must be a regular file');
+    rmSync(androidV4Sidecar);
   }
   const unexpected = readdirSync(directory).filter(file => !required.includes(file));
   if (unexpected.length) throw new Error(`Unexpected release assets: ${unexpected.join(', ')}`);

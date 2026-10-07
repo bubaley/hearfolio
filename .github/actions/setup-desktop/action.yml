@@ -19,6 +19,23 @@ runs:
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+        sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
+        # Tauri's GStreamer plugin copies every file in its source directory.
+        # Use an explicit directory containing only the selected plugin packages,
+        # even if the hosted runner has other GStreamer plugins preinstalled.
+        media_plugins="$RUNNER_TEMP/hearfolio-gstreamer-plugins"
+        mkdir -p "$media_plugins"
+        for plugin_package in gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav; do
+          while IFS= read -r plugin_file; do
+            if [[ "$plugin_file" == */gstreamer-1.0/*.so && -f "$plugin_file" ]]; then
+              cp "$plugin_file" "$media_plugins/"
+            fi
+          done < <(dpkg -L "$plugin_package")
+        done
+        echo "GSTREAMER_PLUGINS_DIR=$media_plugins" >> "$GITHUB_ENV"
+        for media_element in qtdemux aacparse mpegaudioparse avdec_aac avdec_mp3 audioconvert audioresample decodebin; do
+          env GST_PLUGIN_SYSTEM_PATH_1_0="$media_plugins" GST_PLUGIN_PATH_1_0="$media_plugins" \
+            GST_REGISTRY_1_0="$RUNNER_TEMP/hearfolio-gst-registry.bin" gst-inspect-1.0 "$media_element" > /dev/null
+        done
     - shell: bash
       run: npm ci

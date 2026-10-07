@@ -25,6 +25,7 @@ aab="$destination/Hearfolio_${version}_android_aarch64.aab"
 "$build_tools/zipalign" -f -P 16 4 "${apks[0]}" "$RUNNER_TEMP/hearfolio-aligned.apk"
 "$build_tools/apksigner" sign --ks "$keystore" --ks-key-alias "$ANDROID_KEY_ALIAS" \
   --ks-pass env:ANDROID_KEYSTORE_PASSWORD --key-pass env:ANDROID_KEY_PASSWORD \
+  --v4-signing-enabled false \
   --out "$apk" "$RUNNER_TEMP/hearfolio-aligned.apk"
 "$build_tools/apksigner" verify "$apk"
 cp "${aabs[0]}" "$aab"
