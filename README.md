@@ -6,20 +6,30 @@ Turn audio recordings into text and keep them in a personal archive.
 
 Hearfolio is a compact desktop app for transcribing meetings, interviews, and voice notes. Import a recording, choose an on-device model or OpenRouter, and read the transcript as it becomes available. Return to recordings later to listen, rename them, export their text, or transcribe them again.
 
-Built with Tauri 2, Rust, TypeScript, and Vite. The desktop workflow is currently developed and verified on macOS. The interface is currently in Russian; this README is in English.
+Built with Tauri 2, Rust, TypeScript, and Vite. The interface supports English and Russian, follows the device language by default, and can be changed in Settings.
+
+## Downloads and updates
+
+Download installers from [GitHub Releases](https://github.com/bubaley/hearfolio/releases/latest): macOS (Apple Silicon and Intel), Linux x86_64, and Android arm64. Android uses OpenRouter; on-device Whisper and Nemotron are desktop features. iOS is not distributed.
+
+Desktop apps check GitHub for signed updates automatically. Installation and restart are explicit actions, and are unavailable while a recording is being processed. Android offers the new APK for installation through the operating system.
+
+Releases use SemVer derived from Conventional Commits, with a changelog and downloadable artifacts. See [Release pipeline](docs/releases.md) for the build, signing, and publishing process.
 
 ## Features
 
 - Import M4A, MP3, WAV, AAC, FLAC, OGG, and MP4 files.
 - Transcribe locally with Whisper Tiny, Base, or Small, or Nemotron 3.5 Streaming.
 - Download models from the app with download size, percentage, and estimated time remaining.
-- Connect OpenRouter using a base URL, API token, and model ID.
+- Connect OpenRouter using a base URL and API token, then choose an audio model from the searchable catalog in the recording. The supported endpoint is selected automatically.
 - See processing stages, elapsed time, and partial transcripts. Available progress details depend on the engine.
 - Browse and search recordings by name, play the original audio, and rename recordings.
 - Copy or export transcripts as `.txt` files. Renamed recordings use the new name when exporting text.
 - Run transcription again with another model. A failed retry preserves the previous saved transcript.
 - Delete an individual recording or clear the archive with confirmation.
-- Switch between light and dark themes. The selected engine and model persist across launches.
+- Switch between light and dark themes, and choose English, Russian, or the device language.
+- Keep engine, model, and recognition mode with each recording. New recordings use the last configuration that successfully started returning text.
+- Choose the archive parent folder; Hearfolio creates a `.hearfolio` directory inside it.
 
 ## Getting started on macOS
 
@@ -32,7 +42,7 @@ To develop and build the app, install:
 - Xcode Command Line Tools: `xcode-select --install`.
 - [Homebrew](https://brew.sh/) for the audio runtime tools below.
 
-The packaged app also needs audio runtime tools installed on the computer. `ffmpeg` is used to prepare audio for both local and cloud transcription. Whisper additionally requires `whisper-cli`; Nemotron requires `nemo-speech`.
+On-device transcription needs audio runtime tools installed on the computer. `ffmpeg` prepares local audio, Whisper additionally requires `whisper-cli`, and Nemotron requires `nemo-speech`. OpenRouter uses the built-in audio decoder and needs no external audio tools.
 
 ```sh
 brew install ffmpeg whisper.cpp
@@ -57,7 +67,7 @@ npm ci
 npm run tauri dev
 ```
 
-This is a private repository, so cloning requires GitHub access to it.
+The repository is public. HTTPS cloning is also available: `git clone https://github.com/bubaley/hearfolio.git`.
 
 ### Build
 
@@ -79,6 +89,21 @@ npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
+## Linux and Android
+
+On Linux x86_64, use the AppImage or install the DEB/RPM package from Releases. For an AppImage, make it executable and run it:
+
+```sh
+chmod +x Hearfolio_*_linux_x86_64.AppImage
+./Hearfolio_*_linux_x86_64.AppImage
+```
+
+OpenRouter works without additional audio tools. Local recognition needs `ffmpeg` and a built `whisper-cli` or `nemo-speech` on `PATH`; see the [whisper.cpp build instructions](https://github.com/ggml-org/whisper.cpp#quick-start) and [NeMo-Speech.cpp](https://github.com/NVIDIA/NeMo-Speech.cpp). Building the app itself requires the [Tauri Linux prerequisites](https://v2.tauri.app/start/prerequisites/#linux).
+
+On Android arm64, install the signed APK from Releases. Choose an audio document with the system picker, configure OpenRouter, and select a model in the recording. Audio is decoded in the app and text can be exported through the system document picker. The archive is stored in the app's private storage; choosing another archive parent folder is a desktop feature. Removing the Android app removes its private archive, so export transcripts you want to keep.
+
+Android source builds require the [Tauri Android prerequisites](https://v2.tauri.app/start/prerequisites/#android), then `npm run tauri -- android init` and `npm run tauri -- android build --apk --target aarch64`.
+
 ## Transcription engines
 
 | Engine | Where audio is processed | How text appears |
@@ -96,12 +121,12 @@ Open Settings and enter:
 
 1. The API base URL, normally `https://openrouter.ai/api/v1`.
 2. Your API token.
-3. A compatible model ID. You can load available models or enter an ID manually.
-4. The text delivery mode, then apply the settings.
+3. Apply the connection settings.
+4. In a recording, select OpenRouter and choose a model from the catalog. You can search by model name or ID.
 
-Choose **streaming text** for audio-capable chat models using `/chat/completions`. Choose **transcription** for specialized speech-to-text models using `/audio/transcriptions`, such as `fish-audio/transcribe-1-pro`. The mode must match the model's endpoint.
+The app chooses the supported text delivery mode from the model catalog. Audio-capable chat models use `/chat/completions` with streaming text. Specialized speech-to-text models, such as `fish-audio/transcribe-1-pro`, use `/audio/transcriptions` and return completed chunks. Models and delivery modes are selected in the recording, rather than in global Settings.
 
-Hearfolio converts audio to mono WAV at 16 kHz and sends sequential chunks of up to 30 seconds. Streaming models display text during each response; transcription models display completed chunks. Chunk boundaries can affect recognition of words near the cut.
+Hearfolio decodes audio to mono PCM WAV at its original sample rate and sends sequential chunks of up to 30 seconds. AAC/M4A, MP3, PCM/WAV, FLAC, and Vorbis/OGG codecs are supported by the built-in decoder. Streaming models display text during each response; transcription models display completed chunks. Chunk boundaries can affect recognition of words near the cut.
 
 The saved token can be replaced or removed in Settings. Model availability and pricing are determined by the configured service.
 
@@ -109,7 +134,7 @@ API references: [Audio input](https://openrouter.ai/docs/guides/overview/multimo
 
 ## Archive and storage
 
-Hearfolio stores its data in `~/.hearing/`:
+Choose an archive parent folder in Settings. Hearfolio stores recording data in `.hearfolio/` inside that folder (for example, `~/Documents/.hearfolio/`). The default parent is your home directory. Existing data from the former `~/.hearing/` archive is copied safely on upgrade; the original archive remains available.
 
 | Path | Contents |
 | --- | --- |
@@ -117,12 +142,15 @@ Hearfolio stores its data in `~/.hearing/`:
 | `output/` | Text from completed transcriptions. |
 | `models/` | Downloaded Whisper models. Nemotron uses the NeMo-Speech.cpp model cache. |
 | `temp/` | Temporary processing files. |
-| `history.json` | Recording names, model information, and result paths. |
-| `settings.json` | Engine, model, and connection settings. |
+| `history.json` | Recording names, recognition configurations, model information, and result paths. |
 
 In on-device mode, audio is processed locally. When OpenRouter is selected, audio is sent to the configured API. The archive remains on your computer in both modes.
 
-The OpenRouter token is stored in `settings.json`, with owner-only file permissions (`0600`) on macOS and Linux. It is not returned to the frontend after saving.
+Language, connection settings, the current archive location, and the last working recognition configuration are stored separately in the application configuration directory. The OpenRouter token is kept in its settings file with owner-only permissions (`0600`) on macOS and Linux and is not returned to the frontend after saving.
+
+On macOS, the configuration directory is `~/Library/Application Support/Hearfolio/`. It contains `settings.json` and `storage.json`; choosing another archive folder does not reset the connection or language.
+
+Changing the archive folder copies the current archive and updates recording paths before switching to the new location. Existing source files remain available. An occupied destination archive is rejected to prevent accidental overwrites.
 
 Renaming updates the recording's display name without moving its audio or transcript files. Deletion only removes files recorded in Hearfolio's history; unrelated files in the archive directories are left untouched.
 

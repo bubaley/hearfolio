@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Immutable commit or tag to check
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  conventions:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+      - run: node scripts/release.mjs check
+      - run: node --test scripts/release.test.mjs
+      - run: bash -n scripts/release-android.sh
+      - name: Validate PR title for squash merge
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: node scripts/release.mjs lint-title
+      - name: Validate pushed commit messages
+        if: github.event_name == 'push'
+        env:
+          BASE_SHA: ${{ github.event.before }}
+        run: |
+          if [[ "$BASE_SHA" == 0000000000000000000000000000000000000000 ]]; then
+            node scripts/release.mjs lint-range
+          else
+            node scripts/release.mjs lint-range "$BASE_SHA"
+          fi
+  desktop:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-desktop
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - run: npm run build
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - run: npm run tauri -- build --ci --no-bundle -- --locked
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-android
+      - name: Build Android arm64 without release secrets
+        run: npm run tauri -- android build --ci --debug --apk --target aarch64
+      - name: Ensure Android builds use the checked dependency locks
+        run: git diff --exit-code -- src-tauri/Cargo.lock package-lock.json
+      - name: Upload Android smoke build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-debug-${{ github.run_id }}
+          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 7

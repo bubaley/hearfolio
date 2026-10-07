@@ -1,177 +1,985 @@
-use std::{fs, io::{BufRead, BufReader, Write}, path::Path, time::Duration};
-use serde::{Deserialize, Serialize};
 use base64::Engine;
+use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    io::{BufRead, BufReader, Write},
+    path::Path,
+    sync::Mutex,
+    time::Duration,
+};
 
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all="camelCase")]
-pub struct Settings {
+static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecognitionConfig {
     pub provider: String,
-    pub local_model: String,
-    pub openrouter_url: String,
-    pub openrouter_model: String,
-    #[serde(default="default_mode")]
-    pub openrouter_mode: String,
-    #[serde(default, skip_serializing_if="String::is_empty")]
-    token: String,
+    pub model: String,
+    pub mode: String,
 }
-fn default_mode() -> String { "streaming".into() }
-impl Default for Settings {
-    fn default() -> Self { Self { provider:"local".into(), local_model:"whisper-base".into(), openrouter_url:"https://openrouter.ai/api/v1".into(), openrouter_model:"google/gemini-2.5-flash".into(), openrouter_mode:default_mode(), token:String::new() } }
+impl Default for RecognitionConfig {
+    fn default() -> Self {
+        if cfg!(mobile) {
+            Self {
+                provider: "openrouter".into(),
+                model: "google/gemini-2.5-flash".into(),
+                mode: "streaming".into(),
+            }
+        } else {
+            Self {
+                provider: "local".into(),
+                model: "whisper-base".into(),
+                mode: "local".into(),
+            }
+        }
+    }
 }
-#[derive(Serialize)]
-#[serde(rename_all="camelCase")]
-pub struct PublicSettings {
-    provider:String, local_model:String, openrouter_url:String, openrouter_model:String, openrouter_mode:String, has_token:bool,
-}
-impl Settings {
-    pub fn public(&self) -> PublicSettings { PublicSettings { provider:self.provider.clone(), local_model:self.local_model.clone(), openrouter_url:self.openrouter_url.clone(), openrouter_model:self.openrouter_model.clone(), openrouter_mode:self.openrouter_mode.clone(), has_token:!self.token.is_empty() } }
-    fn validate(&mut self) -> Result<(), String> {
-        if !["streaming","transcription"].contains(&self.openrouter_mode.as_str()) { return Err("Неизвестный режим OpenRouter".into()); }
-        if !["local","openrouter"].contains(&self.provider.as_str()) { return Err("Неизвестный способ распознавания".into()); }
-        if !super::MODELS.iter().any(|(id,_,_)| *id == self.local_model) { return Err("Неизвестная локальная модель".into()); }
-        self.openrouter_url = self.openrouter_url.trim().trim_end_matches('/').into();
-        let url = reqwest::Url::parse(&self.openrouter_url).map_err(|_| "Введите корректный URL API")?;
-        let local = matches!(url.host_str(),Some("localhost" | "127.0.0.1" | "::1"));
-        if url.scheme() != "https" && !(local && url.scheme() == "http") { return Err("URL API должен использовать HTTPS".into()); }
-        if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() { return Err("URL API не должен содержать пароль, параметры или фрагмент".into()); }
-        self.openrouter_model = self.openrouter_model.trim().into();
-        if self.openrouter_model.is_empty() { return Err("Укажите модель OpenRouter".into()); }
+impl RecognitionConfig {
+    pub fn validate(&mut self) -> Result<(), String> {
+        self.model = self.model.trim().to_owned();
+        super::platform::validate_configuration(self)?;
+        match self.provider.as_str() {
+            "local" => {
+                if !super::MODELS.iter().any(|(id, _, _)| *id == self.model) {
+                    return Err("errors.localModelUnknown".into());
+                }
+                self.mode = "local".into();
+            }
+            "openrouter" => {
+                if self.model.is_empty() {
+                    return Err("errors.cloudModelRequired".into());
+                }
+                if !["streaming", "transcription"].contains(&self.mode.as_str()) {
+                    return Err("errors.modeUnknown".into());
+                }
+            }
+            _ => return Err("errors.providerUnknown".into()),
+        }
         Ok(())
     }
 }
-pub fn load() -> Result<Settings,String> {
-    let path = super::base()?.join("settings.json");
-    if !path.exists() { return Ok(Settings::default()); }
-    let mut settings:Settings = serde_json::from_slice(&fs::read(path).map_err(|_| "Не удалось прочитать настройки")?).map_err(|_| "Повреждён файл настроек")?;
-    settings.validate()?; Ok(settings)
+fn default_language() -> String {
+    "system".into()
 }
-fn persist(path:&Path, settings:&Settings) -> Result<(),String> {
-    let temp = path.with_extension("json.tmp");
-    let mut options = fs::OpenOptions::new(); options.write(true).create(true).truncate(true);
-    #[cfg(unix)] { use std::os::unix::fs::{OpenOptionsExt,PermissionsExt}; options.mode(0o600); if temp.exists() { fs::set_permissions(&temp,fs::Permissions::from_mode(0o600)).map_err(|_| "Не удалось защитить настройки")?; } }
-    let mut file = options.open(&temp).map_err(|_| "Не удалось сохранить настройки")?;
-    file.write_all(&serde_json::to_vec_pretty(settings).map_err(|_| "Не удалось сохранить настройки")?).map_err(|_| "Не удалось сохранить настройки")?;
-    file.sync_all().map_err(|_| "Не удалось сохранить настройки")?;
-    fs::rename(temp,path).map_err(|_| "Не удалось сохранить настройки".to_string())
+fn default_url() -> String {
+    "https://openrouter.ai/api/v1".into()
 }
-#[tauri::command]
-pub fn get_settings() -> Result<PublicSettings,String> { Ok(load()?.public()) }
-#[tauri::command]
-pub fn save_settings(mut settings:Settings, token:Option<String>) -> Result<PublicSettings,String> {
-    settings.token = match token { Some(token)=>token, None=>load()?.token }.trim().into(); settings.validate()?;
-    persist(&super::base()?.join("settings.json"),&settings)?; Ok(settings.public())
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Settings {
+    #[serde(default = "default_language")]
+    pub language: String,
+    #[serde(default = "default_url")]
+    pub openrouter_url: String,
+    #[serde(default)]
+    pub last_configuration: RecognitionConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_working_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    token: String,
 }
-fn client() -> Result<reqwest::blocking::Client,String> {
-    reqwest::blocking::Client::builder().redirect(reqwest::redirect::Policy::none()).connect_timeout(Duration::from_secs(20)).timeout(Duration::from_secs(900)).build().map_err(|_| "Не удалось создать HTTP клиент".to_string())
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            language: default_language(),
+            openrouter_url: default_url(),
+            last_configuration: RecognitionConfig::default(),
+            last_working_at: None,
+            token: String::new(),
+        }
+    }
 }
-fn api_error(body:&str, token:&str) -> String {
-    let message = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v|v["error"]["message"].as_str().map(str::to_owned)).unwrap_or_else(||"Сервис вернул ошибку".into());
-    let redacted = if token.is_empty() { message } else { message.replace(token,"[скрыто]") };
-    redacted.chars().take(500).collect()
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsUpdate {
+    pub language: String,
+    pub openrouter_url: String,
 }
 #[derive(Serialize)]
-pub struct CloudModel { id:String, name:String }
-#[tauri::command]
-pub async fn list_openrouter_models() -> Result<Vec<CloudModel>,String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        let s=load()?;
-        let mut request=client()?.get(format!("{}/models",s.openrouter_url));
-        if !s.token.is_empty() { request=request.bearer_auth(&s.token); }
-        let response=request.send().map_err(|_| "Не удалось загрузить список моделей")?;
-        if !response.status().is_success() { return Err(format!("Список моделей: HTTP {}",response.status().as_u16())); }
-        let body:serde_json::Value=response.json().map_err(|_|"Некорректный список моделей")?;
-        let mut models=body["data"].as_array().ok_or("Некорректный список моделей")?.iter().filter(|v| v["architecture"]["output_modalities"].as_array().is_some_and(|a| a.iter().any(|m| m == if s.openrouter_mode == "transcription" {"transcription"} else {"text"}))).filter(|v| v["architecture"]["input_modalities"].as_array().is_some_and(|a|a.iter().any(|m|m=="audio"))).filter_map(|v|Some(CloudModel{id:v["id"].as_str()?.into(),name:v["name"].as_str().unwrap_or(v["id"].as_str()?).into()})).collect::<Vec<_>>();
-        models.sort_by(|a,b|a.name.cmp(&b.name)); Ok(models)
-    }).await.map_err(|_| "Не удалось загрузить модели")?
+#[serde(rename_all = "camelCase")]
+pub struct PublicSettings {
+    language: String,
+    system_language: String,
+    openrouter_url: String,
+    has_token: bool,
+    storage_parent: String,
+    storage_path: String,
+    last_configuration: RecognitionConfig,
 }
-fn consume_sse(reader:impl BufRead, token:&str, mut update:impl FnMut(&str)) -> Result<String,String> {
-    let mut text=String::new(); let mut data=Vec::new(); let mut done=false;
-    let mut event = |data:&mut Vec<String>| -> Result<bool,String> {
-        if data.is_empty() { return Ok(false); }
-        let payload=data.join("\n"); data.clear();
-        if payload.trim()=="[DONE]" { return Ok(true); }
-        let value:serde_json::Value=serde_json::from_str(&payload).map_err(|_|"Некорректный поток OpenRouter")?;
-        if !value["error"].is_null() { return Err(api_error(&payload,token)); }
-        if value["choices"][0]["finish_reason"]=="error" { return Err("OpenRouter прервал распознавание".into()); }
-        if matches!(value["choices"][0]["finish_reason"].as_str(), Some("length" | "content_filter")) { return Err("OpenRouter вернул неполную транскрипцию".into()); }
-        if let Some(delta)=value["choices"][0]["delta"]["content"].as_str() { text.push_str(delta); update(&text); }
+fn system_language() -> String {
+    #[cfg(target_os = "macos")]
+    if let Ok(output) = std::process::Command::new("defaults")
+        .args(["read", "-g", "AppleLanguages"])
+        .output()
+    {
+        if output.status.success() {
+            if let Some(first) = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|l| l.trim().trim_matches(['"', ',', ' ']))
+                .find(|l| !l.is_empty() && *l != "(" && *l != ")")
+            {
+                return if first.to_lowercase().starts_with("ru") {
+                    "ru"
+                } else {
+                    "en"
+                }
+                .into();
+            }
+        }
+    }
+    let locale = std::env::var("LC_ALL")
+        .or_else(|_| std::env::var("LC_MESSAGES"))
+        .or_else(|_| std::env::var("LANG"))
+        .unwrap_or_default();
+    if locale.to_lowercase().starts_with("ru") {
+        "ru"
+    } else {
+        "en"
+    }
+    .into()
+}
+impl Settings {
+    pub fn public(&self) -> Result<PublicSettings, String> {
+        let root = super::base()?;
+        Ok(self.public_at(&root, system_language()))
+    }
+    fn public_at(&self, root: &Path, system_language: String) -> PublicSettings {
+        PublicSettings {
+            language: self.language.clone(),
+            system_language,
+            openrouter_url: self.openrouter_url.clone(),
+            has_token: !self.token.is_empty(),
+            storage_parent: root.parent().unwrap_or(root).to_string_lossy().into_owned(),
+            storage_path: root.to_string_lossy().into_owned(),
+            last_configuration: self.last_configuration.clone(),
+        }
+    }
+    fn validate(&mut self) -> Result<(), String> {
+        if !["system", "ru", "en"].contains(&self.language.as_str()) {
+            return Err("errors.languageUnknown".into());
+        }
+        self.last_configuration.validate()?;
+        self.openrouter_url = self.openrouter_url.trim().trim_end_matches('/').into();
+        let url = reqwest::Url::parse(&self.openrouter_url).map_err(|_| "errors.apiUrlInvalid")?;
+        let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+        if url.scheme() != "https" && !(local && url.scheme() == "http") {
+            return Err("errors.apiUrlHttps".into());
+        }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err("errors.apiUrlUnsafe".into());
+        }
+        Ok(())
+    }
+}
+fn load_at(path: &Path, legacy: &Path) -> Result<Settings, String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match fs::read(legacy) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Settings::default())
+            }
+            Err(_) => return Err("errors.settingsRead".into()),
+        },
+        Err(_) => return Err("errors.settingsRead".into()),
+    };
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| "errors.settingsInvalid")?;
+    let mut settings: Settings =
+        serde_json::from_value(value.clone()).map_err(|_| "errors.settingsInvalid")?;
+    if value.get("lastConfiguration").is_none() {
+        // Old preferences are retained as a compatibility default; new selections never update it.
+        let provider = value["provider"].as_str().unwrap_or("local");
+        settings.last_configuration = RecognitionConfig {
+            provider: provider.into(),
+            model: value[if provider == "openrouter" {
+                "openrouterModel"
+            } else {
+                "localModel"
+            }]
+            .as_str()
+            .unwrap_or(if provider == "openrouter" {
+                "google/gemini-2.5-flash"
+            } else {
+                "whisper-base"
+            })
+            .into(),
+            mode: if provider == "openrouter" {
+                value["openrouterMode"].as_str().unwrap_or("streaming")
+            } else {
+                "local"
+            }
+            .into(),
+        };
+    }
+    if cfg!(mobile) && settings.last_configuration.provider == "local" {
+        settings.last_configuration = RecognitionConfig::default();
+    }
+    settings.validate()?;
+    Ok(settings)
+}
+fn recover_last_working(settings: &mut Settings, archive: &Path) -> Result<(), String> {
+    if settings.last_working_at.is_some() {
+        return Ok(());
+    }
+    let entries = match crate::records::read_history_at(archive) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    let mut last: Option<(u64, RecognitionConfig)> = None;
+    for entry in entries {
+        let (Some(model), Some(output)) = (&entry.model, &entry.output_path) else {
+            continue;
+        };
+        if !fs::read_to_string(output).is_ok_and(|text| !text.trim().is_empty()) {
+            continue;
+        }
+        // configuration can contain a later untested selection; model identifies
+        // the engine that actually produced the saved text.
+        let mut configuration = if let Some(model) = model.strip_prefix("openrouter/") {
+            let mode = entry
+                .configuration
+                .as_ref()
+                .filter(|configuration| {
+                    configuration.provider == "openrouter" && configuration.model == model
+                })
+                .map(|configuration| configuration.mode.clone())
+                .unwrap_or_else(|| "streaming".into());
+            RecognitionConfig {
+                provider: "openrouter".into(),
+                model: model.into(),
+                mode,
+            }
+        } else {
+            RecognitionConfig {
+                provider: "local".into(),
+                model: model.clone(),
+                mode: "local".into(),
+            }
+        };
+        if configuration.validate().is_err() {
+            continue;
+        }
+        let finished = entry
+            .completed_at
+            .or_else(|| {
+                fs::metadata(output)
+                    .ok()?
+                    .modified()
+                    .ok()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_millis() as u64)
+            })
+            .unwrap_or(entry.created_at);
+        if last
+            .as_ref()
+            .is_none_or(|(timestamp, _)| finished > *timestamp)
+        {
+            last = Some((finished, configuration));
+        }
+    }
+    if let Some((_, configuration)) = last {
+        settings.last_configuration = configuration;
+    }
+    Ok(())
+}
+fn load_unlocked() -> Result<Settings, String> {
+    let archive = super::base()?;
+    let mut settings = load_at(
+        &super::storage::config_dir()?.join("settings.json"),
+        &archive.join("settings.json"),
+    )?;
+    recover_last_working(&mut settings, &archive)?;
+    Ok(settings)
+}
+pub fn load() -> Result<Settings, String> {
+    let _lock = SETTINGS_LOCK.lock().map_err(|_| "errors.settingsRead")?;
+    load_unlocked()
+}
+fn persist(path: &Path, settings: &Settings) -> Result<(), String> {
+    let temp = path.with_extension("json.tmp");
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(0o600);
+        if temp.is_file() {
+            fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
+                .map_err(|_| "errors.settingsProtect")?;
+        }
+    }
+    let mut file = options.open(&temp).map_err(|_| "errors.settingsSave")?;
+    file.write_all(&serde_json::to_vec_pretty(settings).map_err(|_| "errors.settingsSave")?)
+        .map_err(|_| "errors.settingsSave")?;
+    file.sync_all().map_err(|_| "errors.settingsSave")?;
+    fs::rename(temp, path).map_err(|_| "errors.settingsSave".to_string())
+}
+pub fn preserve_settings() -> Result<(), String> {
+    let _lock = SETTINGS_LOCK.lock().map_err(|_| "errors.settingsRead")?;
+    persist(
+        &super::storage::config_dir()?.join("settings.json"),
+        &load_unlocked()?,
+    )
+}
+pub fn mark_working(configuration: &RecognitionConfig) -> Result<(), String> {
+    let _lock = SETTINGS_LOCK.lock().map_err(|_| "errors.settingsRead")?;
+    let path = super::storage::config_dir()?.join("settings.json");
+    mark_working_at(&path, &super::base()?.join("settings.json"), configuration)
+}
+fn mark_working_at(
+    path: &Path,
+    legacy: &Path,
+    configuration: &RecognitionConfig,
+) -> Result<(), String> {
+    let mut settings = load_at(path, legacy)?;
+    if settings.last_configuration == *configuration && settings.last_working_at.is_some() {
+        return Ok(());
+    }
+    let mut configuration = configuration.clone();
+    configuration.validate()?;
+    settings.last_configuration = configuration;
+    settings.last_working_at = Some(super::clock());
+    persist(path, &settings)
+}
+#[tauri::command]
+pub fn get_settings() -> Result<PublicSettings, String> {
+    load()?.public()
+}
+fn apply_update(
+    mut current: Settings,
+    update: SettingsUpdate,
+    token: Option<String>,
+) -> Result<Settings, String> {
+    current.language = update.language;
+    current.openrouter_url = update.openrouter_url;
+    if let Some(token) = token {
+        current.token = token.trim().into();
+    }
+    current.validate()?;
+    Ok(current)
+}
+#[tauri::command]
+pub fn save_settings(
+    settings: SettingsUpdate,
+    token: Option<String>,
+) -> Result<PublicSettings, String> {
+    let _lock = SETTINGS_LOCK.lock().map_err(|_| "errors.settingsRead")?;
+    let current = apply_update(load_unlocked()?, settings, token)?;
+    persist(
+        &super::storage::config_dir()?.join("settings.json"),
+        &current,
+    )?;
+    current.public()
+}
+fn client_with_timeout(timeout: u64) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(timeout))
+        .build()
+        .map_err(|_| "errors.httpClient".to_string())
+}
+fn client() -> Result<reqwest::blocking::Client, String> {
+    client_with_timeout(900)
+}
+fn api_error(body: &str, token: &str) -> String {
+    let message = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["error"]["message"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| "Service returned an error".into());
+    let redacted = if token.is_empty() {
+        message
+    } else {
+        message.replace(token, "[redacted]")
+    };
+    redacted.chars().take(500).collect()
+}
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudModel {
+    pub id: String,
+    pub name: String,
+    pub modes: Vec<String>,
+    pub preferred_mode: String,
+}
+fn parse_models(body: &serde_json::Value) -> Result<Vec<CloudModel>, String> {
+    let mut models = vec![];
+    for value in body["data"].as_array().ok_or("errors.catalogInvalid")? {
+        let Some(id) = value["id"].as_str() else {
+            continue;
+        };
+        let has = |field: &str, modality: &str| {
+            value["architecture"][field]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|m| m == modality))
+        };
+        if !has("input_modalities", "audio") {
+            continue;
+        }
+        let mut modes = vec![];
+        if has("output_modalities", "transcription") {
+            modes.push("transcription".to_owned());
+        }
+        if has("output_modalities", "text") {
+            modes.push("streaming".to_owned());
+        }
+        if let Some(preferred_mode) = modes.first().cloned() {
+            models.push(CloudModel {
+                id: id.into(),
+                name: value["name"].as_str().unwrap_or(id).into(),
+                modes,
+                preferred_mode,
+            });
+        }
+    }
+    Ok(models)
+}
+fn catalog(s: &Settings) -> Result<Vec<CloudModel>, String> {
+    let client = client_with_timeout(30)?;
+    let mut models: Vec<CloudModel> = vec![];
+    // The default catalog omits dedicated STT models; ask explicitly for that modality.
+    for transcription in [false, true] {
+        let mut request = client.get(format!("{}/models", s.openrouter_url));
+        if transcription {
+            request = request.query(&[("output_modalities", "transcription")]);
+        }
+        if !s.token.is_empty() {
+            request = request.bearer_auth(&s.token);
+        }
+        let response = request.send().map_err(|_| "errors.catalogLoad")?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "errors.catalogHttp|HTTP {}",
+                response.status().as_u16()
+            ));
+        }
+        let body: serde_json::Value = response.json().map_err(|_| "errors.catalogInvalid")?;
+        for model in parse_models(&body)? {
+            if let Some(existing) = models.iter_mut().find(|m| m.id == model.id) {
+                for mode in model.modes {
+                    if !existing.modes.contains(&mode) {
+                        existing.modes.push(mode);
+                    }
+                }
+                existing.preferred_mode = if existing.modes.iter().any(|m| m == "transcription") {
+                    "transcription"
+                } else {
+                    "streaming"
+                }
+                .into();
+            } else {
+                models.push(model);
+            }
+        }
+    }
+    models.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(models)
+}
+#[tauri::command]
+pub async fn list_openrouter_models() -> Result<Vec<CloudModel>, String> {
+    tauri::async_runtime::spawn_blocking(|| catalog(&load()?))
+        .await
+        .map_err(|_| "errors.catalogLoad")?
+}
+pub fn normalize_configuration(
+    s: &Settings,
+    configuration: &mut RecognitionConfig,
+) -> Result<(), String> {
+    configuration.validate()?;
+    if configuration.provider == "openrouter" {
+        if s.token.is_empty() {
+            return Err("errors.tokenRequired".into());
+        }
+        let models = catalog(s)?;
+        normalize_from_models(configuration, &models)?;
+    }
+    Ok(())
+}
+fn normalize_from_models(
+    configuration: &mut RecognitionConfig,
+    models: &[CloudModel],
+) -> Result<(), String> {
+    let model = models
+        .iter()
+        .find(|m| m.id == configuration.model)
+        .ok_or("errors.cloudModelUnsupported")?;
+    configuration.mode = model.preferred_mode.clone();
+    Ok(())
+}
+fn consume_sse(
+    reader: impl BufRead,
+    token: &str,
+    mut update: impl FnMut(&str),
+) -> Result<String, String> {
+    let mut text = String::new();
+    let mut data = Vec::new();
+    let mut done = false;
+    let mut event = |data: &mut Vec<String>| -> Result<bool, String> {
+        if data.is_empty() {
+            return Ok(false);
+        }
+        let payload = data.join("\n");
+        data.clear();
+        if payload.trim() == "[DONE]" {
+            return Ok(true);
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&payload).map_err(|_| "errors.cloudStreamInvalid")?;
+        if !value["error"].is_null() {
+            return Err(format!(
+                "errors.cloudService|{}",
+                api_error(&payload, token)
+            ));
+        }
+        if value["choices"][0]["finish_reason"] == "error" {
+            return Err("errors.cloudInterrupted".into());
+        }
+        if matches!(
+            value["choices"][0]["finish_reason"].as_str(),
+            Some("length" | "content_filter")
+        ) {
+            return Err("errors.cloudIncomplete".into());
+        }
+        if let Some(delta) = value["choices"][0]["delta"]["content"].as_str() {
+            text.push_str(delta);
+            update(&text);
+        }
         Ok(false)
     };
     for line in reader.lines() {
-        let line=line.map_err(|_|"Соединение OpenRouter прервано")?;
-        if line.is_empty() { if event(&mut data)? { done=true; break; } }
-        else if let Some(value)=line.strip_prefix("data:") { data.push(value.strip_prefix(' ').unwrap_or(value).into()); }
+        let line = line.map_err(|_| "errors.cloudInterrupted")?;
+        if line.is_empty() {
+            if event(&mut data)? {
+                done = true;
+                break;
+            }
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.strip_prefix(' ').unwrap_or(value).into());
+        }
     }
-    if !done { done=event(&mut data)?; }
-    if !done { return Err("OpenRouter завершил соединение до окончания ответа".into()); }
-    if text.trim().is_empty() { return Err("OpenRouter вернул пустой текст".into()); }
+    if !done {
+        done = event(&mut data)?;
+    }
+    if !done {
+        return Err("errors.cloudInterrupted".into());
+    }
+    if text.trim().is_empty() {
+        return Err("errors.emptyTranscript".into());
+    }
     Ok(text.trim().into())
 }
-pub fn transcribe(s:&Settings, audio:&Path, mut update:impl FnMut(&str)) -> Result<String,String> {
-    if s.token.is_empty() { return Err("Добавьте API токен OpenRouter в настройках".into()); }
-    let size=fs::metadata(audio).map_err(|_|"Аудиофайл не найден")?.len();
-    if size > 100*1024*1024 { return Err("Для OpenRouter запись должна быть меньше 100 МБ; выберите локальную модель или сократите запись".into()); }
-    let data=base64::engine::general_purpose::STANDARD.encode(fs::read(audio).map_err(|_|"Не удалось прочитать аудио")?);
-    let format=audio.extension().and_then(|e|e.to_str()).unwrap_or("wav");
-    if s.openrouter_mode == "transcription" {
-        let response=client()?.post(format!("{}/audio/transcriptions",s.openrouter_url)).bearer_auth(&s.token).timeout(Duration::from_secs(75)).json(&serde_json::json!({"model":s.openrouter_model,"input_audio":{"data":data,"format":format}})).send().map_err(|_| "Не удалось связаться с OpenRouter; проверьте URL и подключение")?;
-        let status=response.status(); let body=response.text().map_err(|_|"Не удалось прочитать ответ OpenRouter")?;
-        if !status.is_success() { return Err(format!("OpenRouter HTTP {}: {}",status.as_u16(),api_error(&body,&s.token))); }
-        let value:serde_json::Value=serde_json::from_str(&body).map_err(|_|"Некорректный ответ OpenRouter")?;
-        if !value["error"].is_null() { return Err(api_error(&body,&s.token)); }
-        let text=value["text"].as_str().ok_or("OpenRouter вернул пустой текст")?.trim();
-        if text.is_empty() { return Err("OpenRouter вернул пустой текст".into()); } update(text); return Ok(text.into());
+pub fn transcribe(
+    s: &Settings,
+    configuration: &RecognitionConfig,
+    audio: &Path,
+    mut update: impl FnMut(&str),
+) -> Result<String, String> {
+    if s.token.is_empty() {
+        return Err("errors.tokenRequired".into());
     }
-    let body=serde_json::json!({"model":s.openrouter_model,"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"Transcribe all speech in this audio accurately in its original language. Return only the transcript, without commentary, summaries, or invented content."},{"type":"input_audio","input_audio":{"data":data,"format":format}}]}]});
-    let response=client()?.post(format!("{}/chat/completions",s.openrouter_url)).bearer_auth(&s.token).json(&body).send().map_err(|_|"Не удалось связаться с OpenRouter; проверьте URL и подключение")?;
-    if !response.status().is_success() { let status=response.status().as_u16(); let body=response.text().unwrap_or_default(); return Err(format!("OpenRouter HTTP {status}: {}",api_error(&body,&s.token))); }
-    if response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v|v.to_str().ok()).is_some_and(|v|v.contains("text/event-stream")) {
-        consume_sse(BufReader::new(response),&s.token,&mut update)
+    let size = fs::metadata(audio)
+        .map_err(|_| "errors.audioMissing")?
+        .len();
+    if size > 100 * 1024 * 1024 {
+        return Err("errors.audioTooLarge".into());
+    }
+    let data = base64::engine::general_purpose::STANDARD
+        .encode(fs::read(audio).map_err(|_| "errors.audioRead")?);
+    let format = audio.extension().and_then(|e| e.to_str()).unwrap_or("wav");
+    if configuration.mode == "transcription" {
+        let response=client()?.post(format!("{}/audio/transcriptions",s.openrouter_url)).bearer_auth(&s.token).timeout(Duration::from_secs(75)).json(&serde_json::json!({"model":configuration.model,"input_audio":{"data":data,"format":format}})).send().map_err(|_| "errors.cloudConnect")?;
+        let status = response.status();
+        let body = response.text().map_err(|_| "errors.cloudResponseRead")?;
+        if !status.is_success() {
+            return Err(format!(
+                "errors.cloudHttp|HTTP {}: {}",
+                status.as_u16(),
+                api_error(&body, &s.token)
+            ));
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&body).map_err(|_| "errors.cloudResponseInvalid")?;
+        if !value["error"].is_null() {
+            return Err(format!(
+                "errors.cloudService|{}",
+                api_error(&body, &s.token)
+            ));
+        }
+        let text = value["text"]
+            .as_str()
+            .ok_or("errors.emptyTranscript")?
+            .trim();
+        if text.is_empty() {
+            return Err("errors.emptyTranscript".into());
+        }
+        update(text);
+        return Ok(text.into());
+    }
+    let body = serde_json::json!({"model":configuration.model,"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"Transcribe all speech in this audio accurately in its original language. Return only the transcript, without commentary, summaries, or invented content."},{"type":"input_audio","input_audio":{"data":data,"format":format}}]}]});
+    let response = client()?
+        .post(format!("{}/chat/completions", s.openrouter_url))
+        .bearer_auth(&s.token)
+        .json(&body)
+        .send()
+        .map_err(|_| "errors.cloudConnect")?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.text().unwrap_or_default();
+        return Err(format!(
+            "errors.cloudHttp|HTTP {status}: {}",
+            api_error(&body, &s.token)
+        ));
+    }
+    if response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/event-stream"))
+    {
+        consume_sse(BufReader::new(response), &s.token, &mut update)
     } else {
-        let body=response.text().map_err(|_|"Не удалось прочитать ответ OpenRouter")?;
-        let v:serde_json::Value=serde_json::from_str(&body).map_err(|_|"Некорректный ответ OpenRouter")?;
-        if !v["error"].is_null() { return Err(api_error(&body,&s.token)); }
-        if matches!(v["choices"][0]["finish_reason"].as_str(), Some("length" | "content_filter")) { return Err("OpenRouter вернул неполную транскрипцию".into()); }
-        let text=v["choices"][0]["message"]["content"].as_str().ok_or("OpenRouter вернул пустой текст")?.trim();
-        if text.is_empty() { return Err("OpenRouter вернул пустой текст".into()); } update(text); Ok(text.into())
+        let body = response.text().map_err(|_| "errors.cloudResponseRead")?;
+        let v: serde_json::Value =
+            serde_json::from_str(&body).map_err(|_| "errors.cloudResponseInvalid")?;
+        if !v["error"].is_null() {
+            return Err(format!(
+                "errors.cloudService|{}",
+                api_error(&body, &s.token)
+            ));
+        }
+        if matches!(
+            v["choices"][0]["finish_reason"].as_str(),
+            Some("length" | "content_filter")
+        ) {
+            return Err("errors.cloudIncomplete".into());
+        }
+        let text = v["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or("errors.emptyTranscript")?
+            .trim();
+        if text.is_empty() {
+            return Err("errors.emptyTranscript".into());
+        }
+        update(text);
+        Ok(text.into())
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn stream_handles_comments_unicode_and_done() {
+    #[test]
+    fn stream_handles_comments_unicode_and_done() {
         let stream=": processing\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"Привет \"}}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"мир\"}}]}\n\ndata: [DONE]\n\n";
-        let mut updates=vec![]; assert_eq!(consume_sse(stream.as_bytes(),"",|s|updates.push(s.to_owned())).unwrap(),"Привет мир"); assert_eq!(updates.len(),2);
+        let mut updates = vec![];
+        assert_eq!(
+            consume_sse(stream.as_bytes(), "", |s| updates.push(s.to_owned())).unwrap(),
+            "Привет мир"
+        );
+        assert_eq!(updates.len(), 2);
     }
-    #[test] fn stream_rejects_interruption_and_redacts_error() {
-        assert!(consume_sse(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n".as_slice(),"", |_|{}).is_err());
-        let err=consume_sse(b"data: {\"error\":{\"message\":\"bad secret\"}}\n\n".as_slice(),"secret", |_|{}).unwrap_err(); assert!(!err.contains("secret"));
+    #[test]
+    fn stream_rejects_interruption_and_redacts_error() {
+        assert!(consume_sse(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n".as_slice(),
+            "",
+            |_| {}
+        )
+        .is_err());
+        let err = consume_sse(
+            b"data: {\"error\":{\"message\":\"bad secret\"}}\n\n".as_slice(),
+            "secret",
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(!err.contains("secret"));
     }
-    fn mock_request(mode:&str) {
-        use std::{io::{Read,Write},net::TcpListener,thread};
-        let listener=TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut settings=Settings::default(); settings.token="test-token".into(); settings.openrouter_mode=mode.into();
-        let stt=mode=="transcription"; settings.openrouter_url=format!("http://{}",listener.local_addr().unwrap());
-        let handle=thread::spawn(move || {
-            let (mut socket,_)=listener.accept().unwrap(); socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let mut reader=BufReader::new(socket.try_clone().unwrap()); let mut first=String::new(); reader.read_line(&mut first).unwrap(); assert!(first.starts_with(if stt {"POST /audio/transcriptions "} else {"POST /chat/completions "}));
-            let mut length=0;
-            loop { let mut line=String::new(); reader.read_line(&mut line).unwrap(); if line=="\r\n" {break;} if line.to_lowercase().starts_with("content-length:") {length=line.split(':').nth(1).unwrap().trim().parse::<usize>().unwrap();} }
-            let mut body=vec![0;length]; reader.read_exact(&mut body).unwrap(); let v:serde_json::Value=serde_json::from_slice(&body).unwrap();
-            if stt { assert_eq!(v["input_audio"]["format"],"wav"); assert_eq!(v["input_audio"]["data"],"c2FtcGxl"); } else {
-            assert_eq!(v["stream"],true); assert_eq!(v["messages"][0]["content"][1]["input_audio"]["format"],"wav"); assert_eq!(v["messages"][0]["content"][1]["input_audio"]["data"],"c2FtcGxl"); }
-            let body=if stt {r#"{"text":"hello"}"#} else {"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n"};
+    fn mock_request(mode: &str) {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut settings = Settings::default();
+        settings.token = "test-token".into();
+        let configuration = RecognitionConfig {
+            provider: "openrouter".into(),
+            model: "test/model".into(),
+            mode: mode.into(),
+        };
+        let stt = mode == "transcription";
+        settings.openrouter_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            assert!(first.starts_with(if stt {
+                "POST /audio/transcriptions "
+            } else {
+                "POST /chat/completions "
+            }));
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if line.to_lowercase().starts_with("content-length:") {
+                    length = line
+                        .split(':')
+                        .nth(1)
+                        .unwrap()
+                        .trim()
+                        .parse::<usize>()
+                        .unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if stt {
+                assert_eq!(v["input_audio"]["format"], "wav");
+                assert_eq!(v["input_audio"]["data"], "c2FtcGxl");
+            } else {
+                assert_eq!(v["stream"], true);
+                assert_eq!(
+                    v["messages"][0]["content"][1]["input_audio"]["format"],
+                    "wav"
+                );
+                assert_eq!(
+                    v["messages"][0]["content"][1]["input_audio"]["data"],
+                    "c2FtcGxl"
+                );
+            }
+            let body = if stt {
+                r#"{"text":"hello"}"#
+            } else {
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n"
+            };
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",if stt {"application/json"} else {"text/event-stream"},body.len(),body).unwrap();
         });
-        let path=std::env::temp_dir().join(format!("hearing-mock-{mode}-{}.wav",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos())); fs::write(&path,b"sample").unwrap();
-        assert_eq!(transcribe(&settings,&path, |_|{}).unwrap(),"hello"); handle.join().unwrap(); fs::remove_file(path).unwrap();
-    }
-    #[test] fn mock_server_validates_stream_request() { mock_request("streaming"); }
-    #[test] fn mock_server_validates_transcription_request() { mock_request("transcription"); }
-    #[test] fn settings_are_private_and_token_not_public() {
-        let path=std::env::temp_dir().join(format!("hearing-settings-{}.json",super::super::clock())); let mut s=Settings::default(); s.token="secret".into(); persist(&path,&s).unwrap();
-        assert!(!serde_json::to_string(&s.public()).unwrap().contains("secret"));
-        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777,0o600); }
+        let path = std::env::temp_dir().join(format!(
+            "hearing-mock-{mode}-{}.wav",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"sample").unwrap();
+        assert_eq!(
+            transcribe(&settings, &configuration, &path, |_| {}).unwrap(),
+            "hello"
+        );
+        handle.join().unwrap();
         fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn mock_server_validates_stream_request() {
+        mock_request("streaming");
+    }
+    #[test]
+    fn mock_server_validates_transcription_request() {
+        mock_request("transcription");
+    }
+    #[test]
+    fn settings_are_private_and_token_not_public() {
+        let path =
+            std::env::temp_dir().join(format!("hearing-settings-{}.json", super::super::clock()));
+        let mut s = Settings::default();
+        s.token = "secret".into();
+        persist(&path, &s).unwrap();
+        assert!(!serde_json::to_string(
+            &s.public_at(Path::new("/archive/.hearfolio"), "en".into())
+        )
+        .unwrap()
+        .contains("secret"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_file(path).unwrap();
+    }
+    fn fixture() -> std::path::PathBuf {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "hearfolio-cloud-{}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+    #[test]
+    fn legacy_defaults_follow_completed_transcript_not_a_newer_selection() {
+        let root = fixture();
+        let old_text = root.join("older.txt");
+        let last_text = root.join("last.txt");
+        fs::write(&old_text, "older transcript").unwrap();
+        fs::write(&last_text, "latest successful transcript").unwrap();
+        fs::write(root.join("history.json"), serde_json::to_vec(&serde_json::json!([
+            {"id":"hearing-1","name":"old","inputPath":"old.wav","outputPath":old_text,"model":"whisper-base","createdAt":100,"completedAt":300},
+            {"id":"hearing-2","name":"last","inputPath":"last.wav","outputPath":last_text,"model":"openrouter/fish/transcribe","createdAt":1,"completedAt":400,"configuration":{"provider":"local","model":"whisper-small","mode":"local"}},
+            {"id":"hearing-3","name":"new import","inputPath":"new.wav","outputPath":null,"model":null,"createdAt":900,"configuration":{"provider":"local","model":"whisper-tiny","mode":"local"}}
+        ])).unwrap()).unwrap();
+        let mut settings = Settings::default();
+        recover_last_working(&mut settings, &root).unwrap();
+        assert_eq!(settings.last_configuration.provider, "openrouter");
+        assert_eq!(settings.last_configuration.model, "fish/transcribe");
+        settings.last_configuration = RecognitionConfig {
+            provider: "openrouter".into(),
+            model: "new/working-model".into(),
+            mode: "streaming".into(),
+        };
+        settings.last_working_at = Some(1000);
+        recover_last_working(&mut settings, &root).unwrap();
+        assert_eq!(settings.last_configuration.model, "new/working-model");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn legacy_history_uses_saved_text_modified_time_when_completion_is_missing() {
+        let root = fixture();
+        let older = root.join("older.txt");
+        let latest = root.join("latest.txt");
+        for (path, seconds) in [(&older, 100), (&latest, 200)] {
+            fs::write(path, "saved transcript").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds)),
+                )
+                .unwrap();
+        }
+        fs::write(root.join("history.json"), serde_json::to_vec(&serde_json::json!([
+            {"id":"hearing-1","name":"older output","inputPath":"old.wav","outputPath":older,"model":"whisper-tiny","createdAt":900},
+            {"id":"hearing-2","name":"latest output","inputPath":"last.wav","outputPath":latest,"model":"whisper-small","createdAt":1}
+        ])).unwrap()).unwrap();
+        let mut settings = Settings::default();
+        recover_last_working(&mut settings, &root).unwrap();
+        assert_eq!(settings.last_configuration.model, "whisper-small");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn preferences_and_failed_promotion_preserve_token_and_last_working_configuration() {
+        let root = fixture();
+        let path = root.join("settings.json");
+        let legacy = root.join("legacy.json");
+        fs::write(&legacy,r#"{"provider":"openrouter","localModel":"whisper-base","openrouterUrl":"https://openrouter.ai/api/v1","openrouterModel":"fish-audio/transcribe-1","openrouterMode":"transcription","token":"legacy-secret"}"#).unwrap();
+        let previous = load_at(&path, &legacy).unwrap();
+        assert_eq!(previous.token, "legacy-secret");
+        let current = apply_update(
+            previous.clone(),
+            SettingsUpdate {
+                language: "en".into(),
+                openrouter_url: default_url(),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(current.last_configuration, previous.last_configuration);
+        assert_eq!(current.token, "legacy-secret");
+        persist(&path, &current).unwrap();
+        let selection = RecognitionConfig {
+            provider: "local".into(),
+            model: "whisper-small".into(),
+            mode: "local".into(),
+        };
+        fs::create_dir(path.with_extension("json.tmp")).unwrap();
+        assert!(mark_working_at(&path, &legacy, &selection).is_err());
+        assert_eq!(
+            load_at(&path, &legacy).unwrap().last_configuration,
+            previous.last_configuration
+        );
+        assert_eq!(load_at(&path, &legacy).unwrap().token, "legacy-secret");
+        fs::remove_dir(path.with_extension("json.tmp")).unwrap();
+        mark_working_at(&path, &legacy, &selection).unwrap();
+        let saved = load_at(&path, &legacy).unwrap();
+        assert_eq!(saved.last_configuration, selection);
+        assert_eq!(saved.token, "legacy-secret");
+        assert_eq!(saved.language, "en");
+        let cleared = apply_update(
+            saved,
+            SettingsUpdate {
+                language: "system".into(),
+                openrouter_url: default_url(),
+            },
+            Some("".into()),
+        )
+        .unwrap();
+        assert!(cleared.token.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn catalog_merges_explicit_transcription_models_and_normalizes_routing() {
+        use std::{net::TcpListener, thread};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for transcription in [false, true] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                assert!(first.starts_with(if transcription {
+                    "GET /models?output_modalities=transcription "
+                } else {
+                    "GET /models "
+                }));
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    assert!(!line.to_lowercase().starts_with("authorization:"));
+                }
+                let model = |id: &str, outputs: Vec<&str>| serde_json::json!({"id":id,"name":id,"architecture":{"input_modalities":["audio"],"output_modalities":outputs},"supported_parameters":[]});
+                let body=if transcription {serde_json::json!({"data":[model("fish/stt",vec!["transcription"]),model("both/model",vec!["transcription"])]})}else{serde_json::json!({"data":[model("chat/audio",vec!["text"]),model("both/model",vec!["text"]),{"id":"text/only","architecture":{"input_modalities":["text"],"output_modalities":["text"]}}]})}.to_string();
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            }
+        });
+        let mut settings = Settings::default();
+        settings.openrouter_url = format!("http://{address}");
+        let models = catalog(&settings).unwrap();
+        assert_eq!(models.len(), 3);
+        let both = models.iter().find(|m| m.id == "both/model").unwrap();
+        assert_eq!(both.modes.len(), 2);
+        assert_eq!(both.preferred_mode, "transcription");
+        let mut config = RecognitionConfig {
+            provider: "openrouter".into(),
+            model: "fish/stt".into(),
+            mode: "streaming".into(),
+        };
+        normalize_from_models(&mut config, &models).unwrap();
+        assert_eq!(config.mode, "transcription");
+        config.model = "chat/audio".into();
+        normalize_from_models(&mut config, &models).unwrap();
+        assert_eq!(config.mode, "streaming");
+        config.model = "text/only".into();
+        assert!(normalize_from_models(&mut config, &models).is_err());
+        server.join().unwrap();
     }
 }

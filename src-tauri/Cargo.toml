@@ -26,6 +26,13 @@ tauri-plugin-dialog = "2.7.3"
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
 base64 = "0.22"
 tungstenite = { version = "0.28", features = ["handshake"] }
+symphonia = { version = "0.5.5", features = ["aac", "isomp4", "mp3", "flac", "ogg", "vorbis", "wav", "pcm"] }
+hound = "3.5"
+tauri-plugin-fs = "2.5.2"
+
+[target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dependencies]
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

@@ -32,6 +32,10 @@ work/
 !.env.example
 *.pem
 *.key
+*.jks
+*.keystore
+keystore.properties
+.hearfolio/
 .hearing/
 /recordings/
 /input/
