@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0 (2026-10-07)
+
+### Features
+
+- **app:** add microphone recording and Windows releases ([51242dc](https://github.com/bubaley/hearfolio/commit/51242dca8b01c1f7536eb929a8ccd27f270e0660))
+
 ## 0.2.1 (2026-10-07)
 
 ### Fixes and performance
