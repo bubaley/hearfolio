@@ -340,7 +340,7 @@ pub async fn transfer_send(app: tauri::AppHandle, id: String, to: String) -> Res
         };
         let manifest = Manifest {
             version: 1,
-            source_id: entry.id,
+            source_id: entry.transfer_source_id.unwrap_or(entry.id),
             name: entry.name,
             extension,
             size,
@@ -421,6 +421,8 @@ fn validate_manifest(m: &Manifest) -> Result<(), String> {
         || m.name.trim().is_empty()
         || m.name.chars().count() > 200
         || m.name.chars().any(char::is_control)
+        || m.source_id.trim().is_empty()
+        || m.source_id.chars().any(char::is_control)
         || m.source_id.len() > 200
         || m.transcript.len() > 4 * 1024 * 1024
         || m.sha256.len() != 64
@@ -447,8 +449,33 @@ fn commit_received(
 ) -> Result<HistoryEntry, String> {
     validate_manifest(&m)?;
     let mut entries = crate::records::read_history_at(dir)?;
-    if let Some(entry) = entries.iter().find(|e| e.id == local_id) {
-        return Ok(entry.clone());
+    if let Some(entry) = entries.iter().find(|e| {
+        e.id == m.source_id
+            || e.transfer_source_id.as_deref() == Some(m.source_id.as_str())
+            || e.id == local_id
+    }) {
+        let (sha256, size) = hash_file(Path::new(&entry.input_path))?;
+        if sha256 != m.sha256 || size != m.size {
+            return Err("Recording identity refers to different audio".into());
+        }
+        // Empty or older results must not erase a newer local transcription.
+        if m.transcript.is_empty() || m.completed_at.unwrap_or(0) < entry.completed_at.unwrap_or(0)
+        {
+            return Ok(entry.clone());
+        }
+        let mut updated = entry.clone();
+        updated.transfer_source_id = Some(m.source_id);
+        updated.model = m.model;
+        updated.configuration = m.configuration;
+        updated.completed_at = m.completed_at;
+        crate::records::replace_transcript_at(dir, updated.clone(), &m.transcript)?;
+        updated.output_path = Some(
+            dir.join("output")
+                .join(format!("{}.txt", updated.id))
+                .to_string_lossy()
+                .into(),
+        );
+        return Ok(updated);
     }
     let target = dir
         .join("input")
@@ -477,6 +504,7 @@ fn commit_received(
         }
         let entry = HistoryEntry {
             id: local_id,
+            transfer_source_id: Some(m.source_id),
             name: m.name,
             input_path: target.to_string_lossy().into(),
             output_path: if m.transcript.is_empty() {
@@ -522,7 +550,7 @@ pub async fn transfer_receive(app: tauri::AppHandle, id: String) -> Result<Histo
             validate_manifest(&m)?;
             emit(&app, &id, "receiving", 0, m.size);
             let digest = Sha256::digest(
-                serde_json::to_vec(&json!({"from":accepted["from"],"manifest":m}))
+                serde_json::to_vec(&json!({"sourceId":m.source_id,"sha256":m.sha256}))
                     .map_err(error)?,
             );
             let local_id = format!("hearing-{digest:x}");
@@ -626,6 +654,81 @@ mod tests {
         assert_eq!(crate::records::read_history_at(&dir).unwrap().len(), 1);
         fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn round_trip_updates_original_and_received_copy_without_duplicates() {
+        let (original, audio, mut m) = fixture();
+        let (other, _, _) = fixture();
+        m.transcript.clear();
+        m.completed_at = None;
+        let first = commit_received(&original, &audio, m.source_id.clone(), m.clone()).unwrap();
+        let mut imported = first.clone();
+        imported.transfer_source_id = None; // An original recording predates any transfer.
+        crate::records::write_history_at(&original, &[imported]).unwrap();
+        let copy = commit_received(&other, &audio, "hearing-copy".into(), m.clone()).unwrap();
+        assert_eq!(copy.transfer_source_id.as_deref(), Some(first.id.as_str()));
+        m.source_id = copy.transfer_source_id.unwrap();
+        m.transcript = "Новая расшифровка на втором устройстве".into();
+        m.completed_at = Some(900);
+        let returned =
+            commit_received(&original, &audio, "hearing-unused".into(), m.clone()).unwrap();
+        assert_eq!(returned.id, first.id);
+        assert_eq!(returned.input_path, first.input_path);
+        assert_eq!(
+            fs::read_to_string(returned.output_path.unwrap()).unwrap(),
+            m.transcript
+        );
+        assert_eq!(crate::records::read_history_at(&original).unwrap().len(), 1);
+        let refreshed =
+            commit_received(&other, &audio, "hearing-unused".into(), m.clone()).unwrap();
+        assert_eq!(refreshed.id, "hearing-copy");
+        assert_eq!(crate::records::read_history_at(&other).unwrap().len(), 1);
+        fs::remove_dir_all(original).unwrap();
+        fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn received_results_preserve_newer_text_and_reject_different_audio() {
+        let (dir, audio, mut m) = fixture();
+        let entry = commit_received(&dir, &audio, "hearing-copy".into(), m.clone()).unwrap();
+        m.completed_at = Some(1);
+        m.transcript = "Old".into();
+        commit_received(&dir, &audio, "hearing-unused".into(), m.clone()).unwrap();
+        assert_eq!(
+            fs::read_to_string(entry.output_path.as_ref().unwrap()).unwrap(),
+            "Сохранённый текст"
+        );
+        m.completed_at = Some(999);
+        m.transcript.clear();
+        commit_received(&dir, &audio, "hearing-unused".into(), m.clone()).unwrap();
+        assert_eq!(
+            fs::read_to_string(entry.output_path.as_ref().unwrap()).unwrap(),
+            "Сохранённый текст"
+        );
+        m.sha256 = "a".repeat(64);
+        assert!(commit_received(&dir, &audio, "hearing-unused".into(), m).is_err());
+        assert_eq!(crate::records::read_history_at(&dir).unwrap().len(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn received_update_rolls_back_text_and_metadata_if_history_commit_fails() {
+        let (dir, audio, mut m) = fixture();
+        let entry = commit_received(&dir, &audio, "hearing-copy".into(), m.clone()).unwrap();
+        fs::create_dir(dir.join("history.json.tmp")).unwrap();
+        m.transcript = "Updated".into();
+        m.completed_at = Some(999);
+        assert!(commit_received(&dir, &audio, "hearing-unused".into(), m).is_err());
+        assert_eq!(
+            fs::read_to_string(entry.output_path.as_ref().unwrap()).unwrap(),
+            "Сохранённый текст"
+        );
+        assert_eq!(
+            crate::records::read_history_at(&dir).unwrap()[0].completed_at,
+            Some(456)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn mobile_receives_local_transcription_without_running_its_model() {
         let (dir, staging, mut m) = fixture();

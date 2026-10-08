@@ -386,6 +386,16 @@ async function loadCloudModels() {
   finally{cloudLoading=false;render();if(catalogOpen)document.querySelector<HTMLInputElement>('#catalog-search')?.focus();}
 }
 function sortHistory(entries:Entry[]) {return entries.sort((left,right)=>right.createdAt-left.createdAt);}
+async function refreshAfterTransfer() {
+  await refreshHistory();
+  if(active&&(resultSaved||!text)) {
+    try {
+      const detail=await call<{entry:Entry;text:string}>('get_history',{id:active.id});
+      active=detail.entry;restoreConfiguration(detail.entry);text=detail.text;
+      resultSaved=Boolean(detail.entry.outputPath&&detail.text);previousResult=null;render();
+    } catch(error) {notice(errorText(error),true);}
+  }
+}
 async function refreshHistory() {try{history=sortHistory(await call<Entry[]>('list_history'));historyError='';}catch(error){historyError=errorText(error);}loading=false;render();}
 async function refreshRuntime() {
   if(!platform.localRecognition){runtime={ffmpeg:false,whisper:false,nemo:false};runtimeLoaded=true;render();return;}
@@ -559,7 +569,7 @@ async function initialize() {
   if(!preview)void checkUpdates();
 }
 void initialize();
-void initializeTransfers({refresh:refreshHistory,busy:()=>busy,setBusy:value=>{busy=value;render();},notice,confirm:(heading,message)=>confirmAction(heading,message,tr("Отключить"))});
+void initializeTransfers({refresh:refreshAfterTransfer,busy:()=>busy,setBusy:value=>{busy=value;render();},notice,confirm:(heading,message)=>confirmAction(heading,message,tr("Отключить"))});
 subscribe<null>('hearfolio-request-restart',()=>{void restartAfterUpdate(false);}).catch(error=>notice(errorText(error),true));
 setInterval(()=>{if(!preview&&Date.now()-lastUpdateCheck>=4*60*60*1000)void checkUpdates();},4*60*60*1000);
 document.addEventListener('visibilitychange',()=>{if(!preview&&document.visibilityState==='visible'&&Date.now()-lastUpdateCheck>=4*60*60*1000)void checkUpdates();});

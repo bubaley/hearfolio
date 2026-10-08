@@ -520,6 +520,7 @@ async fn import_audio(
         }
         let entry = HistoryEntry {
             id,
+            transfer_source_id: None,
             name,
             input_path: target.to_string_lossy().into_owned(),
             output_path: None,
