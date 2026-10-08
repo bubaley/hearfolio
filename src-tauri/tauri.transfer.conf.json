@@ -1,0 +1,19 @@
+{
+  "productName": "Hearfolio Transfer MVP",
+  "identifier": "com.bubaley.hearfolio.transfer",
+  "bundle": {
+    "createUpdaterArtifacts": false
+  },
+  "plugins": {
+    "deep-link": {
+      "mobile": [
+        {
+          "scheme": [
+            "hearfolio-transfer"
+          ],
+          "appLink": false
+        }
+      ]
+    }
+  }
+}

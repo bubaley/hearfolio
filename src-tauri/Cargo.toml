@@ -14,17 +14,23 @@ edition = "2021"
 name = "speechdesk_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+transfer-mvp = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-opener = "2"
+tauri-plugin-deep-link = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-dialog = "2.7.3"
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
 base64 = "0.22"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
 tungstenite = { version = "0.28", features = ["handshake"] }
 symphonia = { version = "0.5.5", features = ["aac", "isomp4", "mp3", "flac", "ogg", "vorbis", "wav", "pcm"] }
 hound = "3.5"
@@ -36,6 +42,9 @@ tauri-plugin-recording = { path = "tauri-plugin-recording" }
 [target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dependencies]
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-barcode-scanner = "2.5.1"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

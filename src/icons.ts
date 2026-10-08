@@ -1,4 +1,7 @@
 const paths: Record<string, string> = {
+  qr: 'M3 8V3h5m8 0h5v5m0 8v5h-5M8 21H3v-5M7 7h3v3H7V7m7 0h3v3h-3V7M7 14h3v3H7v-3m7 0h3m-3 0v3h3',
+  devices: 'M2 3h14v12H2V3m4 16h6m-3-4v4m10-10h3v12h-7V9h4m-2 9h3',
+  share: 'M21 5a3 3 0 1 1-6 0 3 3 0 0 1 6 0M9 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0m12 7a3 3 0 1 1-6 0 3 3 0 0 1 6 0M8.6 10.5l6.8-4m-6.8 7 6.8 4',
   wave: 'M3 10v4m4-7v10m5-14v18m5-14v10m4-7v4',
   file: 'M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9l-6-6zm0 0v6h6M8 14h8m-8 4h5',
   history: 'M3 12a9 9 0 1 0 3-7M3 3v6h6m3-2v5l3 2',

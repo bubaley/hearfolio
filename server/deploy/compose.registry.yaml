@@ -1,0 +1,5 @@
+# Overlay for compose.yaml. Requires Docker Compose >= 2.24.4.
+services:
+  relay:
+    image: ${RELAY_IMAGE:?Set RELAY_IMAGE to namespace/hearfolio:version}
+    build: !reset null

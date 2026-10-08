@@ -13,6 +13,7 @@ use tauri_plugin_fs::FsExt;
 #[serde(rename_all = "camelCase")]
 pub struct RuntimePlatform {
     os: &'static str,
+    transfer_mvp: bool,
     mobile: bool,
     local_recognition: bool,
     custom_storage: bool,
@@ -23,6 +24,7 @@ pub struct RuntimePlatform {
 pub fn get_runtime_platform() -> RuntimePlatform {
     RuntimePlatform {
         os: std::env::consts::OS,
+        transfer_mvp: cfg!(feature = "transfer-mvp"),
         mobile: cfg!(mobile),
         local_recognition: !cfg!(mobile),
         custom_storage: !cfg!(mobile),
@@ -34,7 +36,13 @@ pub fn get_runtime_platform() -> RuntimePlatform {
 pub fn validate_configuration(
     configuration: &crate::cloud::RecognitionConfig,
 ) -> Result<(), String> {
-    if cfg!(mobile) && configuration.provider == "local" {
+    validate_configuration_for(configuration, !cfg!(mobile))
+}
+pub(crate) fn validate_configuration_for(
+    configuration: &crate::cloud::RecognitionConfig,
+    local_recognition: bool,
+) -> Result<(), String> {
+    if !local_recognition && configuration.provider == "local" {
         return Err("errors.localUnavailableMobile".into());
     }
     Ok(())

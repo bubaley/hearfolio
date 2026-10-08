@@ -1,0 +1,3 @@
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev openjdk-21-jdk-headless curl unzip ca-certificates && rm -rf /var/lib/apt/lists/*

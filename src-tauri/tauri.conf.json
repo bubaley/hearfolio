@@ -67,6 +67,16 @@
       "endpoints": [
         "https://github.com/bubaley/hearfolio/releases/latest/download/latest.json"
       ]
+    },
+    "deep-link": {
+      "mobile": [
+        {
+          "scheme": [
+            "hearfolio-transfer"
+          ],
+          "appLink": false
+        }
+      ]
     }
   }
 }

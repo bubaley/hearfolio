@@ -5,6 +5,7 @@ mod recording;
 mod records;
 mod restart;
 mod storage;
+mod transfer;
 use cloud::RecognitionConfig;
 use records::{
     delete_entries_at, read_history_at, rename_entry_at, save_transcript_at,
@@ -1126,11 +1127,14 @@ fn save_text(path: String, content: String) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init());
     #[cfg(target_os = "android")]
     let builder = builder.plugin(tauri_plugin_recording::init());
+    #[cfg(mobile)]
+    let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
     #[cfg(desktop)]
     let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1141,12 +1145,16 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             restart::install_menu(app.handle())?;
             if let Ok(root) = base() {
+                transfer::cleanup_partial_files(&root);
                 app.asset_protocol_scope()
                     .allow_directory(root.join("input"), false)?;
             }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            transfer::transfer_api,
+            transfer::transfer_send,
+            transfer::transfer_receive,
             restart::restart_application,
             recording::start_audio_recording,
             recording::append_audio_recording,

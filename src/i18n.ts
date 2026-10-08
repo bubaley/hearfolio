@@ -16,7 +16,7 @@ const messages: Record<string,string> = {
   'Добавить в архив':'Add to archive','Удалить эту запись':'Delete this recording','Удалить записанное аудио?':'Delete recorded audio?',
   'Эта запись ещё не добавлена в архив и будет потеряна.':'This recording has not been added to the archive and will be lost.',
   'Сервис':'Service','Модель':'Model','Режим':'Mode','Выбирается автоматически':'Selected automatically',
-  'Расшифровка':'Transcript','Записи':'Recordings','Модели':'Models','Настройки':'Settings',
+  'Расшифровка':'Transcript','Записи':'Recordings','Модели':'Models','Настройки':'Settings','Устройства':'Devices','Отключить':'Unpair',
   'Модель не выбрана':'No model selected','Проверяем готовность…':'Checking readiness…',
   'Установите FFmpeg для подготовки аудио.':'Install FFmpeg to prepare audio.',
   'Добавьте API token OpenRouter.':'Add your OpenRouter API token.','Выберите модель OpenRouter.':'Choose an OpenRouter model.',
@@ -129,6 +129,10 @@ export function countLabel(count:number,kind:'record'|'word') {
   return `${count} ${forms[form as keyof typeof forms]||forms.other}`;
 }
 const errorMessages:Record<string,[string,string]>={
+  cameraPermissionDenied:['Разрешите Hearfolio доступ к камере в настройках телефона. Код можно ввести вручную.','Allow Hearfolio camera access in your phone settings. You can also enter the code manually.'],
+  qrScanFailed:['Не удалось запустить сканер. Проверьте доступ к камере или введите код вручную.','Could not start the scanner. Check camera access or enter the code manually.'],
+  qrInvitationInvalid:['Это не QR-код приглашения Hearfolio. Создайте приглашение в разделе «Устройства» на другом устройстве.','This is not a Hearfolio invitation QR. Create an invitation in Devices on your other device.'],
+
   microphonePermissionDenied:['Разрешите доступ к микрофону в настройках устройства.','Allow microphone access in your device settings.'],
   recordingUnavailable:['Запись с микрофона недоступна на этом устройстве.','Microphone recording is unavailable on this device.'],
   recordingStart:['Не удалось начать запись. Проверьте доступ к микрофону и повторите попытку.','Could not start recording. Check microphone access and try again.'],
