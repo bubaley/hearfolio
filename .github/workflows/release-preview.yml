@@ -1,0 +1,60 @@
+name: Release preview Linux and Android
+on:
+  push:
+    branches: [build/release-preview-0.5.0]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-desktop
+        with:
+          cache-target: x86_64-unknown-linux-gnu
+      - name: Build signed production installers
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: |
+          node scripts/release.mjs check
+          npm run tauri -- build --ci --target x86_64-unknown-linux-gnu --bundles appimage,deb,rpm -- --locked
+      - name: Collect Linux packages
+        run: node scripts/release-artifacts.mjs stage 0.5.0 linux_x86_64 src-tauri/target/x86_64-unknown-linux-gnu/release/bundle release-assets
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: preview-linux_x86_64
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 30
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-android
+      - name: Build production arm64 APK and AAB
+        run: |
+          node scripts/release.mjs check
+          npm run tauri -- android build --ci --apk --aab --target aarch64
+          git diff --exit-code -- src-tauri/Cargo.lock package-lock.json
+      - name: Verify native recorder
+        working-directory: src-tauri/gen/android
+        run: ./gradlew --no-daemon :tauri-plugin-recording:testDebugUnitTest
+      - name: Sign with the existing release certificate
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: bash scripts/release-android.sh 0.5.0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: preview-android_aarch64
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 30
