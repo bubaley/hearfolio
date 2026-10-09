@@ -71,17 +71,60 @@ fn native(app: &tauri::AppHandle, command: &str, path: Option<&Path>) -> Result<
 }
 
 #[tauri::command]
+pub async fn audio_recording_level(app: tauri::AppHandle) -> Result<f64, String> {
+    #[cfg(target_os = "android")]
+    {
+        #[derive(serde::Deserialize)]
+        struct Level {
+            level: f64,
+        }
+        let level = tauri::async_runtime::spawn_blocking(move || {
+            app.state::<tauri_plugin_recording::Recording<tauri::Wry>>()
+                .run::<Level>("recordingLevel", serde_json::json!({}))
+        })
+        .await
+        .map_err(|_| "errors.recordingUnavailable")??;
+        return Ok(level.level.clamp(0.0, 1.0));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok(0.0)
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn hearfolio_request_microphone_permission() -> std::ffi::c_int;
+}
+fn permission_result(status: i32) -> Result<(), String> {
+    match status {
+        0 => Ok(()),
+        1 | 2 => Err("errors.microphonePermissionDenied".into()),
+        _ => Err("errors.recordingUnavailable".into()),
+    }
+}
+#[tauri::command]
+pub async fn request_microphone_permission() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    return tauri::async_runtime::spawn_blocking(|| {
+        // Apple native authorization is requested before WKWebView getUserMedia.
+        permission_result(unsafe { hearfolio_request_microphone_permission() })
+    })
+    .await
+    .map_err(|_| "errors.recordingUnavailable")?;
+    #[cfg(not(target_os = "macos"))]
+    permission_result(0)
+}
+
+#[tauri::command]
 pub async fn start_audio_recording(
     app: tauri::AppHandle,
     sample_rate: Option<u32>,
 ) -> Result<(), String> {
     let job = JobGuard::acquire()?;
     tauri::async_runtime::spawn_blocking(move || {
-        let extension = if cfg!(target_os = "android") {
-            "m4a"
-        } else {
-            "wav"
-        };
+        let extension = "wav";
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -174,15 +217,7 @@ pub async fn stop_audio_recording(app: tauri::AppHandle) -> Result<AudioSelectio
             .map_err(|_| "errors.recordingStop")?
             .insert(path.clone());
         Ok(AudioSelection {
-            name: Some(format!(
-                "Recording-{}.{}",
-                crate::clock(),
-                if cfg!(target_os = "android") {
-                    "m4a"
-                } else {
-                    "wav"
-                }
-            )),
+            name: Some(format!("Recording-{}.{}", crate::clock(), "wav")),
             path: path.to_string_lossy().into_owned(),
         })
     })
@@ -275,6 +310,20 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
     #[test]
+    fn native_permission_contract_never_treats_denied_or_unknown_as_granted() {
+        assert!(permission_result(0).is_ok());
+        for status in [1, 2] {
+            assert_eq!(
+                permission_result(status).unwrap_err(),
+                "errors.microphonePermissionDenied"
+            );
+        }
+        assert_eq!(
+            permission_result(3).unwrap_err(),
+            "errors.recordingUnavailable"
+        );
+    }
+    #[test]
     fn recording_writer_produces_decodable_pcm_and_rejects_invalid_rate() {
         let path = std::env::temp_dir().join(format!(
             "hearfolio-recording-test-{}.wav",
@@ -347,14 +396,14 @@ fn monitor(app: tauri::AppHandle, path: PathBuf) {
                 let result = crate::import_audio_sync(
                     &app,
                     path.to_string_lossy().into_owned(),
-                    Some(format!("Recording-{}.m4a", crate::clock())),
+                    Some(format!("Recording-{}.wav", crate::clock())),
                     configuration,
                 );
                 drop(session);
                 let payload = match result {
                     Ok(entry) => serde_json::json!({"entry":entry}),
                     Err(error) => {
-                        serde_json::json!({"error":error,"selection":{"path":path,"name":"Recording.m4a"}})
+                        serde_json::json!({"error":error,"selection":{"path":path,"name":"Recording.wav"}})
                     }
                 };
                 if let Ok(mut last) = LAST_RESULT.lock() {
@@ -415,7 +464,7 @@ fn quick_recording_id(path: &Path) -> Result<String, String> {
         .file_name()
         .and_then(|s| s.to_str())
         .and_then(|s| s.strip_prefix("hearfolio-recording-"))
-        .and_then(|s| s.strip_suffix(".m4a"))
+        .and_then(|s| s.strip_suffix(".m4a").or_else(|| s.strip_suffix(".wav")))
         .and_then(|s| uuid::Uuid::parse_str(s).ok())
         .ok_or("Invalid quick recording name")?;
     Ok(format!("hearing-quick-{uuid}"))
@@ -460,7 +509,7 @@ pub async fn import_quick_recordings(
                     crate::import_audio_with_id(
                         &app,
                         path.into(),
-                        Some(format!("Recording-{}.m4a", crate::clock())),
+                        Some(format!("Recording-{}.wav", crate::clock())),
                         configuration,
                         Some(id),
                     )?
@@ -497,6 +546,11 @@ mod quick_tests {
             quick_recording_id(&p).unwrap()
         );
         assert!(quick_recording_id(&p.with_extension("m4a.partial")).is_err());
+        assert_eq!(
+            quick_recording_id(&p.with_extension("wav")).unwrap(),
+            quick_recording_id(&p).unwrap()
+        );
+        assert!(quick_recording_id(&p.with_extension("wav.partial")).is_err());
         assert!(quick_recording_id(Path::new("/private/hearfolio-recording-invalid.m4a")).is_err());
         assert!(quick_recording_id(Path::new(
             "/private/hearfolio-quick-recordings/hearfolio-recording-invalid.m4a"

@@ -8,12 +8,15 @@ import { open, save } from '@tauri-apps/plugin-dialog';
 import {tr, currentLanguage, type LanguagePreference} from './i18n';
 
 export type RecognitionConfig = {provider:'local'|'openrouter';model:string;mode:'local'|'streaming'|'transcription'};
+export type PostprocessRule = {id:string;name:string;instruction:string};
+export type TextModel = {id:string;name:string;contextLength:number;maxCompletionTokens:number|null};
+export type PostprocessResult = {id:string;ruleId:string;ruleName:string;instruction:string;model:string;createdAt:number;text:string};
 
 export type Entry = {
   id: string; name: string; inputPath: string; outputPath: string | null;
-  configuration?: RecognitionConfig | null; model: string | null; createdAt: number; sizeBytes?: number | null; durationSeconds?: number | null;
+  configuration?: RecognitionConfig | null; model: string | null; createdAt: number; sizeBytes?: number | null; durationSeconds?: number | null; results?:PostprocessResult[];
 };
-export type Progress = { kind: 'download' | 'transcribe' | 'import' | 'storage' | 'update'; stage: string; current: number; total: number; elapsed: number };
+export type Progress = { kind: 'download' | 'transcribe' | 'postprocess' | 'import' | 'storage' | 'update'; stage: string; current: number; total: number; elapsed: number };
 export type Settings = {language:LanguagePreference;systemLanguage:'ru'|'en';openrouterUrl:string;hasToken:boolean;storageParent:string;storagePath:string;lastConfiguration:RecognitionConfig};
 export type CloudModel = {id:string;name:string;modes:('streaming'|'transcription')[];preferredMode:'streaming'|'transcription'};
 export type RuntimePlatform = 'android'|'macos'|'linux'|'windows'|'ios'|'unknown';
@@ -30,6 +33,10 @@ const previewFiles = new Map<string, { file: File; url: string }>();
 const previewTexts = new Map<string, string>();
 const installedModels = new Set(['whisper-base']);
 let previewEntries: Entry[] = [];
+let previewRules:PostprocessRule[]=[];
+let previewPlayer:HTMLAudioElement|null=null;
+function previewPlayerState():NativePlayerState{return {duration:previewPlayer&&Number.isFinite(previewPlayer.duration)?previewPlayer.duration:0,currentTime:previewPlayer?.currentTime||0,playing:Boolean(previewPlayer&&!previewPlayer.paused&&!previewPlayer.ended)};}
+if(preview){try{const rules=JSON.parse(localStorage.getItem('hearfolio-preview-rules')||'[]');if(Array.isArray(rules))previewRules=rules;}catch{/* Ignore malformed preview rules. */}}
 let previewSettings:Settings={language:'system',systemLanguage:currentLanguage(),openrouterUrl:'https://openrouter.ai/api/v1',hasToken:false,storageParent:'/Users/you',storagePath:'/Users/you/.hearfolio',lastConfiguration:{provider:'local',model:'whisper-base',mode:'local'}};
 if(previewPlatform==='android')previewSettings={...previewSettings,storageParent:'',storagePath:'/data/user/0/app.hearfolio/files/.hearfolio',lastConfiguration:{provider:'openrouter',model:'google/gemini-2.5-flash',mode:'streaming'}};
 if (preview) {
@@ -52,6 +59,40 @@ export async function call<T>(command: string, args: Record<string, unknown> = {
     case 'runtime_status': value = {ffmpeg:true,whisper:true,nemo:false}; break;
     case 'model_status': value = ['whisper-tiny','whisper-base','whisper-small','nemotron-3.5'].map(id => ({id,installed:installedModels.has(id)})); break;
     case 'list_history': value = previewEntries.map(entry => ({...entry})); break;
+    case 'prepare_native_playback': {
+      const entry=previewEntries.find(item=>item.id===args.id),selected=entry&&previewFiles.get(entry.inputPath);
+      if(!selected)throw new Error('errors.audioRead');previewPlayer?.pause();
+      const player=new Audio(selected.url);previewPlayer=player;player.preload='metadata';
+      await new Promise<void>((resolve,reject)=>{const timeout=setTimeout(()=>reject(new Error('errors.audioPlayback')),5000);player.onloadedmetadata=()=>{clearTimeout(timeout);resolve();};player.onerror=()=>{clearTimeout(timeout);reject(new Error('errors.audioPlayback'));};player.load();});
+      entry!.durationSeconds=player.duration;value=previewPlayerState();break;
+    }
+    case 'native_playback_state':value=previewPlayerState();break;
+    case 'play_native_playback':if(!previewPlayer)throw new Error('errors.audioPlayback');await previewPlayer.play();break;
+    case 'pause_native_playback':previewPlayer?.pause();break;
+    case 'seek_native_playback':if(previewPlayer)previewPlayer.currentTime=Math.max(0,Math.min(Number(args.seconds),previewPlayer.duration||0));break;
+    case 'release_native_playback':previewPlayer?.pause();previewPlayer=null;break;
+    case 'list_postprocess_rules': value=previewRules.map(rule=>({...rule}));break;
+    case 'save_postprocess_rule': {
+      const input=args.rule as PostprocessRule;
+      const rule={id:input.id||crypto.randomUUID(),name:input.name.trim(),instruction:input.instruction.trim()};
+      if(!rule.name||rule.name.length>200)throw new Error('errors.postprocessRuleNameInvalid');
+      if(!rule.instruction||rule.instruction.length>8000)throw new Error('errors.postprocessInstructionInvalid');
+      previewRules=[...previewRules.filter(item=>item.id!==rule.id),rule];
+      localStorage.setItem('hearfolio-preview-rules',JSON.stringify(previewRules));value={...rule};break;
+    }
+    case 'delete_postprocess_rule': previewRules=previewRules.filter(rule=>rule.id!==args.id);localStorage.setItem('hearfolio-preview-rules',JSON.stringify(previewRules));break;
+    case 'list_text_models': await delay(250);value=[{id:'google/gemini-2.5-flash',name:'Gemini 2.5 Flash',contextLength:1048576,maxCompletionTokens:65536},{id:'anthropic/claude-sonnet-4',name:'Claude Sonnet 4',contextLength:200000,maxCompletionTokens:64000}];break;
+    case 'apply_postprocess': {
+      const entry=previewEntries.find(item=>item.id===args.id),rule=previewRules.find(item=>item.id===args.ruleId);
+      if(!entry)throw new Error('errors.recordMissing');if(!rule)throw new Error('errors.postprocessRuleMissing');
+      if(!previewTexts.get(entry.id))throw new Error('errors.postprocessTranscriptRequired');
+      if(!previewSettings.hasToken)throw new Error('errors.tokenRequired');
+      const runId=crypto.randomUUID();
+      const result=currentLanguage()==='en'?'The team discussed next week’s plans.\n\n• Update the interface to simplify working with recordings.\n• Assign tasks after the meeting.\n• Review the results on Friday.':'Обсудили планы на следующую неделю.\n\n• Обновить интерфейс и упростить работу с записями.\n• Распределить задачи после встречи.\n• Проверить результат в пятницу.';
+      for(let current=0;current<result.length;current+=30){emit('task-progress',{kind:'postprocess',stage:'progress.postprocess',current,total:result.length,elapsed:Math.floor(current/60)});emit('postprocess-text',{recordId:entry.id,runId,text:result.slice(0,current)});await delay(100);}
+      const saved:PostprocessResult={id:runId,ruleId:rule.id,ruleName:rule.name,instruction:rule.instruction,model:String(args.model),createdAt:Date.now(),text:result};
+      entry.results=[...(entry.results||[]),saved];value=saved;break;
+    }
     case 'get_settings': value = {...previewSettings}; break;
     case 'save_settings':
       previewSettings = {...previewSettings, ...(args.settings as Partial<Settings>), hasToken: args.token !== undefined ? Boolean(args.token) : previewSettings.hasToken};
@@ -113,7 +154,7 @@ export async function call<T>(command: string, args: Record<string, unknown> = {
 function releasePreviewFile(path: string) { const selected=previewFiles.get(path); if (selected) URL.revokeObjectURL(selected.url); previewFiles.delete(path); }
 export function registerPreviewFile(file: File) { const path=`preview:${crypto.randomUUID()}`; previewFiles.set(path,{file,url:URL.createObjectURL(file)}); return path; }
 
-type BrowserRecording={stream:MediaStream;context:AudioContext;source:MediaStreamAudioSourceNode;processor:ScriptProcessorNode;mute:GainNode;queue:Promise<void>;pending:number;error:Error|null;chunks:Int16Array[]};
+type BrowserRecording={stream:MediaStream;context:AudioContext;source:MediaStreamAudioSourceNode;processor:ScriptProcessorNode;mute:GainNode;queue:Promise<void>;pending:number;error:Error|null;chunks:Int16Array[];level:number};
 let browserRecording:BrowserRecording|null=null;
 let browserInputLevel=0;
 export function recordingInputLevel(){return fixtureRecording?browserInputLevel:browserRecording&&!browserRecording.error?browserInputLevel:0;}
@@ -144,6 +185,7 @@ export async function startAudioRecording():Promise<void> {
   recordingStarting=true;const generation=++recordingGeneration;
   let stream:MediaStream|null=null,context:AudioContext|null=null;
   try {
+    if(!preview&&nativePlatform?.os==='macos')await call('request_microphone_permission');
     stream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});
     if(generation!==recordingGeneration)throw new Error('errors.recordingUnavailable');
     context=new AudioContext();await context.resume();
@@ -151,12 +193,13 @@ export async function startAudioRecording():Promise<void> {
     if(!preview)await call('start_audio_recording',{sampleRate:context.sampleRate});
     if(generation!==recordingGeneration)throw new Error('errors.recordingUnavailable');
     const source=context.createMediaStreamSource(stream),processor=context.createScriptProcessor(4096,1,1),mute=context.createGain();mute.gain.value=0;
-    const recording:BrowserRecording={stream,context,source,processor,mute,queue:Promise.resolve(),pending:0,error:null,chunks:[]};
+    const recording:BrowserRecording={stream,context,source,processor,mute,queue:Promise.resolve(),pending:0,error:null,chunks:[],level:0};
     browserInputLevel=0;browserRecording=recording;
     processor.onaudioprocess=event=>{
       if(recording.error)return;
       const input=event.inputBuffer.getChannelData(0),samples=new Int16Array(input.length);
       browserInputLevel=pcmLevel(input);
+      recording.level=Math.min(1,Math.sqrt(input.reduce((sum,sample)=>sum+sample*sample,0)/input.length));
       for(let i=0;i<input.length;i++){const sample=Math.max(-1,Math.min(1,input[i]));samples[i]=Math.round(sample*(sample<0?32768:32767));}
       if(preview){recording.chunks.push(samples);return;}
       // Bound queued IPC chunks; a stalled disk must never buffer an hour in RAM.
@@ -173,7 +216,7 @@ export async function startAudioRecording():Promise<void> {
 }
 export async function stopAudioRecording():Promise<AudioSelection|null> {
   if(!preview&&nativePlatform?.os==='android'){try{return await call<AudioSelection>('stop_audio_recording');}finally{nativeRecordingActive=false;}}
-  if(fixtureRecording){fixtureRecording=false;const samples=Int16Array.from({length:1600},(_,index)=>Math.round(Math.sin(index*2*Math.PI*440/16000)*1000));const file=recordingWav([samples],16000);return {path:registerPreviewFile(file),name:file.name};}
+  if(fixtureRecording){fixtureRecording=false;const samples=Int16Array.from({length:48000},(_,index)=>Math.round(Math.sin(index*2*Math.PI*440/16000)*1000));const file=recordingWav([samples],16000);return {path:registerPreviewFile(file),name:file.name};}
   const recording=browserRecording;if(!recording)throw new Error('errors.recordingUnavailable');browserRecording=null;
   closeBrowserRecording(recording);await recording.queue;
   if(recording.error){if(!preview)await call('cancel_audio_recording').catch(()=>{});throw recording.error;}
@@ -192,7 +235,42 @@ export async function discardAudioRecording(selection:AudioSelection):Promise<vo
   if(preview){releasePreviewFile(selection.path);return;}
   await call('discard_audio_recording',{path:selection.path});
 }
+export async function getAudioRecordingLevel():Promise<number> {
+  if(!preview&&nativePlatform?.os==='android')return nativeRecordingActive?call<number>('audio_recording_level'):0;
+  return browserRecording?.level||0;
+}
 export function audioSource(entry: Entry) { return preview ? previewFiles.get(entry.inputPath)?.url || '' : convertFileSrc(entry.inputPath); }
+export async function resolveAudioSource(entry:Entry):Promise<string> {
+  if(preview)return audioSource(entry);
+  return convertFileSrc(await call<string>('prepare_audio_playback',{id:entry.id}));
+}
+export type NativePlayerState={duration:number;currentTime:number;playing:boolean};
+export async function prepareNativePlayback(entry:Entry):Promise<NativePlayerState> {
+  return call<NativePlayerState>('prepare_native_playback',{id:entry.id});
+}
+export async function nativePlaybackState():Promise<NativePlayerState> {return call<NativePlayerState>('native_playback_state');}
+export async function playNativePlayback():Promise<void> {await call('play_native_playback');}
+export async function pauseNativePlayback():Promise<void> {await call('pause_native_playback');}
+export async function seekNativePlayback(seconds:number):Promise<void> {await call('seek_native_playback',{seconds});}
+export async function releaseNativePlayback():Promise<void> {await call('release_native_playback');}
+function downloadBlob(blob:Blob,name:string) {
+  const url=URL.createObjectURL(blob),anchor=document.createElement('a');anchor.href=url;anchor.download=name;anchor.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+export async function saveAudio(entry:Entry):Promise<void> {
+  if(!preview){await call('save_audio',{id:entry.id});return;}
+  const selected=previewFiles.get(entry.inputPath);if(!selected)throw new Error('errors.audioRead');
+  downloadBlob(selected.file,entry.name);
+}
+export async function shareAudio(entry:Entry):Promise<void> {
+  if(!preview){await call('share_audio',{id:entry.id});return;}
+  const selected=previewFiles.get(entry.inputPath);if(!selected)throw new Error('errors.audioRead');
+  const files=[new File([selected.file],entry.name,{type:selected.file.type})];
+  if(navigator.canShare?.({files}))await navigator.share({files,title:entry.name});else downloadBlob(selected.file,entry.name);
+}
+export async function shareText(name:string,text:string):Promise<void> {
+  if(!preview){await call('share_text',{name,text});return;}
+  if(navigator.share)await navigator.share({title:name,text});else downloadBlob(new Blob([text],{type:'text/plain;charset=utf-8'}),name);
+}
 export async function pickAudio(): Promise<AudioSelection | null> {
   if(!preview&&nativePlatform?.mobile&&nativePlatform.nativeAudio)return call<AudioSelection|null>('pick_audio_file');
   if(!preview){const path=await open({multiple:false,filters:[{name:tr('Аудио'),extensions:['m4a','mp3','wav','aac','flac','ogg','mp4']}]});return path?{path}:null;}

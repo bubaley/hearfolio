@@ -1,6 +1,6 @@
 [package]
 name = "speechdesk"
-version = "0.3.1"
+version = "0.4.2"
 description = "Hearfolio — audio recordings into a personal text archive"
 authors = ["bubaley"]
 edition = "2021"
@@ -19,6 +19,7 @@ transfer-mvp = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+cc = "1"
 
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset"] }

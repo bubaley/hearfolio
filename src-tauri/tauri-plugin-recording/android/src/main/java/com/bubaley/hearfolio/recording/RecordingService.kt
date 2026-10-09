@@ -3,7 +3,6 @@ package com.bubaley.hearfolio.recording
 import android.app.*
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.media.MediaRecorder
 import android.os.*
 import androidx.core.app.NotificationCompat
 import java.io.File
@@ -30,18 +29,14 @@ class RecordingService : Service() {
         fun elapsedSeconds() = if (startedAt == 0L) 0L else ((if (pausedAt > 0L) pausedAt else SystemClock.elapsedRealtime()) - startedAt - pausedMillis).coerceAtLeast(0L) / 1000L
         var ready: ((String?) -> Unit)? = null
     }
-    private var recorder: MediaRecorder? = null
+    private var recorder: RecorderSession? = null
     private var wake: PowerManager.WakeLock? = null
     private val handler = Handler(Looper.getMainLooper())
     private val deadline = Runnable { finish(true) }
-    // getMaxAmplitude resets the peak each time: sample once in the service so
-    // the WebView and lock-screen meter share the same microphone envelope.
+    // Both interfaces consume the same envelope from the capture session.
     private val sampleLevel = object : Runnable {
         override fun run() {
-            inputLevel = if (state == "recording") try {
-                val peak = (recorder?.maxAmplitude ?: 0) / 32767.0
-                if (peak <= .001) 0f else ((20 * kotlin.math.log10(peak) + 60) / 60).coerceIn(0.0, 1.0).toFloat()
-            } catch (_: Exception) { 0f } else 0f
+            inputLevel = if (state == "recording") recorder?.level ?: 0f else 0f
             if (recorder != null) handler.postDelayed(this, 100)
         }
     }
@@ -79,11 +74,9 @@ class RecordingService : Service() {
                 state = "recording"
                 if (Build.VERSION.SDK_INT >= 30) startForeground(ID,notification(),ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE) else startForeground(ID,notification())
                 file.parentFile?.mkdirs()
-                recorder = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else MediaRecorder()
-                recorder!!.apply {
-                    setAudioSource(MediaRecorder.AudioSource.MIC); setOutputFormat(MediaRecorder.OutputFormat.MPEG_4); setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                    setAudioChannels(1); setAudioSamplingRate(44100); setAudioEncodingBitRate(96000); setOutputFile(path); prepare(); start()
-                }
+                require(file.name.removeSuffix(".partial").endsWith(".wav"))
+                recorder = RecorderSession { handler.post { if (recorder != null) finish(true) } }
+                recorder!!.start(file)
                 handler.post(sampleLevel)
                 wake = (getSystemService(POWER_SERVICE) as PowerManager).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"Hearfolio:recording").apply { setReferenceCounted(false); acquire(4 * 60 * 60 * 1000L) }
                 handler.postDelayed(deadline,4 * 60 * 60 * 1000L)
@@ -106,7 +99,7 @@ class RecordingService : Service() {
         resetLevel()
         var error = ""
         try {
-            active.stop(); if (File(path).length() <= 44) throw IllegalStateException()
+            check(active.stop()); if (File(path).length() <= 44) throw IllegalStateException()
             if (quickRecording) { val source=File(path);val target=File(path.removeSuffix(".partial"));if(!source.renameTo(target))throw IllegalStateException();path=target.path }
             if (pausedAt == 0L) pausedAt=SystemClock.elapsedRealtime()
             state = if (fromNotification || quickRecording) "finished" else "idle"

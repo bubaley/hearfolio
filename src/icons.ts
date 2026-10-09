@@ -24,6 +24,7 @@ const paths: Record<string, string> = {
   alert: 'm12 3 10 18H2L12 3zm0 6v5m0 3h.01',
   headphones: 'M4 14v-3a8 8 0 0 1 16 0v3M4 12h3v8H4v-8zm13 0h3v8h-3v-8',
   cloud: 'M6 18a5 5 0 0 1-1-10 7 7 0 0 1 13-1 5.5 5.5 0 0 1 0 11H6',
+  pause: 'M8 5v14M16 5v14',
   play: 'm9 5 11 7-11 7V5',
 };
 export function icon(name: string): string {

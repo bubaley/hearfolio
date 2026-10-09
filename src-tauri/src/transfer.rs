@@ -639,6 +639,7 @@ fn commit_received(
             completed_at: m.completed_at,
             size_bytes: Some(m.size),
             duration_seconds: m.duration_seconds,
+            results: vec![],
         };
         entries.push(entry.clone());
         crate::records::write_history_at(dir, &entries)?;

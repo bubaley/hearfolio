@@ -19,7 +19,7 @@ Releases use SemVer derived from Conventional Commits, with a changelog and down
 ## Features
 
 - Import M4A, MP3, WAV, AAC, FLAC, OGG, and MP4 files.
-- Record with the microphone, stop and save the audio, or cancel it. Android records AAC/M4A; desktop records WAV.
+- Record with the microphone, watch the actual input level, stop and save the audio, or cancel it. Android and desktop record mono PCM WAV.
 - Transcribe locally with Whisper Tiny, Base, or Small, or Nemotron 3.5 Streaming.
 - Download models from the app with download size, percentage, and estimated time remaining.
 - Connect OpenRouter using a base URL and API token, then choose an audio model from the searchable catalog in the recording. The supported endpoint is selected automatically.
@@ -27,6 +27,8 @@ Releases use SemVer derived from Conventional Commits, with a changelog and down
 - Browse and search recordings by name, play the original audio, and rename recordings.
 - Copy or export transcripts as `.txt` files. Renamed recordings use the new name when exporting text.
 - Run transcription again with another model. A failed retry preserves the previous saved transcript.
+- Create reusable post-processing rules, such as a brief summary, meeting decisions, or action items. Apply a rule with a text model from OpenRouter and keep its result alongside the original transcript.
+- Share audio, transcripts, and processed results through Android's system share sheet, or save audio to a location chosen with the system picker.
 - Delete an individual recording or clear the archive with confirmation.
 - Switch between light and dark themes, and choose English, Russian, or the device language.
 - Keep engine, model, and recognition mode with each recording. New recordings use the last configuration that successfully started returning text.
@@ -109,11 +111,23 @@ On Android arm64, install the signed APK from Releases. Record a voice note or c
 
 Android source builds require the [Tauri Android prerequisites](https://v2.tauri.app/start/prerequisites/#android), then `npm run tauri -- android init`, `node scripts/prepare-android.mjs`, and `npm run tauri -- android build --apk --target aarch64`.
 
+Android playback uses the system media player, including seeking and duration, rather than depending on WebView audio codecs. The system share sheet lets you send a recording to installed apps such as Telegram. Hearfolio grants the selected recipient temporary access to the shared file; the original remains in its private archive.
+
 ## Microphone recording
 
 Select **Record audio** on the new recording screen. Allow microphone access when the operating system asks, then select **Stop and save** to review the audio and choose a transcription model. Cancel discards the capture. A failed save keeps the recording available for another attempt.
 
 Keep the app open while recording; background recording is not supported. Recording audio does not send it to OpenRouter until you start transcription with that service selected.
+
+Android captures uncompressed mono samples through `AudioRecord`, using the standard `MIC` source with device preprocessing and a `DEFAULT` fallback. System automatic gain control is enabled when available; devices without it can still record. The waveform shows measured microphone input. Silence or quiet speech does not trigger a microphone warning. On macOS, Hearfolio explicitly requests microphone permission before starting capture. If access was previously denied, enable Hearfolio under **System Settings → Privacy & Security → Microphone**.
+
+## Post-processing rules
+
+Open **Settings → Rules** to create a named instruction. Start from **Brief summary**, **Meeting decisions**, or **Action items**, or write your own instruction.
+
+After transcription, select **Process text**, choose a saved rule and a text model from the searchable catalog, and run it. This sends the transcript and instruction to the configured OpenRouter API. The original audio is not sent again for this step. The response appears progressively and is saved only after a successful completion.
+
+The **Results** tab keeps each output with its rule, model, and time. Copy, share, or export it independently of the original transcript. Editing or deleting a rule does not change previous results. New processing uses the last text model that completed successfully.
 
 ## Transcription engines
 
@@ -154,6 +168,7 @@ Choose an archive parent folder in Settings. Hearfolio stores recording data in 
 | `models/` | Downloaded Whisper models. Nemotron uses the NeMo-Speech.cpp model cache. |
 | `temp/` | Temporary processing files. |
 | `history.json` | Recording names, recognition configurations, model information, and result paths. |
+| `postprocess-rules.json` | Saved names and instructions for post-processing. |
 
 In on-device mode, audio is processed locally. When OpenRouter is selected, audio is sent to the configured API. The archive remains on your computer in both modes.
 
@@ -164,6 +179,8 @@ On macOS, the configuration directory is `~/Library/Application Support/Hearfoli
 Changing the archive folder copies the current archive and updates recording paths before switching to the new location. Existing source files remain available. An occupied destination archive is rejected to prevent accidental overwrites.
 
 Renaming updates the recording's display name without moving its audio or transcript files. Deletion only removes files recorded in Hearfolio's history; unrelated files in the archive directories are left untouched.
+
+Processed results and the instructions used to produce them are stored with each recording in `history.json`. They move with the archive and remain separate from the original transcript in `output/`.
 
 ## Project structure
 

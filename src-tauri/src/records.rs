@@ -26,6 +26,8 @@ pub struct HistoryEntry {
     pub size_bytes: Option<u64>,
     #[serde(default)]
     pub duration_seconds: Option<f64>,
+    #[serde(default)]
+    pub results: Vec<crate::postprocess::PostprocessResult>,
 }
 
 pub fn read_history_at(dir: &Path) -> Result<Vec<HistoryEntry>, String> {
@@ -328,6 +330,7 @@ mod tests {
             completed_at: None,
             size_bytes: None,
             duration_seconds: None,
+            results: vec![],
         }
     }
     #[test]
@@ -335,6 +338,7 @@ mod tests {
         let parsed: HistoryEntry = serde_json::from_str(r#"{"id":"hearing-1","name":"old.wav","inputPath":"old.wav","outputPath":null,"model":null,"createdAt":1}"#).unwrap();
         assert!(parsed.size_bytes.is_none());
         assert!(parsed.duration_seconds.is_none());
+        assert!(parsed.results.is_empty());
     }
     #[test]
     fn renaming_preserves_audio_transcript_and_previous_name_on_failure() {

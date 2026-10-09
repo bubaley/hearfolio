@@ -109,6 +109,22 @@ jobs:
           [[ -n "$TAURI_SIGNING_PRIVATE_KEY" ]] || { echo 'Missing TAURI_SIGNING_PRIVATE_KEY'; exit 1; }
           node scripts/release.mjs check
           npm run tauri -- build --ci --target '${{ matrix.target }}' --bundles '${{ matrix.bundles }}' -- --locked
+      - name: Verify macOS microphone access in the signed application
+        if: runner.os == 'macOS'
+        run: |
+          APP_PATH="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Hearfolio.app"
+          codesign --verify --deep --strict "$APP_PATH"
+          codesign --display --entitlements - --xml "$APP_PATH" > "$RUNNER_TEMP/hearfolio-entitlements.plist"
+          python3 - "$RUNNER_TEMP/hearfolio-entitlements.plist" "$APP_PATH/Contents/Info.plist" <<'PY'
+          import plistlib, sys
+          with open(sys.argv[1], 'rb') as file:
+              entitlements = plistlib.load(file)
+          with open(sys.argv[2], 'rb') as file:
+              info = plistlib.load(file)
+          assert entitlements.get('com.apple.security.device.audio-input') is True, 'Missing microphone entitlement'
+          assert info.get('NSMicrophoneUsageDescription', '').strip(), 'Missing microphone purpose description'
+          print('Signed macOS application includes microphone access and its purpose description.')
+          PY
       - name: Collect all required desktop assets
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
@@ -136,6 +152,9 @@ jobs:
           node scripts/release.mjs check
           npm run tauri -- android build --ci --apk --aab --target aarch64
           git diff --exit-code -- src-tauri/Cargo.lock package-lock.json
+      - name: Test Android recorder source and gain control lifecycle
+        working-directory: src-tauri/gen/android
+        run: ./gradlew --no-daemon :tauri-plugin-recording:testDebugUnitTest
       - name: Sign Android packages and verify signatures
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
