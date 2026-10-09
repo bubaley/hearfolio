@@ -152,6 +152,9 @@ jobs:
           node scripts/release.mjs check
           npm run tauri -- android build --ci --apk --aab --target aarch64
           git diff --exit-code -- src-tauri/Cargo.lock package-lock.json
+      - name: Test Android recorder source and gain control lifecycle
+        working-directory: src-tauri/gen/android
+        run: ./gradlew --no-daemon :tauri-plugin-recording:testDebugUnitTest
       - name: Sign Android packages and verify signatures
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}

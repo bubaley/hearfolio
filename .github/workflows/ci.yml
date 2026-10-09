@@ -81,6 +81,9 @@ jobs:
       - uses: ./.github/actions/setup-android
       - name: Build Android arm64 without release secrets
         run: npm run tauri -- android build --ci --debug --apk --target aarch64
+      - name: Test Android recorder source and gain control lifecycle
+        working-directory: src-tauri/gen/android
+        run: ./gradlew --no-daemon :tauri-plugin-recording:testDebugUnitTest
       - name: Ensure Android builds use the checked dependency locks
         run: git diff --exit-code -- src-tauri/Cargo.lock package-lock.json
       - name: Upload Android smoke build

@@ -67,7 +67,6 @@ const messages: Record<string,string> = {
   "Воспроизвести":"Play",
   "Позиция воспроизведения":"Playback position",
   "Определяем длительность…":"Reading duration…",
-  "Микрофон почти не слышит звук. Говорите ближе к устройству.":"The microphone is picking up very little sound. Speak closer to your device.",
   "Не удалось воспроизвести аудио. Попробуйте открыть запись снова. Файл можно распознать.":"Could not play the audio. Try opening the recording again. You can still transcribe the file.",
   'выберите аудиофайл или запишите голос.':'choose an audio file or record your voice.','Запись':'Recording','Начните с аудио':'Start with audio','Запишите голосовую заметку или выберите готовый файл.':'Record a voice memo or choose an existing file.',
   'Записать аудио':'Record audio','Запись аудио':'Recording audio','Идёт запись':'Recording','Подключаем микрофон…':'Connecting microphone…','Сохраняем аудио…':'Saving audio…','Отменяем запись…':'Cancelling recording…',

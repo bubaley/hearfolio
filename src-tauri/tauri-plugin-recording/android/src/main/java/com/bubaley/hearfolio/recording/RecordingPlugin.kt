@@ -3,13 +3,14 @@ package com.bubaley.hearfolio.recording
 import android.Manifest
 import android.app.Activity
 import android.content.ClipData
-import android.content.Context
 import android.content.Intent
 import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaPlayer
 import android.media.MediaRecorder
+import android.media.audiofx.AudioEffect
+import android.media.audiofx.AutomaticGainControl
+import android.util.Log
 import android.os.Build
 import androidx.activity.result.ActivityResult
 import androidx.appcompat.app.AppCompatActivity
@@ -44,6 +45,7 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
     private var playbackGeneration = 0
     private var preparingPlayback: Invoke? = null
     private var recorder: AudioRecord? = null
+    private var gainControl: RecorderGainControl? = null
     private var output: File? = null
     private var pending: Invoke? = null
     private var worker: Thread? = null
@@ -87,42 +89,64 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
             file.parentFile?.mkdirs()
             require(file.createNewFile())
             output = file
-            val audioManager = activity.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            val preferredSource = if (Build.VERSION.SDK_INT >= 24 && audioManager.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true") {
-                MediaRecorder.AudioSource.UNPROCESSED
-            } else { MediaRecorder.AudioSource.VOICE_RECOGNITION }
             var actualRate = 0
-            // Respect device capabilities without applying artificial gain to stored PCM.
-            for (source in listOf(preferredSource, MediaRecorder.AudioSource.VOICE_RECOGNITION, MediaRecorder.AudioSource.MIC).distinct()) {
-                for (rate in listOf(48000, 44100)) {
-                    var candidate: AudioRecord? = null
-                    try {
-                        val minimum = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-                        require(minimum > 0)
-                        candidate = AudioRecord(source, rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minimum * 4, rate / 5 * 2))
-                        require(candidate.state == AudioRecord.STATE_INITIALIZED)
-                        candidate.startRecording()
-                        require(candidate.recordingState == AudioRecord.RECORDSTATE_RECORDING)
-                        next = candidate; actualRate = rate
-                        break
-                    } catch (error: Exception) {
-                        candidate?.release()
-                        if (error is SecurityException) throw error
-                    }
+            var actualSource = MediaRecorder.AudioSource.MIC
+            for (configuration in RecorderCapturePolicy.configurations) {
+                var candidate: AudioRecord? = null
+                var candidateGain: RecorderGainControl? = null
+                try {
+                    val source = configuration.source
+                    val rate = configuration.sampleRate
+                    val minimum = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                    require(minimum > 0)
+                    candidate = AudioRecord(source, rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minimum * 4, rate / 5 * 2))
+                    require(candidate.state == AudioRecord.STATE_INITIALIZED)
+                    candidateGain = createGainControl()
+                    candidateGain.attach(candidate.audioSessionId)
+                    candidate.startRecording()
+                    require(candidate.recordingState == AudioRecord.RECORDSTATE_RECORDING)
+                    next = candidate; actualRate = rate; actualSource = source
+                    gainControl = candidateGain
+                    break
+                } catch (error: Exception) {
+                    candidateGain?.release()
+                    candidate?.release()
+                    if (error is SecurityException) throw error
                 }
-                if (next != null) break
             }
             val active = requireNotNull(next)
             recorder = next
+            val agc = gainControl?.diagnostics ?: RecorderGainDiagnostics()
+            val sourceName = if (actualSource == MediaRecorder.AudioSource.MIC) "MIC" else "DEFAULT"
+            // Metadata only: no samples, file paths, transcript, or user secrets.
+            Log.i("HearfolioRecording", "source=$sourceName; sampleRate=$actualRate; agcAvailable=${agc.available}; agcAttached=${agc.attached}; agcEnabled=${agc.enabled}; agcStatus=${agc.status}")
             capturing = true; captureFailed = false; level = 0.0
             worker = Thread({ capture(active, file, actualRate) }, "HearfolioAudioCapture").also { it.start() }
             pending = null
             invoke.resolve()
         } catch (error: Exception) {
+            releaseGainControl()
             next?.release()
             output?.delete(); output = null; pending = null; recorder = null; capturing = false
             invoke.reject(if (error is SecurityException) "errors.microphonePermissionDenied" else "errors.recordingStart")
         }
+    }
+
+    private fun createGainControl(): RecorderGainControl = RecorderGainControl(
+        isAvailable = { AutomaticGainControl.isAvailable() },
+        create = { session ->
+            AutomaticGainControl.create(session)?.let { effect ->
+                object : RecorderGainEffect {
+                    override fun isEnabled(): Boolean = effect.enabled
+                    override fun enable(): Boolean = effect.setEnabled(true) == AudioEffect.SUCCESS
+                    override fun release() { effect.release() }
+                }
+            }
+        }
+    )
+    private fun releaseGainControl() {
+        gainControl?.release()
+        gainControl = null
     }
 
     // Store PCM directly; header duration is computed from captured samples, never wall time.
@@ -165,6 +189,7 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
         val active = recorder; recorder = null
         try { active?.stop() } catch (_: Exception) { captureFailed = true }
         worker?.join(250)
+        releaseGainControl()
         active?.release()
         worker?.join(2000)
         if (worker?.isAlive == true) { captureFailed = true } else { worker = null }

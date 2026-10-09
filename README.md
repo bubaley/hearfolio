@@ -119,7 +119,7 @@ Select **Record audio** on the new recording screen. Allow microphone access whe
 
 Keep the app open while recording; background recording is not supported. Recording audio does not send it to OpenRouter until you start transcription with that service selected.
 
-Android captures uncompressed mono samples through `AudioRecord`, with compatible source and sample-rate fallbacks. The waveform shows measured microphone input; a sustained quiet signal prompts you to check the microphone. On macOS, Hearfolio explicitly requests microphone permission before starting capture. If access was previously denied, enable Hearfolio under **System Settings → Privacy & Security → Microphone**.
+Android captures uncompressed mono samples through `AudioRecord`, using the standard `MIC` source with device preprocessing and a `DEFAULT` fallback. System automatic gain control is enabled when available; devices without it can still record. The waveform shows measured microphone input. Silence or quiet speech does not trigger a microphone warning. On macOS, Hearfolio explicitly requests microphone permission before starting capture. If access was previously denied, enable Hearfolio under **System Settings → Privacy & Security → Microphone**.
 
 ## Post-processing rules
 
