@@ -1,0 +1,4 @@
+<resources>
+    <string name="hearfolio_record_tile">Record Hearfolio</string>
+    <color name="hearfolio_record_icon_background">#212123</color>
+</resources>

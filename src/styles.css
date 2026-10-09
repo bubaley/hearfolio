@@ -550,3 +550,12 @@ html.qr-scanning #app { visibility: hidden; }
 .qr-scan-heading h2 { margin: 0; font-size: 18px; }
 .qr-scan-frame { width: min(70vw, 280px); aspect-ratio: 1; border: 2px solid var(--accent); border-radius: 12px; }
 .qr-scan-screen>p { max-width: 360px; margin: 0; padding: 16px; border: 1px solid var(--line); border-radius: 9px; background: var(--canvas); text-align: center; line-height: 1.6; }
+
+.recording-stage {position:relative;isolation:isolate;display:grid;place-items:center;width:min(100%,640px);height:180px;flex:none;}
+.recording-stage::before {content:"";position:absolute;inset:12% 8%;z-index:-1;background:radial-gradient(ellipse,var(--accent) 0%,transparent 68%);opacity:.025;pointer-events:none;}
+.recording-stage .recording-duration {position:relative;margin:0;z-index:1;font-variant-numeric:tabular-nums;}
+.recording-meter {position:absolute;inset:0;display:block;width:100%;height:100%;color:var(--accent);overflow:visible;pointer-events:none;opacity:.15;}
+.recording-meter path {fill:none;stroke:url(#voice-gradient);stroke-linecap:round;stroke-linejoin:round;vector-effect:non-scaling-stroke;}
+.recording-meter .voice-line {stroke-width:1.1;}
+.recording-meter .voice-halo {stroke-width:12;opacity:.1;filter:blur(5px);}
+@media(max-width:760px){.recording-stage {height:160px;}}

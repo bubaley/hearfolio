@@ -8,8 +8,9 @@ export function setLanguage(value: LanguagePreference,system?:'ru'|'en') { prefe
 export function locale() { return currentLanguage()==='ru'?'ru-RU':'en-US'; }
 // Only translate static UI fragments. User names, transcripts, model IDs and paths never pass through this table.
 const messages: Record<string,string> = {
+  'Уровень микрофона':'Microphone level',
   'выберите аудиофайл или запишите голос.':'choose an audio file or record your voice.','Запись':'Recording','Начните с аудио':'Start with audio','Запишите голосовую заметку или выберите готовый файл.':'Record a voice memo or choose an existing file.',
-  'Записать аудио':'Record audio','Запись аудио':'Recording audio','Идёт запись':'Recording','Подключаем микрофон…':'Connecting microphone…','Сохраняем аудио…':'Saving audio…','Отменяем запись…':'Cancelling recording…',
+  'Записать аудио':'Record audio','Запись аудио':'Recording audio','Запись на паузе':'Recording paused','Запись сохранена':'Recording saved','Идёт запись':'Recording','Подключаем микрофон…':'Connecting microphone…','Сохраняем аудио…':'Saving audio…','Отменяем запись…':'Cancelling recording…',
   'Длительность записи':'Recording duration','После остановки выберите модель и распознайте аудио.':'After stopping, choose a model and transcribe the audio.',
   'Остановить и сохранить':'Stop and save','Отменить запись':'Cancel recording','Аудио записано':'Audio recorded',
   'Добавьте запись в архив, чтобы перейти к распознаванию.':'Add the recording to your archive to start transcription.',
@@ -129,6 +130,8 @@ export function countLabel(count:number,kind:'record'|'word') {
   return `${count} ${forms[form as keyof typeof forms]||forms.other}`;
 }
 const errorMessages:Record<string,[string,string]>={
+  transferBackgroundUnavailable: ['Не удалось запустить фоновую передачу. Откройте приложение и повторите.','Could not start the background transfer. Open the app and retry.'],
+  transferCancelled: ['Передача отменена','Transfer cancelled'],
   cameraPermissionDenied:['Разрешите Hearfolio доступ к камере в настройках телефона. Код можно ввести вручную.','Allow Hearfolio camera access in your phone settings. You can also enter the code manually.'],
   qrScanFailed:['Не удалось запустить сканер. Проверьте доступ к камере или введите код вручную.','Could not start the scanner. Check camera access or enter the code manually.'],
   qrInvitationInvalid:['Это не QR-код приглашения Hearfolio. Создайте приглашение в разделе «Устройства» на другом устройстве.','This is not a Hearfolio invitation QR. Create an invitation in Devices on your other device.'],

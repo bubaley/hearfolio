@@ -1,6 +1,7 @@
+import {recordingWavePath} from './recording-wave';
 import {transferSettingsHtml, devicesHtml, transferBarHtml, shareButtonHtml, bindTransfers, initializeTransfers} from './transfers';
 import './styles.css';
-import {call, pickAudio, startAudioRecording, stopAudioRecording, cancelAudioRecording, discardAudioRecording, exportText, subscribe, subscribeAudioDrop, registerPreviewFile, audioSource, openExternal, pickStorageParent, loadRuntimePlatform, previewCapabilities, appVersion, checkDesktopUpdate, latestAndroidRelease, restartApp, isNewerVersion, preview, type AudioSelection, type Entry, type Progress, type Settings, type CloudModel, type RecognitionConfig, type RuntimeCapabilities, type AndroidRelease, type AppUpdate} from './api';
+import {recordingInputLevel, call, pickAudio, startAudioRecording, stopAudioRecording, cancelAudioRecording, discardAudioRecording, exportText, subscribe, subscribeAudioDrop, registerPreviewFile, audioSource, openExternal, pickStorageParent, loadRuntimePlatform, previewCapabilities, appVersion, checkDesktopUpdate, latestAndroidRelease, restartApp, isNewerVersion, preview, type AudioSelection, type Entry, type Progress, type Settings, type CloudModel, type RecognitionConfig, type RuntimeCapabilities, type AndroidRelease, type AppUpdate} from './api';
 import {icon, escapeHtml as esc} from './icons';
 import {tr, locale, countLabel, errorText, setLanguage, currentLanguage, type LanguagePreference} from './i18n';
 
@@ -29,9 +30,30 @@ let operationStarted=0, elapsedTimer:ReturnType<typeof setInterval>|null=null;
 let settingsSaveQueue:Promise<unknown>=Promise.resolve(), previousResult:{text:string;saved:boolean}|null=null;
 let receivedPartial=false, audioPosition=0, audioWasPlaying=false, pickingAudio=false;
 let noticeTimer:ReturnType<typeof setTimeout>|null=null;
-let recordingPhase:'idle'|'starting'|'recording'|'stopping'|'cancelling'='idle', recordingStarted=0, recordingTimer:ReturnType<typeof setInterval>|null=null, pendingRecording:AudioSelection|null=null;
+let recordingPhase:'idle'|'starting'|'recording'|'paused'|'stopping'|'cancelling'='idle', recordingStarted=0, recordingTimer:ReturnType<typeof setInterval>|null=null, pendingRecording:AudioSelection|null=null;
 const microphone=()=>'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><rect x="9" y="2" width="6" height="13" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg>';
-const recordingDuration=()=>formatTime(recordingStarted?Math.floor((Date.now()-recordingStarted)/1000):0);
+let nativeRecordingSeconds:number|null=null,externalRecording=false;
+let nativeInputLevel=0, nativeLevelAt=0;
+function recordingMeterHtml(){return `<svg class="recording-meter" viewBox="0 0 640 220" preserveAspectRatio="none" role="img" aria-label="${tr('Уровень микрофона')}"><defs><linearGradient id="voice-gradient"><stop offset="0" stop-color="currentColor" stop-opacity="0"/><stop offset=".22" stop-color="currentColor" stop-opacity=".4"/><stop offset=".5" stop-color="currentColor"/><stop offset=".78" stop-color="currentColor" stop-opacity=".4"/><stop offset="1" stop-color="currentColor" stop-opacity="0"/></linearGradient></defs>${[0,1,2].map(i=>`<path class="voice-halo" d="${recordingWavePath(0,0,i)}"/><path class="voice-line" d="${recordingWavePath(0,0,i)}"/>`).join('')}</svg>`;}
+let waveFrame=0,waveLevel=0,wavePhase=0,waveTime=0;
+const reducedWaveMotion=matchMedia('(prefers-reduced-motion: reduce)');
+function animateRecordingWave(now:number){
+  waveFrame=0;
+  const meter=document.querySelector<SVGElement>('.recording-meter');
+  if(!meter||document.hidden){waveTime=0;waveLevel=0;return;}
+  const dt=waveTime?Math.min(64,now-waveTime):16;waveTime=now;
+  const input=platform.os==='android'&&!preview?(now-nativeLevelAt<700?nativeInputLevel:0):recordingInputLevel();
+  const target=recordingPhase==='recording'&&Number.isFinite(input)?Math.max(0,Math.min(1,input)):0;
+  waveLevel=reducedWaveMotion.matches?target:waveLevel+(target-waveLevel)*(1-Math.exp(-dt/(target>waveLevel?90:260)));
+  if(Math.abs(waveLevel-target)<.001)waveLevel=target;
+  if(!reducedWaveMotion.matches&&target>0)wavePhase+=dt*.0018*(.35+target);
+  meter.querySelectorAll('path').forEach((path,i)=>path.setAttribute('d',recordingWavePath(waveLevel,wavePhase,Math.floor(i/2))));
+  if(!reducedWaveMotion.matches&&(target>0||waveLevel>0))waveFrame=requestAnimationFrame(animateRecordingWave);
+  else waveTime=0;
+}
+// Wake animation only while this foreground recording surface is present.
+setInterval(()=>{if(!waveFrame&&!document.hidden&&document.querySelector('.recording-meter'))waveFrame=requestAnimationFrame(animateRecordingWave);},100);
+const recordingDuration=()=>formatTime(nativeRecordingSeconds??(recordingStarted?Math.floor((Date.now()-recordingStarted)/1000):0));
 document.documentElement.dataset.theme=theme;
 const title:Record<View,string>={work:"Расшифровка",history:"Записи",models:"Модели",settings:"Настройки",devices:"Устройства"};
 const modelName=(id:string|null)=>{const normalized=id?.replace(/^openrouter\//,'');return models.find(model=>model.id===normalized)?.name||cloudModels.find(model=>model.id===normalized)?.name||normalized||tr("Модель не выбрана");};
@@ -100,11 +122,12 @@ function sidebarHtml():string {
   return `${tr("<aside class=\"sidebar\" aria-label=\"Навигация\"><div class=\"sidebar-chrome\" data-tauri-drag-region><button class=\"icon-button\" id=\"collapse\" title=\"Свернуть боковую панель\" aria-label=\"Свернуть боковую панель\" aria-expanded=\"true\">")}${icon('panel')}${tr("</button></div><div class=\"sidebar-body\"><div class=\"brand-row\"><button class=\"brand\" data-view=\"work\" title=\"Hearfolio — расшифровка аудио\">")}${icon('wave')}Hearfolio</button></div><div class="primary-nav"><button class="nav-item" id="new" ${disabled()}>${icon('plus')}${tr("<span>Новая запись</span><kbd>⌘ N</kbd></button><button class=\"nav-item ")}${view==='history'?'active':''}" data-view="history">${icon('search')}${tr("<span>Найти запись</span><kbd>⌘ K</kbd></button></div><div class=\"recent-records\"><div class=\"recent-heading\"><span>Недавние записи</span>")}${history.length?`${tr("<button class=\"text-button\" data-view=\"history\">Все ")}${history.length}</button>`:''}</div>${loading?tr("<div class=\"sidebar-empty\">Загружаем записи…</div>"):historyError?tr("<button class=\"text-button\" id=\"retry-history\">Повторить загрузку</button>"):recent.length?historyItems(recent,true):tr("<div class=\"sidebar-empty\">Здесь появятся ваши записи</div>")}</div><nav class="bottom-nav" aria-label="${tr('Приложение')}">${desktopModelsNav()}<button class="nav-item ${view==='devices'?'active':''}" data-view="devices">${icon('devices')}<span>${tr('Устройства')}</span></button><button class="nav-item ${view==='settings'?'active':''}" data-view="settings">${icon('settings')}${tr("<span>Настройки</span></button></nav><div class=\"sidebar-footer\"><span>")}${icon('headphones')}${tr("Личный аудиоархив</span><button class=\"icon-button\" data-theme title=\"")}${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}" aria-label="${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}">${icon(theme==='dark'?'sun':'moon')}</button></div></div></aside>`;
 }
 function captureHtml():string {
-  if(recordingPhase!=='idle')return `<div class="capture-panel recording-panel"><div class="recording-indicator">${microphone()}<span>${tr(recordingPhase==='starting'?'Подключаем микрофон…':recordingPhase==='stopping'?'Сохраняем аудио…':recordingPhase==='cancelling'?'Отменяем запись…':'Идёт запись')}</span></div><div class="recording-duration" id="recording-duration" aria-label="${tr('Длительность записи')}">${recordingDuration()}</div><p>${tr('После остановки выберите модель и распознайте аудио.')}</p><button class="primary capture-stop" id="stop-recording" ${recordingPhase!=='recording'?'disabled':''}><span class="stop-symbol"></span>${tr('Остановить и сохранить')}</button><button class="text-button capture-cancel" id="cancel-recording" ${recordingPhase!=='recording'?'disabled':''}>${tr('Отменить запись')}</button></div>`;
+  if(recordingPhase!=='idle')return `<div class="capture-panel recording-panel"><div class="recording-indicator">${microphone()}<span>${tr(recordingPhase==='starting'?'Подключаем микрофон…':recordingPhase==='stopping'?'Сохраняем аудио…':recordingPhase==='cancelling'?'Отменяем запись…':recordingPhase==='paused'?'Запись на паузе':'Идёт запись')}</span></div><div class="recording-stage">${recordingMeterHtml()}<div class="recording-duration" id="recording-duration" aria-label="${tr('Длительность записи')}">${recordingDuration()}</div></div><p>${tr('После остановки выберите модель и распознайте аудио.')}</p><button class="primary capture-stop" id="stop-recording" ${!['recording','paused'].includes(recordingPhase)?'disabled':''}><span class="stop-symbol"></span>${tr('Остановить и сохранить')}</button><button class="text-button capture-cancel" id="cancel-recording" ${!['recording','paused'].includes(recordingPhase)?'disabled':''}>${tr('Отменить запись')}</button></div>`;
   if(pendingRecording)return `<div class="capture-panel"><div class="empty-symbol">${microphone()}</div><h1>${tr('Аудио записано')}</h1><p>${tr('Добавьте запись в архив, чтобы перейти к распознаванию.')}</p><button class="primary" id="retry-recording" ${disabled()}>${tr('Добавить в архив')}</button><button class="text-button capture-cancel" id="discard-recording" ${disabled()}>${tr('Удалить эту запись')}</button></div>`;
   return `<div class="capture-panel"><div class="empty-symbol">${icon('wave')}</div><h1>${tr('Начните с аудио')}</h1><p>${tr('Запишите голосовую заметку или выберите готовый файл.')}</p>${platform.audioRecording?`<button class="primary capture-start" id="start-recording" ${disabled()}>${microphone()}${tr('Записать аудио')}</button>`:''}<button class="secondary capture-file" data-choose ${disabled()}>${icon('plus')}${tr('Выбрать аудиофайл')}</button><small>${audioFormats}</small></div>`;
 }
 function outputHtml():string {
+  if(recordingPhase!=='idle')return captureHtml();
   if(!active&&(platform.mobile||recordingPhase!=='idle'||pendingRecording))return captureHtml();
   if (text) return `<article class="transcript">${esc(text)}</article>`;
   if (active) return `<div class="record-empty"><div class="empty-symbol">${icon('wave')}</div><h2>${busy&&progress?.kind==='transcribe'?tr("Распознаём запись…"):tr("Запись готова к распознаванию")}</h2><p>${busy&&progress?.kind==='transcribe'?tr("Текст будет появляться здесь по мере обработки."):tr("Выберите способ распознавания внизу и нажмите «Распознать».")}</p></div>`;
@@ -138,6 +161,7 @@ function runButtonHtml(issue:string):string {
   return `<button class="run-button ${active&&!busy?'with-label':''}" id="run" ${busy||!active||issue?'disabled':''} title="${esc(issue||(!active?tr("Добавьте аудиофайл"):label+' · ⌘ Enter'))}" aria-label="${label}">${active&&!busy?`<span>${label}</span>`:''}${busy&&progress?.kind==='transcribe'?'<span class="spinner"></span>':icon('arrow')}</button>`;
 }
 function composerHtml(issue:string):string {
+  if(recordingPhase!=='idle')return '';
   if(!active&&(platform.mobile||recordingPhase!=='idle'||pendingRecording))return progress?`<div class="composer-area"><div id="progress">${progressHtml()}</div></div>`:'';
   const needsDownload=configuration.provider==='local'&&runtime.ffmpeg&&!models.find(model=>model.id===localChoice)?.installed;
   const needsCatalog=configuration.provider==='openrouter'&&(platform.nativeAudio||runtime.ffmpeg)&&settings.hasToken;
@@ -420,7 +444,7 @@ function clearRecordingTimer(){if(recordingTimer)clearInterval(recordingTimer);r
 async function startRecording(){
   if(busy||active||!platform.audioRecording||!await mayLeaveSettings()||!await mayReplaceRecord())return;
   if(busy||active)return;
-  settingsDraft=null;view='work';recordingPhase='starting';busy=true;status='';recordingStarted=0;render();
+  lastNativeRecordingResult='';nativeRecordingSeconds=null;settingsDraft=null;view='work';recordingPhase='starting';busy=true;status='';recordingStarted=0;render();
   try{await startAudioRecording();recordingStarted=Date.now();recordingPhase='recording';recordingTimer=setInterval(()=>{const timer=document.querySelector('#recording-duration');if(timer)timer.textContent=recordingDuration();},250);render();}
   catch(error){recordingPhase='idle';busy=false;render();notice(errorText(error),true);}
 }
@@ -431,8 +455,9 @@ function recordingName(selected:AudioSelection):string {
   return `${tr('Запись')} ${day} ${pad(date.getHours())}.${pad(date.getMinutes())}.${extension}`;
 }
 async function stopRecording(){
-  if(recordingPhase!=='recording')return;
+  if(!['recording','paused'].includes(recordingPhase))return;
   clearRecordingTimer();recordingPhase='stopping';render();
+  if(externalRecording){try{await call('recording_quick_control',{action:'stop'});await finishQuickRecording();}catch(e){notice(errorText(e),true);await syncNativeRecording();}return;}
   try{
     pendingRecording=await stopAudioRecording();recordingPhase='idle';
     if(!pendingRecording)throw new Error('errors.recordingEmpty');
@@ -441,10 +466,10 @@ async function stopRecording(){
   }catch(error){await cancelAudioRecording().catch(()=>{});recordingPhase='idle';busy=false;render();notice(errorText(error),true);}
 }
 async function cancelRecording(){
-  if(recordingPhase!=='recording')return;
+  if(!['recording','paused'].includes(recordingPhase))return;
   clearRecordingTimer();recordingPhase='cancelling';render();
-  try{await cancelAudioRecording();}catch(error){notice(errorText(error),true);}
-  finally{recordingPhase='idle';recordingStarted=0;busy=false;render();}
+  try{if(externalRecording)await call('recording_quick_control',{action:'cancel'});else await cancelAudioRecording();}catch(error){notice(errorText(error),true);}
+  finally{externalRecording=false;recordingPhase='idle';recordingStarted=0;busy=false;render();}
 }
 async function importSelection(selected:AudioSelection):Promise<boolean>{
   beginOperation('import',tr('Добавляем запись'));settingsDraft=null;view='work';render();
@@ -566,6 +591,7 @@ async function initialize() {
   if(['macos','linux','windows'].includes(platform.os))subscribeAudioDrop(paths=>{if(paths.length){if(paths.length>1)notice(tr("Добавляем первый файл. Остальные можно добавить по одному."));choose(paths[0]);}}).catch(error=>notice(errorText(error),true));
   restoreConfiguration(active);render();
   await Promise.allSettled([refreshHistory(),refreshRuntime()]);
+  if(platform.os==='android'){await syncNativeRecording();await importQuickRecordings();}
   if(!preview)void checkUpdates();
 }
 void initialize();
@@ -601,3 +627,21 @@ window.addEventListener('beforeunload',event=>{if(settingsDraft||pendingRecordin
 
 function updateCatalogViewport(){const viewport=window.visualViewport;document.documentElement.style.setProperty('--catalog-height',`${viewport?.height||window.innerHeight}px`);document.documentElement.style.setProperty('--catalog-top',`${viewport?.offsetTop||0}px`);}
 updateCatalogViewport();window.visualViewport?.addEventListener('resize',updateCatalogViewport);window.visualViewport?.addEventListener('scroll',updateCatalogViewport);window.addEventListener('resize',updateCatalogViewport);
+
+subscribe<{state:string;elapsedSeconds?:number}>('recording-native-state',p=>{if(!['recording','paused'].includes(recordingPhase))return;if(p.elapsedSeconds!==undefined)nativeRecordingSeconds=p.elapsedSeconds;if(p.state==='finished'){clearRecordingTimer();recordingPhase='stopping';render();return;}const next=p.state==='paused'?'paused':p.state==='recording'?'recording':null;if(next&&next!==recordingPhase){recordingPhase=next;render();}}).catch(()=>{});
+type NativeRecordingResult={entry?:Entry;selection?:AudioSelection;error?:string};
+let lastNativeRecordingResult='';
+async function finishNativeRecording(p:NativeRecordingResult){const key=JSON.stringify(p);if(key===lastNativeRecordingResult)return;lastNativeRecordingResult=key;clearRecordingTimer();recordingPhase='idle';recordingStarted=0;busy=false;pendingRecording=p.selection||null;if(p.entry){resetPlayback();active=p.entry;restoreConfiguration(p.entry);text='';resultSaved=false;previousResult=null;view='work';await refreshHistory();}render();if(p.error)notice(errorText(p.error),true);else notice(tr('Запись сохранена'));}
+subscribe<NativeRecordingResult>('recording-native-finished',p=>{void finishNativeRecording(p);}).catch(()=>{});
+let snapshotPolling=false,quickFinishing=false;
+async function finishQuickRecording(){if(quickFinishing)return;quickFinishing=true;try{const entries=await call<Entry[]>('import_quick_recordings');externalRecording=false;recordingPhase='idle';busy=false;clearRecordingTimer();if(entries.length){const entry=entries[entries.length-1];if(!active||resultSaved||!text){resetPlayback();active=entry;restoreConfiguration(entry);text='';resultSaved=false;previousResult=null;}await refreshHistory();notice(tr('Запись сохранена'));}render();}catch(e){if(!String(e).includes('operationBusy')){externalRecording=false;recordingPhase='idle';busy=false;render();notice(errorText(e),true);}}finally{quickFinishing=false;}}
+async function syncNativeRecording(){if(snapshotPolling||document.hidden||platform.os!=='android')return;snapshotPolling=true;try{const p=await call<{state:string;quick?:boolean;elapsedSeconds?:number;level?:number;result?:NativeRecordingResult}>('recording_activity_snapshot');nativeInputLevel=p.level??0;nativeLevelAt=performance.now();const live=p.state==='recording'||p.state==='paused';if(p.quick&&live){if(busy&&recordingPhase==='idle')return;externalRecording=true;busy=true;view='work';const changed=recordingPhase!==p.state;recordingPhase=p.state as 'recording'|'paused';nativeRecordingSeconds=p.elapsedSeconds??0;const timer=document.querySelector('#recording-duration');if(timer)timer.textContent=recordingDuration();if(changed)render();}else if(externalRecording){if(p.state==='finished'){recordingPhase='stopping';await finishQuickRecording();}else if(!live){externalRecording=false;recordingPhase='idle';busy=false;render();}}else if(p.result&&recordingPhase!=='starting'){await finishNativeRecording(p.result);}else if(live&&['recording','paused'].includes(recordingPhase)){nativeRecordingSeconds=p.elapsedSeconds??nativeRecordingSeconds;const next=p.state as 'recording'|'paused';if(next!==recordingPhase){recordingPhase=next;render();}}else if(p.state==='error'&&recordingPhase!=='idle'){await finishNativeRecording({error:'errors.recordingEmpty'});}}catch{/* Poll again on the next foreground tick. */}finally{snapshotPolling=false;}}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)void syncNativeRecording();});
+let lastNativePoll=0;setInterval(()=>{const now=performance.now();if(now-lastNativePoll>=(recordingPhase==='idle'?700:150)){lastNativePoll=now;void syncNativeRecording();}},150);
+
+
+let importingQuick=false,quickImportFailed=false;
+async function importQuickRecordings(retry=false){if(retry)quickImportFailed=false;if(quickImportFailed||importingQuick||busy||platform.os!=='android')return;importingQuick=true;try{const entries=await call<Entry[]>('import_quick_recordings');if(entries.length){await refreshHistory();notice(currentLanguage()==='ru'?`Добавлено записей: ${entries.length}`:`Recordings added: ${entries.length}`);}}catch(e){if(!String(e).includes('operationBusy')){quickImportFailed=true;notice(errorText(e),true);}}finally{importingQuick=false;}}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)void importQuickRecordings(true);});
+
+setInterval(()=>{if(!document.hidden&&platform.os==='android')void importQuickRecordings();},5000);

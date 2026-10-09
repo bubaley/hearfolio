@@ -288,7 +288,7 @@ pub async fn transfer_api(action: String, payload: Value) -> Result<Value, Strin
     .await
     .map_err(error)?
 }
-fn hash_file(path: &Path) -> Result<(String, u64), String> {
+pub(crate) fn hash_file(path: &Path) -> Result<(String, u64), String> {
     let mut f = fs::File::open(path).map_err(error)?;
     let mut hash = Sha256::new();
     let mut size = 0;
@@ -312,8 +312,10 @@ fn emit(app: &tauri::AppHandle, id: &str, status: &str, current: u64, total: u64
 #[tauri::command]
 pub async fn transfer_send(app: tauri::AppHandle, id: String, to: String) -> Result<(), String> {
     let job = crate::JobGuard::acquire()?;
+    let background = crate::background::TransferGuard::start(&app, "send")?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
+        let mut background = background;
         let c = load()?;
         let entry = crate::read_history()?
             .into_iter()
@@ -352,18 +354,26 @@ pub async fn transfer_send(app: tauri::AppHandle, id: String, to: String) -> Res
             model: entry.model,
             configuration: entry.configuration,
         };
-        let offered = rpc(&c, "offer", json!({"to":to,"manifest":manifest}))?;
+        let offered = rpc(
+            &c,
+            "offer",
+            json!({"to":to,"manifest":manifest,"metadataOnly":true}),
+        )?;
         let session = offered["id"]
             .as_str()
             .ok_or("Transfer ID missing")?
             .to_owned();
         let result = (|| {
             emit(&app, &session, "waiting", 0, size);
+            background.progress("waiting", 0, size);
             let started = Instant::now();
-            loop {
+            let audio_required = loop {
+                background.check()?;
+                background.progress("waiting", 0, 0);
                 let status = rpc(&c, "status", json!({"id":session}))?;
                 match status["status"].as_str() {
-                    Some("streaming") => break,
+                    Some("streaming") => break status["audioRequired"].as_bool().unwrap_or(true),
+                    Some("delivered") => break false,
                     Some("cancelled") => return Err("Transfer cancelled".into()),
                     _ => {}
                 }
@@ -371,29 +381,34 @@ pub async fn transfer_send(app: tauri::AppHandle, id: String, to: String) -> Res
                     return Err("Recipient did not accept".into());
                 }
                 std::thread::sleep(Duration::from_millis(500));
-            }
-            let mut file = fs::File::open(path).map_err(error)?;
-            let mut offset = 0;
-            let mut buf = [0; BLOCK];
-            loop {
-                let n = file.read(&mut buf).map_err(error)?;
-                if n == 0 {
-                    break;
+            };
+            if audio_required {
+                let mut file = fs::File::open(path).map_err(error)?;
+                let mut offset = 0;
+                let mut buf = [0; BLOCK];
+                loop {
+                    background.check()?;
+                    let n = file.read(&mut buf).map_err(error)?;
+                    if n == 0 {
+                        break;
+                    }
+                    response(
+                        client()?
+                            .put(format!("{}/transfers/{session}/chunk", c.server))
+                            .bearer_auth(&c.token)
+                            .header("x-offset", offset.to_string())
+                            .body(buf[..n].to_vec())
+                            .send()
+                            .map_err(network_error)?,
+                    )?;
+                    offset += n as u64;
+                    emit(&app, &session, "sending", offset, size);
+                    background.progress("sending", offset, size);
                 }
-                response(
-                    client()?
-                        .put(format!("{}/transfers/{session}/chunk", c.server))
-                        .bearer_auth(&c.token)
-                        .header("x-offset", offset.to_string())
-                        .body(buf[..n].to_vec())
-                        .send()
-                        .map_err(network_error)?,
-                )?;
-                offset += n as u64;
-                emit(&app, &session, "sending", offset, size);
             }
             let finish = Instant::now();
             loop {
+                background.check()?;
                 let s = rpc(&c, "status", json!({"id":session}))?;
                 if s["status"] == "delivered" {
                     break;
@@ -408,6 +423,9 @@ pub async fn transfer_send(app: tauri::AppHandle, id: String, to: String) -> Res
         })();
         if result.is_err() {
             let _ = rpc(&c, "cancel", json!({"id":session}));
+        }
+        if result.is_ok() {
+            background.complete();
         }
         result
     })
@@ -441,32 +459,61 @@ fn validate_manifest(m: &Manifest) -> Result<(), String> {
     }
     Ok(())
 }
-fn commit_received(
+fn recording_matches(entry: &HistoryEntry, m: &Manifest, local_id: &str) -> bool {
+    entry.id == m.source_id
+        || entry.transfer_source_id.as_deref() == Some(m.source_id.as_str())
+        || entry.id == local_id
+}
+fn received_id(m: &Manifest) -> Result<String, String> {
+    let digest = Sha256::digest(
+        serde_json::to_vec(&json!({"sourceId":m.source_id,"sha256":m.sha256})).map_err(error)?,
+    );
+    Ok(format!("hearing-{digest:x}"))
+}
+fn has_verified_audio(dir: &Path, m: &Manifest) -> Result<bool, String> {
+    let local_id = received_id(m)?;
+    Ok(crate::records::read_history_at(dir)?
+        .iter()
+        .filter(|entry| recording_matches(entry, m, &local_id))
+        .any(|entry| {
+            managed_audio_target(dir, entry).is_ok()
+                && hash_file(Path::new(&entry.input_path))
+                    .is_ok_and(|(hash, size)| hash == m.sha256 && size == m.size)
+        }))
+}
+fn managed_audio_target(dir: &Path, entry: &HistoryEntry) -> Result<PathBuf, String> {
+    let path = Path::new(&entry.input_path);
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let expected = dir
+        .join("input")
+        .join(format!("{}.{}", entry.id, extension));
+    if !entry.id.starts_with("hearing-")
+        || !entry
+            .id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        || path != expected
+        || !["m4a", "mp3", "wav", "mp4", "aac", "flac", "ogg"].contains(&extension)
+    {
+        return Err("Invalid archived audio path".into());
+    }
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => Ok(expected),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(expected),
+        _ => Err("Invalid archived audio path".into()),
+    }
+}
+fn update_received_entry(
     dir: &Path,
-    staging: &Path,
-    local_id: String,
-    m: Manifest,
+    entry: &HistoryEntry,
+    m: &Manifest,
 ) -> Result<HistoryEntry, String> {
-    validate_manifest(&m)?;
-    let mut entries = crate::records::read_history_at(dir)?;
-    if let Some(entry) = entries.iter().find(|e| {
-        e.id == m.source_id
-            || e.transfer_source_id.as_deref() == Some(m.source_id.as_str())
-            || e.id == local_id
-    }) {
-        let (sha256, size) = hash_file(Path::new(&entry.input_path))?;
-        if sha256 != m.sha256 || size != m.size {
-            return Err("Recording identity refers to different audio".into());
-        }
-        // Empty or older results must not erase a newer local transcription.
-        if m.transcript.is_empty() || m.completed_at.unwrap_or(0) < entry.completed_at.unwrap_or(0)
-        {
-            return Ok(entry.clone());
-        }
-        let mut updated = entry.clone();
-        updated.transfer_source_id = Some(m.source_id);
-        updated.model = m.model;
-        updated.configuration = m.configuration;
+    let mut updated = entry.clone();
+    updated.transfer_source_id = Some(m.source_id.clone());
+    updated.size_bytes = Some(m.size);
+    if !m.transcript.is_empty() && m.completed_at.unwrap_or(0) >= entry.completed_at.unwrap_or(0) {
+        updated.model = m.model.clone();
+        updated.configuration = m.configuration.clone();
         updated.completed_at = m.completed_at;
         crate::records::replace_transcript_at(dir, updated.clone(), &m.transcript)?;
         updated.output_path = Some(
@@ -475,7 +522,81 @@ fn commit_received(
                 .to_string_lossy()
                 .into(),
         );
-        return Ok(updated);
+    } else {
+        let mut entries = crate::records::read_history_at(dir)?;
+        *entries
+            .iter_mut()
+            .find(|e| e.id == entry.id)
+            .ok_or("Recording missing")? = updated.clone();
+        crate::records::write_history_at(dir, &entries)?;
+    }
+    Ok(updated)
+}
+fn repair_received_audio(
+    dir: &Path,
+    staging: &Path,
+    entry: &HistoryEntry,
+    m: &Manifest,
+) -> Result<HistoryEntry, String> {
+    let target = managed_audio_target(dir, entry)?;
+    // A damaged/missing local copy is replaceable only by verified incoming bytes.
+    if hash_file(staging)? != (m.sha256.clone(), m.size) {
+        return Err("Audio checksum mismatch".into());
+    }
+    let repair = dir
+        .join("temp")
+        .join(format!("repair-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&repair).map_err(error)?;
+    let result = (|| {
+        let candidate = repair.join("new");
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .map_err(error)?;
+        std::io::copy(&mut fs::File::open(staging).map_err(error)?, &mut output).map_err(error)?;
+        output.sync_all().map_err(error)?;
+        drop(output);
+        let backup = repair.join("previous");
+        let existed = target.exists();
+        if existed {
+            fs::rename(&target, &backup).map_err(error)?;
+        }
+        let commit = fs::rename(&candidate, &target)
+            .map_err(error)
+            .and_then(|_| update_received_entry(dir, entry, m));
+        if commit.is_err() {
+            if existed {
+                fs::rename(&backup, &target)
+                    .map_err(|e| format!("Audio recovery required at {}: {e}", backup.display()))?;
+            } else if target.exists() {
+                fs::remove_file(&target).map_err(error)?;
+            }
+        }
+        commit
+    })();
+    // Preserve any backup if restoring it failed.
+    if !repair.join("previous").exists() || result.is_ok() {
+        let _ = fs::remove_dir_all(repair);
+    }
+    result
+}
+fn commit_received(
+    dir: &Path,
+    staging: &Path,
+    local_id: String,
+    m: Manifest,
+) -> Result<HistoryEntry, String> {
+    validate_manifest(&m)?;
+    let mut entries = crate::records::read_history_at(dir)?;
+    if let Some(entry) = entries.iter().find(|e| recording_matches(e, &m, &local_id)) {
+        managed_audio_target(dir, entry)?;
+        if !hash_file(Path::new(&entry.input_path))
+            .is_ok_and(|(hash, size)| hash == m.sha256 && size == m.size)
+        {
+            return repair_received_audio(dir, staging, entry, &m);
+        }
+        return update_received_entry(dir, entry, &m);
     }
     let target = dir
         .join("input")
@@ -536,11 +657,23 @@ fn commit_received(
 #[tauri::command]
 pub async fn transfer_receive(app: tauri::AppHandle, id: String) -> Result<HistoryEntry, String> {
     let job = crate::JobGuard::acquire()?;
+    let background = crate::background::TransferGuard::start(&app, "receive")?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
+        let mut background=background;
         let c = load()?;
-        let accepted = rpc(&c, "accept", json!({"id":id}))?;
         let dir = crate::base()?;
+        // Older relays/senders default to a full transfer.
+        let mut accept_payload=json!({"id":id});
+        if let Ok(inspected)=rpc(&c,"inspect",json!({"id":id})) {
+            let manifest:Manifest=serde_json::from_value(inspected["manifest"].clone()).map_err(error)?;
+            validate_manifest(&manifest)?;
+            let _lock=crate::history_lock()?;
+            if inspected["metadataOnlyCapable"]==true && has_verified_audio(&dir,&manifest)? {
+                accept_payload=json!({"id":id,"audioRequired":false,"sha256":manifest.sha256,"size":manifest.size});
+            }
+        }
+        let accepted=rpc(&c,"accept",accept_payload)?;
         let staging = dir
             .join("temp")
             .join(format!("transfer-{}.part", uuid::Uuid::new_v4()));
@@ -549,11 +682,18 @@ pub async fn transfer_receive(app: tauri::AppHandle, id: String) -> Result<Histo
                 serde_json::from_value(accepted["manifest"].clone()).map_err(error)?;
             validate_manifest(&m)?;
             emit(&app, &id, "receiving", 0, m.size);
-            let digest = Sha256::digest(
-                serde_json::to_vec(&json!({"sourceId":m.source_id,"sha256":m.sha256}))
-                    .map_err(error)?,
-            );
-            let local_id = format!("hearing-{digest:x}");
+            let local_id=received_id(&m)?;
+            if accepted["audioRequired"]==false {
+                background.check()?;
+                background.progress("metadata",0,0);
+                let _lock=crate::history_lock()?;
+                if !has_verified_audio(&dir,&m)? {return Err("Existing audio changed; retry to download it again".into());}
+                let entry=commit_received(&dir,&staging,local_id,m.clone())?;
+                app.asset_protocol_scope().allow_file(&entry.input_path).map_err(error)?;
+                rpc(&c,"finish",json!({"id":id}))?;
+                emit(&app,&id,"delivered",m.size,m.size);
+                return Ok(entry);
+            }
             let mut output = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -563,6 +703,7 @@ pub async fn transfer_receive(app: tauri::AppHandle, id: String) -> Result<Histo
             let mut hash = Sha256::new();
             let mut last = Instant::now();
             while offset < m.size {
+                background.check()?;
                 let Some((position, buf)) = receive_block(&c, &id)? else {
                     if last.elapsed() > Duration::from_secs(45) {
                         return Err("Sender timed out".into());
@@ -582,6 +723,7 @@ pub async fn transfer_receive(app: tauri::AppHandle, id: String) -> Result<Histo
                 rpc(&c, "ack", json!({"id":id,"offset":offset}))?;
                 last = Instant::now();
                 emit(&app, &id, "receiving", offset, m.size);
+                background.progress("receiving",offset,m.size);
             }
             output.sync_all().map_err(error)?;
             drop(output);
@@ -601,6 +743,7 @@ pub async fn transfer_receive(app: tauri::AppHandle, id: String) -> Result<Histo
         if result.is_err() {
             let _ = rpc(&c, "cancel", json!({"id":id}));
         }
+        if result.is_ok() {background.complete();}
         result
     })
     .await
@@ -707,6 +850,63 @@ mod tests {
         m.sha256 = "a".repeat(64);
         assert!(commit_received(&dir, &audio, "hearing-unused".into(), m).is_err());
         assert_eq!(crate::records::read_history_at(&dir).unwrap().len(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn hash_negotiation_reuses_intact_audio_and_repairs_missing_or_corrupt_copies() {
+        let (dir, staging, mut m) = fixture();
+        let entry = commit_received(&dir, &staging, "hearing-copy".into(), m.clone()).unwrap();
+        assert!(has_verified_audio(&dir, &m).unwrap());
+        m.transcript = "Only updated text".into();
+        m.completed_at = Some(999);
+        // Metadata-only commit needs no downloaded staging file.
+        let updated = commit_received(
+            &dir,
+            &dir.join("absent.part"),
+            "hearing-unused".into(),
+            m.clone(),
+        )
+        .unwrap();
+        assert_eq!(updated.id, entry.id);
+        assert_eq!(
+            fs::read_to_string(updated.output_path.as_ref().unwrap()).unwrap(),
+            m.transcript
+        );
+        for missing in [false, true] {
+            if missing {
+                fs::remove_file(&entry.input_path).unwrap();
+            } else {
+                fs::write(&entry.input_path, b"corrupt audio").unwrap();
+            }
+            assert!(!has_verified_audio(&dir, &m).unwrap());
+            let repaired =
+                commit_received(&dir, &staging, "hearing-unused".into(), m.clone()).unwrap();
+            assert_eq!(repaired.id, entry.id);
+            assert_eq!(
+                fs::read(&entry.input_path).unwrap(),
+                fs::read(&staging).unwrap()
+            );
+            assert!(has_verified_audio(&dir, &m).unwrap());
+            assert_eq!(crate::records::read_history_at(&dir).unwrap().len(), 1);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_repair_restores_damaged_audio_and_prior_transcript() {
+        let (dir, staging, mut m) = fixture();
+        let entry = commit_received(&dir, &staging, "hearing-copy".into(), m.clone()).unwrap();
+        fs::write(&entry.input_path, b"old damaged audio").unwrap();
+        fs::create_dir(dir.join("history.json.tmp")).unwrap();
+        m.transcript = "Updated".into();
+        m.completed_at = Some(999);
+        assert!(commit_received(&dir, &staging, "hearing-unused".into(), m).is_err());
+        assert_eq!(fs::read(&entry.input_path).unwrap(), b"old damaged audio");
+        assert_eq!(
+            fs::read_to_string(entry.output_path.unwrap()).unwrap(),
+            "Сохранённый текст"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

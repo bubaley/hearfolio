@@ -87,11 +87,18 @@ export function createRelay({stateFile, ttl=120000, codeTtl=180000, registration
           if(!m||m.version!==1||!text(m.name)||!text(m.sourceId)||!['m4a','mp3','wav','mp4','aac','flac','ogg'].includes(m.extension)||!Number.isSafeInteger(m.size)||m.size<=0||m.size>MAX_SIZE||!/^[a-f0-9]{64}$/.test(m.sha256)||typeof m.transcript!=='string'||Buffer.byteLength(m.transcript)>4*1024*1024||!Number.isSafeInteger(m.createdAt)||m.createdAt<0)fail('Invalid recording manifest');
           if([...transfers.values()].filter(t=>!['delivered','cancelled'].includes(t.status)).length>=16)fail('Relay busy',429);
           if([...transfers.values()].some(t=>t.to===payload.to&&!['delivered','cancelled'].includes(t.status)))fail('Recipient has another transfer',409);
-          const id=randomUUID();transfers.set(id,{id,from:device.id,to:payload.to,manifest:m,status:'offered',offset:0,updated:Date.now(),pending:null});return json(res,{id});
+          const id=randomUUID();transfers.set(id,{id,from:device.id,to:payload.to,manifest:m,status:'offered',offset:0,updated:Date.now(),pending:null,metadataOnlyCapable:payload.metadataOnly===true,audioRequired:true});return json(res,{id});
         }
         const t=transfers.get(payload.id);if(!t||![t.from,t.to].includes(device.id))fail('Unknown transfer',404);t.updated=Date.now();
-        if(action==='status')return json(res,{status:t.status,offset:t.offset,size:t.manifest.size});
-        if(action==='accept'&&t.to===device.id&&t.status==='offered'){t.status='streaming';return json(res,{manifest:t.manifest,from:t.from});}
+        if(action==='status')return json(res,{status:t.status,offset:t.offset,size:t.manifest.size,audioRequired:t.audioRequired});
+        if(action==='inspect'&&t.to===device.id&&t.status==='offered')return json(res,{manifest:t.manifest,metadataOnlyCapable:t.metadataOnlyCapable});
+        if(action==='accept'&&t.to===device.id&&t.status==='offered'){
+          if(payload.audioRequired===false){
+            if(!t.metadataOnlyCapable||payload.sha256!==t.manifest.sha256||payload.size!==t.manifest.size)fail('Invalid existing audio confirmation');
+            t.audioRequired=false;t.offset=t.manifest.size;
+          }
+          t.status='streaming';return json(res,{manifest:t.manifest,from:t.from,audioRequired:t.audioRequired});
+        }
         if(action==='cancel'){stop(t);return json(res,{ok:true});}
         if(action==='ack'&&t.to===device.id&&t.status==='streaming'){
           if(!t.pending||payload.offset!==t.offset+t.pending.buffer.length)fail('Invalid acknowledgement');const pending=t.pending;t.pending=null;t.offset=payload.offset;json(pending.res,{offset:t.offset});return json(res,{ok:true});
@@ -100,7 +107,7 @@ export function createRelay({stateFile, ttl=120000, codeTtl=180000, registration
         fail('Invalid action');
       }
       const match=/^\/transfers\/([a-f0-9-]+)\/chunk$/.exec(url.pathname);const t=match&&transfers.get(match[1]);
-      if(!t||![t.from,t.to].includes(device.id))fail('Unknown transfer',404);t.updated=Date.now();if(t.status!=='streaming')fail('Transfer is not active',409);
+      if(!t||![t.from,t.to].includes(device.id))fail('Unknown transfer',404);t.updated=Date.now();if(t.status!=='streaming'||!t.audioRequired)fail('Transfer is not active',409);
       if(req.method==='PUT'&&t.from===device.id){
         if(t.pending)fail('A block is already pending',409);if(Number(req.headers['x-offset'])!==t.offset)fail('Invalid offset',409);
         const buffer=await read(req,BLOCK);if(!buffer.length||t.offset+buffer.length>t.manifest.size)fail('Invalid block');

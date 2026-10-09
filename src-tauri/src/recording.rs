@@ -28,6 +28,8 @@ impl Drop for Session {
         }
     }
 }
+#[cfg(target_os = "android")]
+static LAST_RESULT: Mutex<Option<serde_json::Value>> = Mutex::new(None);
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 static FINISHED: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -107,6 +109,13 @@ pub async fn start_audio_recording(
                 active.take();
             }
             return Err(error);
+        }
+        #[cfg(target_os = "android")]
+        {
+            if let Ok(mut result) = LAST_RESULT.lock() {
+                *result = None;
+            }
+            monitor(app.clone(), path);
         }
         #[cfg(not(target_os = "android"))]
         let _ = app;
@@ -292,4 +301,230 @@ mod tests {
         );
         fs::remove_file(path).unwrap();
     }
+}
+
+#[cfg(target_os = "android")]
+fn monitor(app: tauri::AppHandle, path: PathBuf) {
+    use tauri::Emitter;
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if !SESSION
+            .lock()
+            .is_ok_and(|s| s.as_ref().is_some_and(|s| s.path == path))
+        {
+            break;
+        }
+        let status: serde_json::Value = match app
+            .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
+            .transfer("recordingStatus", serde_json::json!({}))
+        {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if status["path"].as_str() != path.to_str() {
+            continue;
+        }
+        let state = status["state"].as_str().unwrap_or("");
+        let _ = app.emit(
+            "recording-native-state",
+            serde_json::json!({"state":state,"elapsedSeconds":status["elapsedSeconds"]}),
+        );
+        if state == "finished" {
+            let session = SESSION.lock().ok().and_then(|mut s| {
+                if s.as_ref().is_some_and(|s| s.path == path) {
+                    s.take()
+                } else {
+                    None
+                }
+            });
+            if let Some(session) = session {
+                if let Ok(mut paths) = FINISHED.lock() {
+                    paths.insert(path.clone());
+                }
+                let configuration = crate::cloud::load()
+                    .map(|s| s.last_configuration)
+                    .unwrap_or_default();
+                let result = crate::import_audio_sync(
+                    &app,
+                    path.to_string_lossy().into_owned(),
+                    Some(format!("Recording-{}.m4a", crate::clock())),
+                    configuration,
+                );
+                drop(session);
+                let payload = match result {
+                    Ok(entry) => serde_json::json!({"entry":entry}),
+                    Err(error) => {
+                        serde_json::json!({"error":error,"selection":{"path":path,"name":"Recording.m4a"}})
+                    }
+                };
+                if let Ok(mut last) = LAST_RESULT.lock() {
+                    *last = Some(payload.clone());
+                }
+                let _ = app.emit("recording-native-finished", payload);
+                let _ = app
+                    .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
+                    .transfer::<()>("acknowledgeRecording", serde_json::json!({}));
+            }
+            break;
+        }
+        if state == "error" || state == "cancelled" {
+            let mut session = match SESSION.lock() {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            if session.as_ref().is_some_and(|s| s.path == path) {
+                session.take();
+            }
+            let _ = app.emit(
+                "recording-native-finished",
+                serde_json::json!({"error":"errors.recordingEmpty"}),
+            );
+            break;
+        }
+    });
+}
+
+#[tauri::command]
+pub async fn recording_activity_snapshot(
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(target_os="android")]
+        {
+            let status:serde_json::Value=app.state::<tauri_plugin_recording::Recording<tauri::Wry>>().transfer("recordingStatus",serde_json::json!({}))?;
+            Ok(serde_json::json!({"state":status["state"],"quick":status["quick"],"level":status["level"],"elapsedSeconds":status["elapsedSeconds"],"path":status["path"],"result":LAST_RESULT.lock().map_err(|_|"errors.recordingStop")?.clone()}))
+        }
+        #[cfg(not(target_os="android"))]
+        {let _=app; Ok(serde_json::json!({"state":"idle"}))}
+    }).await.map_err(|e|e.to_string())?
+}
+
+// A stable private filename makes import idempotent if the process exits after
+// committing history but before deleting the quick-recording source.
+#[cfg(any(target_os = "android", test))]
+fn quick_recording_id(path: &Path) -> Result<String, String> {
+    if path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|s| s.to_str())
+        != Some("hearfolio-quick-recordings")
+    {
+        return Err("Invalid quick recording location".into());
+    }
+    let uuid = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_prefix("hearfolio-recording-"))
+        .and_then(|s| s.strip_suffix(".m4a"))
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .ok_or("Invalid quick recording name")?;
+    Ok(format!("hearing-quick-{uuid}"))
+}
+#[tauri::command]
+pub async fn import_quick_recordings(
+    app: tauri::AppHandle,
+) -> Result<Vec<crate::records::HistoryEntry>, String> {
+    #[cfg(target_os = "android")]
+    {
+        let job = JobGuard::acquire()?;
+        tauri::async_runtime::spawn_blocking(move || {
+            let _job = job;
+            let pending: serde_json::Value = app
+                .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
+                .transfer("quickRecordings", serde_json::json!({}))?;
+            let mut imported = Vec::new();
+            for path in pending["paths"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|p| p.as_str())
+            {
+                let source = Path::new(path);
+                let id = quick_recording_id(source)?;
+                let existing = {
+                    let _lock = crate::history_lock()?;
+                    crate::read_history_at(&crate::base()?)?
+                        .into_iter()
+                        .find(|e| e.id == id)
+                };
+                let entry = if let Some(entry) = existing {
+                    // Never discard the source if the archived copy is missing or damaged.
+                    if crate::transfer::hash_file(source)?
+                        != crate::transfer::hash_file(Path::new(&entry.input_path))?
+                    {
+                        return Err("Archived quick recording differs; source preserved".into());
+                    }
+                    entry
+                } else {
+                    let configuration = crate::cloud::load()?.last_configuration;
+                    crate::import_audio_with_id(
+                        &app,
+                        path.into(),
+                        Some(format!("Recording-{}.m4a", crate::clock())),
+                        configuration,
+                        Some(id),
+                    )?
+                };
+                fs::remove_file(source).map_err(|e| format!("errors.audioRead|{e}"))?;
+                imported.push(entry);
+            }
+            Ok(imported)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok(vec![])
+    }
+}
+#[cfg(test)]
+mod quick_tests {
+    use super::*;
+    #[test]
+    fn quick_recording_ids_survive_retries_and_reject_unfinished_or_foreign_files() {
+        let uuid = uuid::Uuid::new_v4();
+        let p = PathBuf::from(format!(
+            "/private/hearfolio-quick-recordings/hearfolio-recording-{uuid}.m4a"
+        ));
+        assert_eq!(
+            quick_recording_id(&p).unwrap(),
+            format!("hearing-quick-{uuid}")
+        );
+        assert_eq!(
+            quick_recording_id(&p).unwrap(),
+            quick_recording_id(&p).unwrap()
+        );
+        assert!(quick_recording_id(&p.with_extension("m4a.partial")).is_err());
+        assert!(quick_recording_id(Path::new("/private/hearfolio-recording-invalid.m4a")).is_err());
+        assert!(quick_recording_id(Path::new(
+            "/private/hearfolio-quick-recordings/hearfolio-recording-invalid.m4a"
+        ))
+        .is_err());
+    }
+}
+
+#[tauri::command]
+pub async fn recording_quick_control(app: tauri::AppHandle, action: String) -> Result<(), String> {
+    if !["stop", "cancel"].contains(&action.as_str()) {
+        return Err("errors.recordingUnavailable".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(target_os = "android")]
+        {
+            app.state::<tauri_plugin_recording::Recording<tauri::Wry>>()
+                .transfer::<()>(
+                    "quickControl",
+                    serde_json::json!({"id":"quick","stage":action}),
+                )
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = (app, action);
+            Err("errors.recordingUnavailable".into())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }

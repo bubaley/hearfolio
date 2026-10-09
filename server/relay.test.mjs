@@ -47,3 +47,22 @@ test('rejected and expired invitations never grant device credentials',async t=>
  assert.equal((await post('/join',{name:'Expired',code:expiring})).status,400);
  assert.equal((await post('/join/status',ticket)).status,404);
 });
+
+test('verified existing audio negotiates metadata-only and rejects unverified skips',async t=>{
+ const r=await setup(t);const a=await r.register('A'),b=await r.register('B'),stranger=await r.register('C');await pair(r,a,b);
+ const m=manifest(Buffer.alloc(123));const id=(await r.rpc(a,'offer',{to:b.id,manifest:m,metadataOnly:true})).body.id;
+ assert.equal((await r.rpc(stranger,'inspect',{id})).status,404);
+ assert.deepEqual((await r.rpc(b,'inspect',{id})).body,{manifest:m,metadataOnlyCapable:true});
+ assert.equal((await r.rpc(a,'status',{id})).body.status,'offered');
+ assert.equal((await r.rpc(b,'accept',{id,audioRequired:false,sha256:'wrong',size:m.size})).status,400);
+ assert.equal((await r.rpc(b,'accept',{id,audioRequired:false,sha256:m.sha256,size:m.size})).body.audioRequired,false);
+ const state=(await r.rpc(a,'status',{id})).body;assert.equal(state.audioRequired,false);assert.equal(state.offset,m.size);assert.equal(state.status,'streaming');
+ assert.equal(r.transfers.get(id).pending,null);
+ assert.equal((await fetch(r.base+`/transfers/${id}/chunk`,{method:'PUT',headers:{authorization:'Bearer '+a.token,'x-offset':'0'},body:Buffer.alloc(123)})).status,409);
+ assert.equal((await r.rpc(b,'finish',{id})).status,200);assert.equal((await r.rpc(a,'status',{id})).body.status,'delivered');
+ const legacy=(await r.rpc(a,'offer',{to:b.id,manifest:m})).body.id;
+ assert.equal((await r.rpc(b,'accept',{id:legacy,audioRequired:false,sha256:m.sha256,size:m.size})).status,400);
+ assert.equal((await r.rpc(b,'accept',{id:legacy})).body.audioRequired,true);await r.rpc(b,'cancel',{id:legacy});
+ const damaged=(await r.rpc(a,'offer',{to:b.id,manifest:m,metadataOnly:true})).body.id;
+ assert.equal((await r.rpc(b,'accept',{id:damaged,audioRequired:true})).body.audioRequired,true);await r.rpc(b,'cancel',{id:damaged});
+});
