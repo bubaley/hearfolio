@@ -69,14 +69,14 @@ const messages: Record<string,string> = {
   "Определяем длительность…":"Reading duration…",
   "Не удалось воспроизвести аудио. Попробуйте открыть запись снова. Файл можно распознать.":"Could not play the audio. Try opening the recording again. You can still transcribe the file.",
   'выберите аудиофайл или запишите голос.':'choose an audio file or record your voice.','Запись':'Recording','Начните с аудио':'Start with audio','Запишите голосовую заметку или выберите готовый файл.':'Record a voice memo or choose an existing file.',
-  'Записать аудио':'Record audio','Запись аудио':'Recording audio','Идёт запись':'Recording','Подключаем микрофон…':'Connecting microphone…','Сохраняем аудио…':'Saving audio…','Отменяем запись…':'Cancelling recording…',
+  'Записать аудио':'Record audio','Запись аудио':'Recording audio','Запись на паузе':'Recording paused','Запись сохранена':'Recording saved','Идёт запись':'Recording','Подключаем микрофон…':'Connecting microphone…','Сохраняем аудио…':'Saving audio…','Отменяем запись…':'Cancelling recording…',
   'Длительность записи':'Recording duration','После остановки выберите модель и распознайте аудио.':'After stopping, choose a model and transcribe the audio.',
   'Остановить и сохранить':'Stop and save','Отменить запись':'Cancel recording','Аудио записано':'Audio recorded',
   'Добавьте запись в архив, чтобы перейти к распознаванию.':'Add the recording to your archive to start transcription.',
   'Добавить в архив':'Add to archive','Удалить эту запись':'Delete this recording','Удалить записанное аудио?':'Delete recorded audio?',
   'Эта запись ещё не добавлена в архив и будет потеряна.':'This recording has not been added to the archive and will be lost.',
   'Сервис':'Service','Модель':'Model','Режим':'Mode','Выбирается автоматически':'Selected automatically',
-  'Расшифровка':'Transcript','Записи':'Recordings','Модели':'Models','Настройки':'Settings',
+  'Расшифровка':'Transcript','Записи':'Recordings','Модели':'Models','Настройки':'Settings','Устройства':'Devices','Отключить':'Unpair',
   'Модель не выбрана':'No model selected','Проверяем готовность…':'Checking readiness…',
   'Установите FFmpeg для подготовки аудио.':'Install FFmpeg to prepare audio.',
   'Добавьте API token OpenRouter.':'Add your OpenRouter API token.','Выберите модель OpenRouter.':'Choose an OpenRouter model.',
@@ -189,6 +189,12 @@ export function countLabel(count:number,kind:'record'|'word') {
   return `${count} ${forms[form as keyof typeof forms]||forms.other}`;
 }
 const errorMessages:Record<string,[string,string]>={
+  transferBackgroundUnavailable: ['Не удалось запустить фоновую передачу. Откройте приложение и повторите.','Could not start the background transfer. Open the app and retry.'],
+  transferCancelled: ['Передача отменена','Transfer cancelled'],
+  cameraPermissionDenied:['Разрешите Hearfolio доступ к камере в настройках телефона. Код можно ввести вручную.','Allow Hearfolio camera access in your phone settings. You can also enter the code manually.'],
+  qrScanFailed:['Не удалось запустить сканер. Проверьте доступ к камере или введите код вручную.','Could not start the scanner. Check camera access or enter the code manually.'],
+  qrInvitationInvalid:['Это не QR-код приглашения Hearfolio. Создайте приглашение в разделе «Устройства» на другом устройстве.','This is not a Hearfolio invitation QR. Create an invitation in Devices on your other device.'],
+
   "postprocessRuleIdInvalid":["Неверный идентификатор правила.", "Invalid rule identifier."],
   "postprocessRuleNameInvalid":["Введите название правила длиной до 200 символов.", "Enter a rule name up to 200 characters."],
   "postprocessInstructionInvalid":["Введите инструкцию длиной до 8000 символов.", "Enter an instruction up to 8000 characters."],

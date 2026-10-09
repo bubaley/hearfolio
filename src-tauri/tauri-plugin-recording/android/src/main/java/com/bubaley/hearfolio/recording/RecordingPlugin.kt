@@ -3,6 +3,7 @@ package com.bubaley.hearfolio.recording
 import android.Manifest
 import android.app.Activity
 import android.content.ClipData
+import androidx.core.content.ContextCompat
 import android.content.Intent
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -32,6 +33,7 @@ import kotlin.math.sqrt
 
 @InvokeArg
 class StartArgs { lateinit var path: String }
+
 @InvokeArg
 class AudioArgs { lateinit var path: String; lateinit var name: String }
 @InvokeArg
@@ -39,28 +41,31 @@ class TextArgs { lateinit var name: String; lateinit var text: String }
 @InvokeArg
 class SeekArgs { var seconds: Double = 0.0 }
 
-@TauriPlugin(permissions = [Permission(strings = [Manifest.permission.RECORD_AUDIO], alias = "microphone")])
+@InvokeArg
+class TransferArgs {
+    lateinit var id: String
+    var direction: String = "send"
+    var stage: String = "waiting"
+    var current: Long = 0
+    var total: Long = 0
+    var success: Boolean = false
+}
+
+@TauriPlugin(permissions = [Permission(strings = [Manifest.permission.RECORD_AUDIO], alias = "microphone"), Permission(strings = [Manifest.permission.POST_NOTIFICATIONS], alias = "notifications")])
 class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
     private var player: MediaPlayer? = null
     private var playbackGeneration = 0
     private var preparingPlayback: Invoke? = null
-    private var recorder: AudioRecord? = null
-    private var gainControl: RecorderGainControl? = null
-    private var output: File? = null
     private var pending: Invoke? = null
-    private var worker: Thread? = null
-    @Volatile private var capturing = false
-    @Volatile private var captureFailed = false
-    @Volatile private var level = 0.0
 
     @Command
     fun start(invoke: Invoke) {
-        if (recorder != null || pending != null || worker?.isAlive == true) { invoke.reject("errors.operationBusy"); return }
+        if (RecordingService.instance != null || pending != null) { invoke.reject("errors.operationBusy"); return }
         releasePlayer()
         pending = invoke
         if (getPermissionState("microphone") != PermissionState.GRANTED) {
             requestPermissionForAlias("microphone", invoke, "microphonePermissionResult")
-        } else { startGranted(invoke) }
+        } else { startWithNotifications(invoke) }
     }
 
     @PermissionCallback
@@ -69,157 +74,140 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
         if (getPermissionState("microphone") != PermissionState.GRANTED) {
             pending = null
             invoke.reject("errors.microphonePermissionDenied")
-        } else { startGranted(invoke) }
+        } else { startWithNotifications(invoke) }
     }
 
+    private fun startWithNotifications(invoke: Invoke) {
+        if (Build.VERSION.SDK_INT >= 33 && getPermissionState("notifications") != PermissionState.GRANTED) requestPermissionForAlias("notifications", invoke, "recordingNotificationResult") else startGranted(invoke)
+    }
+    @PermissionCallback
+    fun recordingNotificationResult(invoke: Invoke) { startGranted(invoke) }
+    @Command
+    fun acknowledgeRecording(invoke: Invoke) { activity.stopService(Intent(activity, RecordingService::class.java)); invoke.resolve() }
+
+    private fun startGranted(invoke: Invoke) {
+        try {
+            val file = File(invoke.parseArgs(StartArgs::class.java).path).canonicalFile
+            if (!file.path.startsWith(activity.dataDir.canonicalPath + File.separator) || !file.name.startsWith("hearfolio-recording-")) throw IllegalArgumentException()
+            RecordingService.ready = { error -> pending = null; if (error == null) invoke.resolve() else invoke.reject(error) }
+            ContextCompat.startForegroundService(activity, Intent(activity, RecordingService::class.java).setAction(RecordingService.START).putExtra("path", file.path))
+        } catch (_: Exception) { RecordingService.ready = null; pending = null; invoke.reject("errors.recordingStart") }
+    }
+
+    @Command
+    fun stop(invoke: Invoke) {
+        if (RecordingService.state == "finished") { activity.stopService(Intent(activity, RecordingService::class.java)); invoke.resolve(); return }
+        val error = RecordingService.instance?.finish(false) ?: "errors.recordingUnavailable"
+        if (error.isEmpty()) invoke.resolve() else invoke.reject(error)
+    }
+    @Command
+    fun cancel(invoke: Invoke) {
+        pending?.reject("errors.recordingUnavailable"); pending = null
+        RecordingService.instance?.discard(); invoke.resolve()
+    }
+    @Command
+    fun recordingLevel(invoke: Invoke) { invoke.resolve(JSObject().put("level", RecordingService.inputLevel)) }
+    @Command
+    fun recordingStatus(invoke: Invoke) {
+        val result = JSObject(); result.put("state", RecordingService.state); result.put("path", RecordingService.path); result.put("elapsedSeconds", RecordingService.elapsedSeconds()); result.put("quick", RecordingService.quickRecording); result.put("level", RecordingService.inputLevel); invoke.resolve(result)
+    }
+    @Command
+    fun quickControl(invoke: Invoke) {
+        if (!RecordingService.quickRecording) { invoke.reject("errors.recordingUnavailable"); return }
+        val action=invoke.parseArgs(TransferArgs::class.java).stage
+        when(action) {
+            "stop" -> { if (RecordingService.state == "finished") invoke.resolve() else { val error=RecordingService.instance?.finish(true) ?: "errors.recordingUnavailable"; if(error.isEmpty())invoke.resolve() else invoke.reject(error) } }
+            "cancel" -> {RecordingService.instance?.discard();invoke.resolve()}
+            else -> invoke.reject("errors.recordingUnavailable")
+        }
+    }
+
+    @Command
+    fun quickRecordings(invoke: Invoke) {
+        val dir=File(activity.filesDir,"hearfolio-quick-recordings")
+        val files=dir.listFiles()?.filter { it.isFile && it.canonicalFile.parentFile==dir.canonicalFile && it.name.startsWith("hearfolio-recording-") && (it.name.endsWith(".m4a") || it.name.endsWith(".wav")) }?.map { it.canonicalPath } ?: emptyList()
+        val result=JSObject();result.put("paths",org.json.JSONArray(files));invoke.resolve(result)
+    }
+
+    @Command
+    fun startInbox(invoke: Invoke) {
+        if (Build.VERSION.SDK_INT >= 33 && getPermissionState("notifications") != PermissionState.GRANTED) {
+            requestPermissionForAlias("notifications", invoke, "inboxPermissionResult")
+        } else startInboxGranted(invoke)
+    }
+    @PermissionCallback
+    fun inboxPermissionResult(invoke: Invoke) {
+        if (Build.VERSION.SDK_INT >= 33 && getPermissionState("notifications") != PermissionState.GRANTED) invoke.reject("errors.transferBackgroundUnavailable") else startInboxGranted(invoke)
+    }
+    private fun startInboxGranted(invoke: Invoke) {
+        try {
+            InboxService.ready = { error -> if (error == null) invoke.resolve() else invoke.reject(error) }
+            ContextCompat.startForegroundService(activity, Intent(activity, InboxService::class.java).setAction(InboxService.START))
+        } catch (_: Exception) { InboxService.ready = null; invoke.reject("errors.transferBackgroundUnavailable") }
+    }
+    @Command
+    fun stopInbox(invoke: Invoke) { activity.stopService(Intent(activity, InboxService::class.java)); invoke.resolve() }
+    @Command
+    fun inboxStatus(invoke: Invoke) {
+        val result = JSObject(); result.put("active", InboxService.active); invoke.resolve(result)
+    }
+    @Command
+    fun inboxOffers(invoke: Invoke) {
+        val args = invoke.parseArgs(TransferArgs::class.java)
+        InboxService.instance?.offers(args.current.toInt(), args.success)
+        invoke.resolve()
+    }
+
+    @Command
+    fun beginTransfer(invoke: Invoke) {
+        if (Build.VERSION.SDK_INT >= 33 && getPermissionState("notifications") != PermissionState.GRANTED) {
+            requestPermissionForAlias("notifications", invoke, "transferNotificationResult")
+        } else { startTransfer(invoke) }
+    }
+
+    @PermissionCallback
+    fun transferNotificationResult(invoke: Invoke) { startTransfer(invoke) }
+
+    private fun startTransfer(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(TransferArgs::class.java)
+            TransferService.prepare(args.id)
+            if (InboxService.active) { InboxService.instance?.transfer(true, false, args.direction); invoke.resolve(); return }
+            TransferService.ready = { error -> if (error == null) invoke.resolve() else invoke.reject(error) }
+            ContextCompat.startForegroundService(activity, Intent(activity, TransferService::class.java).setAction(TransferService.BEGIN).putExtra("id",args.id).putExtra("direction",args.direction))
+        } catch (error: Exception) { TransferService.ready = null; invoke.reject("errors.transferBackgroundUnavailable") }
+    }
+
+    @Command
+    fun checkTransfer(invoke: Invoke) {
+        val args = invoke.parseArgs(TransferArgs::class.java)
+        val response = JSObject(); response.put("cancelled", TransferService.isCancelled(args.id)); invoke.resolve(response)
+    }
+
+    @Command
+    fun updateTransfer(invoke: Invoke) {
+        val args = invoke.parseArgs(TransferArgs::class.java)
+        if (TransferService.job == args.id) { if (InboxService.active) InboxService.instance?.progress(args.stage,args.current,args.total) else TransferService.instance?.update(args.stage,args.current,args.total) }
+        invoke.resolve()
+    }
+
+    @Command
+    fun finishTransfer(invoke: Invoke) {
+        val args = invoke.parseArgs(TransferArgs::class.java)
+        if (InboxService.active && TransferService.job == args.id) { InboxService.instance?.transfer(false, args.success); invoke.resolve(); return }
+        if (TransferService.job == args.id && TransferService.instance != null) {
+            TransferService.stopped = { invoke.resolve() }
+            activity.startService(Intent(activity, TransferService::class.java).setAction(TransferService.END).putExtra("id",args.id).putExtra("success",args.success))
+        } else { invoke.resolve() }
+    }
+
+    override fun onDestroy(activity: AppCompatActivity) { releasePlayer(); /* Services own recording and transfer lifetimes. */ }
     private fun privateFile(path: String): File {
         val file = File(path).canonicalFile
         require(file.path.startsWith(activity.dataDir.canonicalPath + File.separator))
         require(file.isFile)
         return file
     }
-
-    @Suppress("DEPRECATION")
-    private fun startGranted(invoke: Invoke) {
-        var next: AudioRecord? = null
-        try {
-            val file = File(invoke.parseArgs(StartArgs::class.java).path).canonicalFile
-            require(file.path.startsWith(activity.dataDir.canonicalPath + File.separator))
-            require(file.name.startsWith("hearfolio-recording-") && file.extension == "wav")
-            file.parentFile?.mkdirs()
-            require(file.createNewFile())
-            output = file
-            var actualRate = 0
-            var actualSource = MediaRecorder.AudioSource.MIC
-            for (configuration in RecorderCapturePolicy.configurations) {
-                var candidate: AudioRecord? = null
-                var candidateGain: RecorderGainControl? = null
-                try {
-                    val source = configuration.source
-                    val rate = configuration.sampleRate
-                    val minimum = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-                    require(minimum > 0)
-                    candidate = AudioRecord(source, rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minimum * 4, rate / 5 * 2))
-                    require(candidate.state == AudioRecord.STATE_INITIALIZED)
-                    candidateGain = createGainControl()
-                    candidateGain.attach(candidate.audioSessionId)
-                    candidate.startRecording()
-                    require(candidate.recordingState == AudioRecord.RECORDSTATE_RECORDING)
-                    next = candidate; actualRate = rate; actualSource = source
-                    gainControl = candidateGain
-                    break
-                } catch (error: Exception) {
-                    candidateGain?.release()
-                    candidate?.release()
-                    if (error is SecurityException) throw error
-                }
-            }
-            val active = requireNotNull(next)
-            recorder = next
-            val agc = gainControl?.diagnostics ?: RecorderGainDiagnostics()
-            val sourceName = if (actualSource == MediaRecorder.AudioSource.MIC) "MIC" else "DEFAULT"
-            // Metadata only: no samples, file paths, transcript, or user secrets.
-            Log.i("HearfolioRecording", "source=$sourceName; sampleRate=$actualRate; agcAvailable=${agc.available}; agcAttached=${agc.attached}; agcEnabled=${agc.enabled}; agcStatus=${agc.status}")
-            capturing = true; captureFailed = false; level = 0.0
-            worker = Thread({ capture(active, file, actualRate) }, "HearfolioAudioCapture").also { it.start() }
-            pending = null
-            invoke.resolve()
-        } catch (error: Exception) {
-            releaseGainControl()
-            next?.release()
-            output?.delete(); output = null; pending = null; recorder = null; capturing = false
-            invoke.reject(if (error is SecurityException) "errors.microphonePermissionDenied" else "errors.recordingStart")
-        }
-    }
-
-    private fun createGainControl(): RecorderGainControl = RecorderGainControl(
-        isAvailable = { AutomaticGainControl.isAvailable() },
-        create = { session ->
-            AutomaticGainControl.create(session)?.let { effect ->
-                object : RecorderGainEffect {
-                    override fun isEnabled(): Boolean = effect.enabled
-                    override fun enable(): Boolean = effect.setEnabled(true) == AudioEffect.SUCCESS
-                    override fun release() { effect.release() }
-                }
-            }
-        }
-    )
-    private fun releaseGainControl() {
-        gainControl?.release()
-        gainControl = null
-    }
-
-    // Store PCM directly; header duration is computed from captured samples, never wall time.
-    private fun capture(active: AudioRecord, file: File, sampleRate: Int) {
-        try {
-            RandomAccessFile(file, "rw").use { wav ->
-                wav.write(ByteArray(44))
-                val samples = ShortArray(2048)
-                val bytes = ByteArray(samples.size * 2)
-                var count = 0L
-                while (capturing) {
-                    val read = active.read(samples, 0, samples.size, AudioRecord.READ_BLOCKING)
-                    if (read < 0) { if (capturing) throw IllegalStateException("Capture failed"); break }
-                    if (read == 0) continue
-                    require(count + read * 2L <= 0xffffffffL - 36)
-                    var energy = 0.0
-                    for (index in 0 until read) {
-                        val value = samples[index].toInt()
-                        bytes[index * 2] = value.toByte()
-                        bytes[index * 2 + 1] = (value shr 8).toByte()
-                        val normalized = value / 32768.0
-                        energy += normalized * normalized
-                    }
-                    level = sqrt(energy / read).coerceIn(0.0, 1.0)
-                    wav.write(bytes, 0, read * 2)
-                    count += read * 2L
-                }
-                wav.seek(0)
-                fun little(value: Long, size: Int) { repeat(size) { wav.write((value shr (it * 8)).toInt() and 255) } }
-                wav.writeBytes("RIFF"); little(count + 36, 4); wav.writeBytes("WAVEfmt ")
-                little(16, 4); little(1, 2); little(1, 2); little(sampleRate.toLong(), 4)
-                little(sampleRate * 2L, 4); little(2, 2); little(16, 2)
-                wav.writeBytes("data"); little(count, 4); wav.fd.sync()
-            }
-        } catch (_: Exception) { captureFailed = true; capturing = false }
-    }
-
-    private fun finishCapture(): File? {
-        capturing = false
-        val active = recorder; recorder = null
-        try { active?.stop() } catch (_: Exception) { captureFailed = true }
-        worker?.join(250)
-        releaseGainControl()
-        active?.release()
-        worker?.join(2000)
-        if (worker?.isAlive == true) { captureFailed = true } else { worker = null }
-        level = 0.0
-        return output.also { output = null }
-    }
-
-    @Command
-    fun stop(invoke: Invoke) {
-        if (recorder == null) { invoke.reject("errors.recordingUnavailable"); return }
-        val file = finishCapture()
-        if (captureFailed || file == null || file.length() <= 44) {
-            file?.delete()
-            invoke.reject(if (captureFailed) "errors.recordingStop" else "errors.recordingEmpty")
-        } else { invoke.resolve() }
-    }
-
-    @Command
-    fun recordingLevel(invoke: Invoke) {
-        if (captureFailed && recorder != null) { invoke.reject("errors.recordingStop"); return }
-        invoke.resolve(JSObject().put("level", level))
-    }
-
-    private fun cancelSession() {
-        pending?.reject("errors.recordingUnavailable"); pending = null
-        finishCapture()?.delete()
-    }
-    @Command
-    fun cancel(invoke: Invoke) { cancelSession(); invoke.resolve() }
-    override fun onDestroy(activity: AppCompatActivity) { cancelSession(); releasePlayer() }
 
     private fun releasePlayer() {
         playbackGeneration++
@@ -233,7 +221,7 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
     }
     @Command
     fun preparePlayback(invoke: Invoke) {
-        if (recorder != null || pending != null) { invoke.reject("errors.operationBusy"); return }
+        if (RecordingService.instance != null || pending != null) { invoke.reject("errors.operationBusy"); return }
         releasePlayer()
         try {
             val file = privateFile(invoke.parseArgs(StartArgs::class.java).path)

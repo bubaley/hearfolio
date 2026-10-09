@@ -11,6 +11,8 @@ use std::{
 #[serde(rename_all = "camelCase")]
 pub struct HistoryEntry {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_source_id: Option<String>,
     pub name: String,
     pub input_path: String,
     pub output_path: Option<String>,
@@ -107,6 +109,24 @@ pub fn save_transcript_at(dir: &Path, id: &str, model: String, text: &str) -> Re
         .iter_mut()
         .find(|entry| entry.id == id)
         .ok_or("errors.recordMissing")?;
+    entry.model = Some(model);
+    entry.completed_at = Some(crate::clock());
+    replace_transcript_at(dir, entry.clone(), text)
+}
+
+// Commit the text and its exact metadata together, restoring the previous text
+// if the archive cannot be updated.
+pub(crate) fn replace_transcript_at(
+    dir: &Path,
+    updated: HistoryEntry,
+    text: &str,
+) -> Result<(), String> {
+    let mut entries = read_history_at(dir)?;
+    let id = updated.id.as_str();
+    let entry = entries
+        .iter_mut()
+        .find(|entry| entry.id == id)
+        .ok_or("errors.recordMissing")?;
     if !id.starts_with("hearing-")
         || !id
             .bytes()
@@ -153,9 +173,8 @@ pub fn save_transcript_at(dir: &Path, id: &str, model: String, text: &str) -> Re
         }
         return Err(format!("errors.transcriptSave|{error}"));
     }
+    *entry = updated;
     entry.output_path = Some(output.to_string_lossy().into_owned());
-    entry.model = Some(model);
-    entry.completed_at = Some(crate::clock());
     if let Err(error) = write_history_at(dir, &entries) {
         if has_backup {
             fs::rename(&backup, &output)
@@ -292,6 +311,7 @@ mod tests {
     fn entry(dir: &Path, id: &str) -> HistoryEntry {
         HistoryEntry {
             id: id.into(),
+            transfer_source_id: None,
             name: "audio.wav".into(),
             input_path: dir
                 .join("input")

@@ -1,3 +1,4 @@
+import {pcmLevel} from './audio-level';
 import { getVersion } from '@tauri-apps/api/app';
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -19,7 +20,7 @@ export type Progress = { kind: 'download' | 'transcribe' | 'postprocess' | 'impo
 export type Settings = {language:LanguagePreference;systemLanguage:'ru'|'en';openrouterUrl:string;hasToken:boolean;storageParent:string;storagePath:string;lastConfiguration:RecognitionConfig};
 export type CloudModel = {id:string;name:string;modes:('streaming'|'transcription')[];preferredMode:'streaming'|'transcription'};
 export type RuntimePlatform = 'android'|'macos'|'linux'|'windows'|'ios'|'unknown';
-export type RuntimeCapabilities={os:RuntimePlatform;mobile:boolean;localRecognition:boolean;customStorage:boolean;nativeAudio:boolean;audioRecording:boolean};
+export type RuntimeCapabilities={transferMvp?:boolean;os:RuntimePlatform;mobile:boolean;localRecognition:boolean;customStorage:boolean;nativeAudio:boolean;audioRecording:boolean};
 export type AudioSelection={path:string;name?:string|null};
 export type AndroidRelease = {version:string;url:string;notes?:string;pub_date?:string;sha256?:string};
 export const preview = import.meta.env.DEV && !('__TAURI_INTERNALS__' in window);
@@ -155,6 +156,8 @@ export function registerPreviewFile(file: File) { const path=`preview:${crypto.r
 
 type BrowserRecording={stream:MediaStream;context:AudioContext;source:MediaStreamAudioSourceNode;processor:ScriptProcessorNode;mute:GainNode;queue:Promise<void>;pending:number;error:Error|null;chunks:Int16Array[];level:number};
 let browserRecording:BrowserRecording|null=null;
+let browserInputLevel=0;
+export function recordingInputLevel(){return fixtureRecording?browserInputLevel:browserRecording&&!browserRecording.error?browserInputLevel:0;}
 let recordingGeneration=0, recordingStarting=false, fixtureRecording=false;
 let nativeRecordingActive=false;
 function microphoneError(error:unknown):Error {
@@ -164,6 +167,7 @@ function microphoneError(error:unknown):Error {
   return new Error(name==='NotAllowedError'||name==='SecurityError'?'errors.microphonePermissionDenied':name==='NotFoundError'||name==='NotSupportedError'?'errors.recordingUnavailable':'errors.recordingStart');
 }
 function closeBrowserRecording(recording:BrowserRecording) {
+  browserInputLevel=0;
   recording.processor.onaudioprocess=null;recording.processor.disconnect();recording.source.disconnect();recording.mute.disconnect();
   recording.stream.getTracks().forEach(track=>track.stop());void recording.context.close().catch(()=>{});
 }
@@ -176,7 +180,7 @@ function recordingWav(chunks:Int16Array[],rate:number):File {
 export async function startAudioRecording():Promise<void> {
   if(recordingStarting||browserRecording||fixtureRecording||nativeRecordingActive)throw new Error('errors.operationBusy');
   if(!preview&&nativePlatform?.os==='android'){recordingStarting=true;const generation=++recordingGeneration;try{await call('start_audio_recording');if(generation!==recordingGeneration){await call('cancel_audio_recording');throw new Error('errors.recordingUnavailable');}nativeRecordingActive=true;}finally{recordingStarting=false;}return;}
-  if(preview&&new URLSearchParams(location.search).get('recording')==='fixture'){fixtureRecording=true;return;}
+  if(preview&&new URLSearchParams(location.search).get('recording')==='fixture'){fixtureRecording=true;browserInputLevel=pcmLevel(Float32Array.from({length:1600},(_,i)=>Math.sin(i*2*Math.PI*440/16000)*1000/32767));return;}
   if(!navigator.mediaDevices?.getUserMedia||typeof AudioContext==='undefined')throw new Error('errors.recordingUnavailable');
   recordingStarting=true;const generation=++recordingGeneration;
   let stream:MediaStream|null=null,context:AudioContext|null=null;
@@ -190,10 +194,11 @@ export async function startAudioRecording():Promise<void> {
     if(generation!==recordingGeneration)throw new Error('errors.recordingUnavailable');
     const source=context.createMediaStreamSource(stream),processor=context.createScriptProcessor(4096,1,1),mute=context.createGain();mute.gain.value=0;
     const recording:BrowserRecording={stream,context,source,processor,mute,queue:Promise.resolve(),pending:0,error:null,chunks:[],level:0};
-    browserRecording=recording;
+    browserInputLevel=0;browserRecording=recording;
     processor.onaudioprocess=event=>{
       if(recording.error)return;
       const input=event.inputBuffer.getChannelData(0),samples=new Int16Array(input.length);
+      browserInputLevel=pcmLevel(input);
       recording.level=Math.min(1,Math.sqrt(input.reduce((sum,sample)=>sum+sample*sample,0)/input.length));
       for(let i=0;i<input.length;i++){const sample=Math.max(-1,Math.min(1,input[i]));samples[i]=Math.round(sample*(sample<0?32768:32767));}
       if(preview){recording.chunks.push(samples);return;}

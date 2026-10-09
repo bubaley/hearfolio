@@ -29,6 +29,7 @@ jobs:
           node-version: '24'
       - run: node scripts/release.mjs check
       - run: node --test scripts/release.test.mjs scripts/prepare-android.test.mjs
+      - run: npm run test:transfer
       - run: bash -n scripts/release-android.sh
       - name: Validate PR title for squash merge
         if: github.event_name == 'pull_request'

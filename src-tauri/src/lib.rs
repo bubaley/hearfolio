@@ -1,4 +1,5 @@
 mod audio;
+mod background;
 mod cloud;
 mod platform;
 mod postprocess;
@@ -6,6 +7,7 @@ mod recording;
 mod records;
 mod restart;
 mod storage;
+mod transfer;
 use cloud::RecognitionConfig;
 use records::{
     delete_entries_at, read_history_at, rename_entry_at, save_transcript_at,
@@ -414,143 +416,162 @@ async fn import_audio(
     app: tauri::AppHandle,
     path: String,
     name: Option<String>,
-    mut configuration: RecognitionConfig,
+    configuration: RecognitionConfig,
 ) -> Result<HistoryEntry, String> {
     let job = JobGuard::acquire()?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
-        configuration.validate()?;
-        platform::validate_configuration(&configuration)?;
-        let source = Path::new(&path);
-        let is_uri = path.starts_with("content://");
-        let requested_name = name
-            .as_deref()
-            .and_then(|name| Path::new(name).file_name())
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.chars().any(char::is_control));
-        let original_name = requested_name.or_else(|| {
-            if is_uri {
-                None
-            } else {
-                source.file_name().and_then(|name| name.to_str())
-            }
-        });
-        let extension = original_name
-            .and_then(|name| Path::new(name).extension())
-            .and_then(|extension| extension.to_str())
-            .map(str::to_lowercase);
-        if !is_uri
-            && !extension.as_ref().is_some_and(|extension| {
-                ["m4a", "mp3", "wav", "mp4", "aac", "flac", "ogg"].contains(&extension.as_str())
-            })
-        {
-            return Err("errors.audioFormatUnsupported".into());
+        import_audio_sync(&app, path, name, configuration)
+    })
+    .await
+    .map_err(|e| format!("errors.operationFailed|{e}"))?
+}
+fn import_audio_sync(
+    app: &tauri::AppHandle,
+    path: String,
+    name: Option<String>,
+    configuration: RecognitionConfig,
+) -> Result<HistoryEntry, String> {
+    import_audio_with_id(app, path, name, configuration, None)
+}
+fn import_audio_with_id(
+    app: &tauri::AppHandle,
+    path: String,
+    name: Option<String>,
+    mut configuration: RecognitionConfig,
+    stable_id: Option<String>,
+) -> Result<HistoryEntry, String> {
+    configuration.validate()?;
+    platform::validate_configuration(&configuration)?;
+    let source = Path::new(&path);
+    let is_uri = path.starts_with("content://");
+    let requested_name = name
+        .as_deref()
+        .and_then(|name| Path::new(name).file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.chars().any(char::is_control));
+    let original_name = requested_name.or_else(|| {
+        if is_uri {
+            None
+        } else {
+            source.file_name().and_then(|name| name.to_str())
         }
-        let id = format!(
+    });
+    let extension = original_name
+        .and_then(|name| Path::new(name).extension())
+        .and_then(|extension| extension.to_str())
+        .map(str::to_lowercase);
+    if !is_uri
+        && !extension.as_ref().is_some_and(|extension| {
+            ["m4a", "mp3", "wav", "mp4", "aac", "flac", "ogg"].contains(&extension.as_str())
+        })
+    {
+        return Err("errors.audioFormatUnsupported".into());
+    }
+    let id = stable_id.unwrap_or_else(|| {
+        format!(
             "hearing-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos()
-        );
-        let staging = base()?.join("temp").join(format!("{id}-import.audio"));
-        let mut input = platform::open_audio(&app, &path)?;
-        let total = input.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-        let mut output =
-            fs::File::create(&staging).map_err(|e| format!("errors.operationFailed|{e}"))?;
-        let start = Instant::now();
-        let mut copied = 0u64;
-        let mut buffer = [0u8; 1024 * 1024];
-        let copy_result = (|| -> Result<(), String> {
-            loop {
-                let n = input
-                    .read(&mut buffer)
-                    .map_err(|e| format!("errors.operationFailed|{e}"))?;
-                if n == 0 {
-                    break;
-                }
-                output
-                    .write_all(&buffer[..n])
-                    .map_err(|e| format!("errors.operationFailed|{e}"))?;
-                copied += n as u64;
-                emit(
-                    &app,
-                    "import",
-                    "progress.copyAudio",
-                    copied,
-                    total,
-                    start.elapsed().as_secs(),
-                );
+        )
+    });
+    let staging = base()?.join("temp").join(format!("{id}-import.audio"));
+    let mut input = platform::open_audio(&app, &path)?;
+    let total = input.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let mut output =
+        fs::File::create(&staging).map_err(|e| format!("errors.operationFailed|{e}"))?;
+    let start = Instant::now();
+    let mut copied = 0u64;
+    let mut buffer = [0u8; 1024 * 1024];
+    let copy_result = (|| -> Result<(), String> {
+        loop {
+            let n = input
+                .read(&mut buffer)
+                .map_err(|e| format!("errors.operationFailed|{e}"))?;
+            if n == 0 {
+                break;
             }
-            Ok(())
-        })();
-        if let Err(e) = copy_result {
-            drop(output);
-            let _ = fs::remove_file(&staging);
-            return Err(e);
+            output
+                .write_all(&buffer[..n])
+                .map_err(|e| format!("errors.operationFailed|{e}"))?;
+            copied += n as u64;
+            emit(
+                &app,
+                "import",
+                "progress.copyAudio",
+                copied,
+                total,
+                start.elapsed().as_secs(),
+            );
         }
-        if let Err(e) = output.sync_all() {
-            drop(output);
-            let _ = fs::remove_file(&staging);
-            return Err(format!("errors.audioRead|{e}"));
-        }
+        Ok(())
+    })();
+    if let Err(e) = copy_result {
         drop(output);
-        let extension = match extension {
-            Some(extension)
-                if ["m4a", "mp3", "wav", "mp4", "aac", "flac", "ogg"]
-                    .contains(&extension.as_str()) =>
-            {
-                extension
-            }
-            _ => match audio::detect_extension(&staging) {
-                Ok(extension) => extension.to_owned(),
-                Err(error) => {
-                    let _ = fs::remove_file(&staging);
-                    return Err(error);
-                }
-            },
-        };
-        let name = original_name
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("Recording-{}.{extension}", clock()));
-        let target = base()?.join("input").join(format!("{id}.{extension}"));
-        if let Err(error) = fs::rename(&staging, &target) {
-            let _ = fs::remove_file(&staging);
-            return Err(format!("errors.audioRead|{error}"));
+        let _ = fs::remove_file(&staging);
+        return Err(e);
+    }
+    if let Err(e) = output.sync_all() {
+        drop(output);
+        let _ = fs::remove_file(&staging);
+        return Err(format!("errors.audioRead|{e}"));
+    }
+    drop(output);
+    let extension = match extension {
+        Some(extension)
+            if ["m4a", "mp3", "wav", "mp4", "aac", "flac", "ogg"].contains(&extension.as_str()) =>
+        {
+            extension
         }
-        let entry = HistoryEntry {
-            id,
-            name,
-            input_path: target.to_string_lossy().into_owned(),
-            output_path: None,
-            model: None,
-            configuration: Some(configuration),
-            created_at: clock(),
-            completed_at: None,
-            size_bytes: Some(copied),
-            duration_seconds: audio_duration(&target)
-                .or_else(|| platform::native_audio_duration(&app, &target)),
-            results: vec![],
-        };
-        let _lock = history_lock()?;
-        let dir = base()?;
-        let mut entries = match read_history_at(&dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                let _ = fs::remove_file(&target);
-                return Err(e);
+        _ => match audio::detect_extension(&staging) {
+            Ok(extension) => extension.to_owned(),
+            Err(error) => {
+                let _ = fs::remove_file(&staging);
+                return Err(error);
             }
-        };
-        entries.push(entry.clone());
-        if let Err(e) = write_history_at(&dir, &entries) {
-            let _ = fs::remove_file(target);
+        },
+    };
+    let name = original_name
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("Recording-{}.{extension}", clock()));
+    let target = base()?.join("input").join(format!("{id}.{extension}"));
+    if let Err(error) = fs::rename(&staging, &target) {
+        let _ = fs::remove_file(&staging);
+        return Err(format!("errors.audioRead|{error}"));
+    }
+    let entry = HistoryEntry {
+        id,
+        transfer_source_id: None,
+        name,
+        input_path: target.to_string_lossy().into_owned(),
+        output_path: None,
+        model: None,
+        configuration: Some(configuration),
+        created_at: clock(),
+        completed_at: None,
+        size_bytes: Some(copied),
+        duration_seconds: audio_duration(&target)
+            .or_else(|| platform::native_audio_duration(app, &target)),
+        results: vec![],
+    };
+    let _lock = history_lock()?;
+    let dir = base()?;
+    let mut entries = match read_history_at(&dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            let _ = fs::remove_file(&target);
             return Err(e);
         }
-        recording::imported(source);
-        Ok(entry)
-    })
-    .await
-    .map_err(|e| format!("errors.operationFailed|{e}"))?
+    };
+    entries.push(entry.clone());
+    if let Err(e) = write_history_at(&dir, &entries) {
+        let _ = fs::remove_file(target);
+        return Err(e);
+    }
+    recording::imported(source);
+    Ok(entry)
 }
 #[tauri::command]
 fn get_history(id: String) -> Result<HistoryDetail, String> {
@@ -1129,11 +1150,14 @@ fn save_text(path: String, content: String) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init());
     #[cfg(target_os = "android")]
     let builder = builder.plugin(tauri_plugin_recording::init());
+    #[cfg(mobile)]
+    let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
     #[cfg(desktop)]
     let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1144,12 +1168,16 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             restart::install_menu(app.handle())?;
             if let Ok(root) = base() {
+                transfer::cleanup_partial_files(&root);
                 app.asset_protocol_scope()
                     .allow_directory(root.join("input"), false)?;
             }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            transfer::transfer_api,
+            transfer::transfer_send,
+            transfer::transfer_receive,
             restart::restart_application,
             recording::start_audio_recording,
             recording::append_audio_recording,
@@ -1184,6 +1212,10 @@ pub fn run() {
             model_status,
             list_history,
             import_audio,
+            background::transfer_background,
+            recording::recording_activity_snapshot,
+            recording::import_quick_recordings,
+            recording::recording_quick_control,
             update_record_configuration,
             set_storage_parent,
             get_history,

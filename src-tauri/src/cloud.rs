@@ -34,6 +34,19 @@ impl Default for RecognitionConfig {
     }
 }
 impl RecognitionConfig {
+    /// Validate portable archive metadata without requiring this device to run the model.
+    pub fn validate_metadata(&self) -> Result<(), String> {
+        if self.model.trim().is_empty()
+            || self.model.len() > 200
+            || self.model.chars().any(char::is_control)
+        {
+            return Err("Invalid recognition metadata".into());
+        }
+        match (self.provider.as_str(), self.mode.as_str()) {
+            ("local", "local") | ("openrouter", "streaming" | "transcription") => Ok(()),
+            _ => Err("Invalid recognition metadata".into()),
+        }
+    }
     pub fn validate(&mut self) -> Result<(), String> {
         self.model = self.model.trim().to_owned();
         super::platform::validate_configuration(self)?;

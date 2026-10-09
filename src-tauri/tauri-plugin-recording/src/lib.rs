@@ -5,6 +5,9 @@ use tauri::{
 
 pub struct Recording<R: Runtime>(PluginHandle<R>);
 impl<R: Runtime> Recording<R> {
+    pub fn transfer<T: serde::de::DeserializeOwned>(&self, command: &str, payload: serde_json::Value) -> Result<T, String> {
+        self.0.run_mobile_plugin(command, payload).map_err(|e|e.to_string())
+    }
     pub fn run<T: serde::de::DeserializeOwned>(
         &self,
         command: &str,

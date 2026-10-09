@@ -41,3 +41,5 @@ keystore.properties
 /input/
 /output/
 /models/
+
+/server/deploy/.env
