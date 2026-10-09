@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1 (2026-10-09)
+
+### Fixes and performance
+
+- **macos:** include microphone access in hardened signatures ([3e32af5](https://github.com/bubaley/hearfolio/commit/3e32af59e03cdb4ead8026fa8d69b506d51f8f8d))
+
 ## 0.4.0 (2026-10-09)
 
 ### Features
