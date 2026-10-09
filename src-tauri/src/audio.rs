@@ -26,15 +26,53 @@ fn probe(path: &Path) -> Result<symphonia::core::probe::ProbeResult, String> {
 
 pub fn duration(path: &Path) -> Option<f64> {
     let probed = probe(path).ok()?;
-    let parameters = &probed.format.default_track()?.codec_params;
-    let frames = parameters.n_frames?;
-    let seconds = if let Some(time_base) = parameters.time_base {
-        let time = time_base.calc_time(frames);
-        time.seconds as f64 + time.frac
-    } else {
-        frames as f64 / parameters.sample_rate? as f64
+    let track = probed.format.default_track()?;
+    let track_id = track.id;
+    let parameters = track.codec_params.clone();
+    duration_from_packets(probed, parameters, track_id)
+}
+fn duration_from_packets(
+    mut probed: symphonia::core::probe::ProbeResult,
+    parameters: symphonia::core::codecs::CodecParameters,
+    track_id: u32,
+) -> Option<f64> {
+    let seconds_for_frames = |frames| {
+        if let Some(time_base) = parameters.time_base {
+            let time = time_base.calc_time(frames);
+            Some(time.seconds as f64 + time.frac)
+        } else {
+            parameters
+                .sample_rate
+                .filter(|rate| *rate > 0)
+                .map(|rate| frames as f64 / rate as f64)
+        }
     };
-    (seconds.is_finite() && seconds > 0.0).then_some(seconds)
+    if let Some(seconds) = parameters
+        .n_frames
+        .and_then(seconds_for_frames)
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+    {
+        return Some(seconds);
+    }
+    // Raw AAC and some recorders omit n_frames. Scan packet timestamps without
+    // decoding PCM or buffering the recording, then use the track's time base.
+    let mut first = None;
+    let mut end = 0;
+    loop {
+        match probed.format.next_packet() {
+            Ok(packet) if packet.track_id() == track_id => {
+                first.get_or_insert(packet.ts());
+                end = end.max(packet.ts().checked_add(packet.dur())?);
+            }
+            Ok(_) => {}
+            Err(Error::IoError(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break
+            }
+            Err(_) => return None,
+        }
+    }
+    seconds_for_frames(end.checked_sub(first?)?)
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
 }
 
 // SAF providers may return an opaque URI with no extension. Inspect the copied
@@ -208,6 +246,59 @@ mod tests {
             16000
         );
         assert_eq!(detect_extension(&input).unwrap(), "wav");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn packet_duration_handles_aac_without_container_frame_count() {
+        let dir = fixture();
+        let input = dir.join("source.aac");
+        fs::write(&input, include_bytes!("../tests/fixtures/sine.aac")).unwrap();
+        let probed = probe(&input).unwrap();
+        let track = probed.format.default_track().unwrap();
+        let track_id = track.id;
+        let mut parameters = track.codec_params.clone();
+        // Model a recorder/stream that omitted frame count in its metadata.
+        parameters.n_frames = None;
+        let seconds = duration_from_packets(probed, parameters, track_id).unwrap();
+        assert!(
+            (0.5..0.56).contains(&seconds),
+            "unexpected duration: {seconds}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn native_pcm_recording_preserves_exact_sample_duration_and_playable_audio() {
+        let dir = fixture();
+        let input = dir.join("recording.wav");
+        let mut writer = hound::WavWriter::create(
+            &input,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 48000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for index in 0..24000 {
+            writer
+                .write_sample(
+                    (f64::sin(index as f64 * 2.0 * std::f64::consts::PI * 440.0 / 48000.0)
+                        * 16000.0) as i16,
+                )
+                .unwrap();
+        }
+        writer.finalize().unwrap();
+        assert_eq!(duration(&input), Some(0.5));
+        assert_eq!(detect_extension(&input).unwrap(), "wav");
+        let chunks = prepare_cloud_chunks(&input, &dir, |_, _| {}).unwrap();
+        let mut decoded = hound::WavReader::open(&chunks[0]).unwrap();
+        assert_eq!(decoded.duration(), 24000);
+        let energy: f64 = decoded
+            .samples::<i16>()
+            .map(|sample| (sample.unwrap() as f64 / 32768.0).powi(2))
+            .sum();
+        assert!((energy / 24000.0).sqrt() > 0.3);
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

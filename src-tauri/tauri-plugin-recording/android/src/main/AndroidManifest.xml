@@ -1,4 +1,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <application>
+        <provider android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.hearfolio.files"
+            android:exported="false" android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/hearfolio_share_paths" />
+        </provider>
+    </application>
 </manifest>

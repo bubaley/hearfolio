@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Preserve the dark badge; scale only the waveform by 2/3 around (512,512). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp" android:height="48dp"
+    android:viewportWidth="1024" android:viewportHeight="1024">
+    <group android:pivotX="512" android:pivotY="512" android:scaleX="0.84" android:scaleY="0.84">
+    <path android:fillColor="#19191b"
+        android:pathData="M268,66 H756 A202,202 0,0 1,958,268 V756 A202,202 0,0 1,756,958 H268 A202,202 0,0 1,66,756 V268 A202,202 0,0 1,268,66 Z" />
+    <path android:fillColor="@android:color/transparent" android:strokeColor="#ffffff"
+        android:strokeWidth="30.8" android:strokeLineCap="round"
+        android:pathData="M344,474.667 V549.333 M418.667,418.667 V605.333 M512,344 V680 M605.333,418.667 V605.333 M680,474.667 V549.333" />
+    </group>
+</vector>

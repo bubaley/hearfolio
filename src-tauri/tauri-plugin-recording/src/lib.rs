@@ -5,9 +5,13 @@ use tauri::{
 
 pub struct Recording<R: Runtime>(PluginHandle<R>);
 impl<R: Runtime> Recording<R> {
-    pub fn run(&self, command: &str, payload: serde_json::Value) -> Result<(), String> {
+    pub fn run<T: serde::de::DeserializeOwned>(
+        &self,
+        command: &str,
+        payload: serde_json::Value,
+    ) -> Result<T, String> {
         self.0
-            .run_mobile_plugin::<()>(command, payload)
+            .run_mobile_plugin::<T>(command, payload)
             .map_err(|error| {
                 let detail = error.to_string();
                 for key in [
@@ -17,6 +21,10 @@ impl<R: Runtime> Recording<R> {
                     "recordingStart",
                     "recordingStop",
                     "operationBusy",
+                    "audioShare",
+                    "textShare",
+                    "exportWrite",
+                    "audioPlayback",
                 ] {
                     let localized = format!("errors.{key}");
                     if detail.contains(&localized) {

@@ -16,6 +16,9 @@ test('generated Android branding survives repeated preparation',async()=>{
     assert.ok(source.includes('@mipmap/ic_launcher'));
     assert.deepEqual(await readFile(path.join(directory,'res/mipmap-xxxhdpi/ic_launcher.png')),await readFile('src-tauri/icons/android/mipmap-xxxhdpi/ic_launcher.png'));
     assert.deepEqual(await readFile(path.join(directory,'res/mipmap-anydpi-v26/ic_launcher.xml')),await readFile('src-tauri/icons/android/mipmap-anydpi-v26/ic_launcher.xml'));
+    for(const resource of ['drawable/hearfolio_launcher_foreground.xml','drawable/hearfolio_launcher_legacy.xml','mipmap-anydpi/ic_launcher.xml','mipmap-anydpi/ic_launcher_round.xml','mipmap-anydpi-v26/ic_launcher_round.xml']){
+      assert.deepEqual(await readFile(path.join(directory,'res',resource)),await readFile(path.join('src-tauri/icons/android',resource)));
+    }
     await writeFile(manifest,'<manifest><application/></manifest>');
     assert.throws(()=>execFileSync(process.execPath,['scripts/prepare-android.mjs',directory],{stdio:'pipe'}),/launcher/);
   }finally{await rm(directory,{recursive:true,force:true});}

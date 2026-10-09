@@ -1,6 +1,7 @@
 mod audio;
 mod cloud;
 mod platform;
+mod postprocess;
 mod recording;
 mod records;
 mod restart;
@@ -527,7 +528,9 @@ async fn import_audio(
             created_at: clock(),
             completed_at: None,
             size_bytes: Some(copied),
-            duration_seconds: audio_duration(&target),
+            duration_seconds: audio_duration(&target)
+                .or_else(|| platform::native_audio_duration(&app, &target)),
+            results: vec![],
         };
         let _lock = history_lock()?;
         let dir = base()?;
@@ -1153,13 +1156,30 @@ pub fn run() {
             recording::stop_audio_recording,
             recording::cancel_audio_recording,
             recording::discard_audio_recording,
+            recording::audio_recording_level,
+            recording::request_microphone_permission,
             platform::get_runtime_platform,
+            platform::prepare_audio_playback,
+            platform::share_audio,
+            platform::save_audio,
+            platform::share_text,
+            platform::prepare_native_playback,
+            platform::native_playback_state,
+            platform::play_native_playback,
+            platform::pause_native_playback,
+            platform::seek_native_playback,
+            platform::release_native_playback,
             platform::pick_audio_file,
             platform::export_text,
             platform::get_latest_android_release,
             cloud::get_settings,
             cloud::save_settings,
             cloud::list_openrouter_models,
+            postprocess::list_postprocess_rules,
+            postprocess::save_postprocess_rule,
+            postprocess::delete_postprocess_rule,
+            postprocess::list_text_models,
+            postprocess::apply_postprocess,
             runtime_status,
             model_status,
             list_history,
