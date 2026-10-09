@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.0 (2026-10-09)
+
+### Features
+
+- **android:** add background transfers and lock-screen recording ([cadf1ff](https://github.com/bubaley/hearfolio/commit/cadf1ff7c7e379a2164eeab001a9e0b31d98bbe4))
+- **transfer:** share recordings through paired devices ([d233fea](https://github.com/bubaley/hearfolio/commit/d233feaca5d3ecf2cf45d402579f78129229ec6e))
+
+### Fixes and performance
+
+- **transfer:** update the original recording on return ([a251070](https://github.com/bubaley/hearfolio/commit/a2510707da29c4a4c01bbe96e9e9c32449b3a569))
+
+### Maintenance
+
+- merge main into device transfer branch ([2396fe4](https://github.com/bubaley/hearfolio/commit/2396fe41c3d70a4eab1e6d188625c20540e18d7e))
+
 ## 0.4.2 (2026-10-09)
 
 ### Fixes and performance
