@@ -23,3 +23,17 @@ test('generated Android branding survives repeated preparation',async()=>{
     assert.throws(()=>execFileSync(process.execPath,['scripts/prepare-android.mjs',directory],{stdio:'pipe'}),/launcher/);
   }finally{await rm(directory,{recursive:true,force:true});}
 });
+test('audio share provider stays separate from the generated Tauri provider',async()=>{
+  const manifest=await readFile('src-tauri/tauri-plugin-recording/android/src/main/AndroidManifest.xml','utf8');
+  const provider=/<provider\b[^>]*android:name="([^"]+)"[^>]*>/.exec(manifest);
+  assert.ok(provider,'share provider must be declared');
+  // Android merges providers by android:name. The generated app already uses
+  // androidx.core.content.FileProvider with a different authority and XML paths.
+  assert.notEqual(provider[1],'androidx.core.content.FileProvider');
+  const source=await readFile(`src-tauri/tauri-plugin-recording/android/src/main/java/${provider[1].replaceAll('.','/')}.kt`,'utf8');
+  assert.match(source,/class\s+HearfolioFileProvider\s*:\s*FileProvider\(\)/);
+  assert.match(provider[0],/android:authorities="\$\{applicationId\}\.hearfolio\.files"/);
+  const paths=await readFile('src-tauri/tauri-plugin-recording/android/src/main/res/xml/hearfolio_share_paths.xml','utf8');
+  assert.match(paths,/<cache-path\b[^>]*path="hearfolio-shares\/"/);
+  assert.doesNotMatch(paths,/<(?:root|files|external)-path\b/);
+});
