@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 (2026-10-09)
+
+### Features
+
+- **app:** add native recording and reusable text processing ([ad751e1](https://github.com/bubaley/hearfolio/commit/ad751e16a393ee0565541568f65b5fdda473f53c))
+
+### Fixes and performance
+
+- **android:** isolate the audio sharing file provider ([388b8d0](https://github.com/bubaley/hearfolio/commit/388b8d09af7e7c16fd65c92091a413c98bb979d6))
+
 ## 0.3.1 (2026-10-07)
 
 ### Fixes and performance
