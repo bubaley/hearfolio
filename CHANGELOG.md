@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.2 (2026-10-09)
+
+### Fixes and performance
+
+- **android:** use processed microphone capture with automatic gain ([a5639ba](https://github.com/bubaley/hearfolio/commit/a5639baca8526b6d671df71b6f92a0c2afb577ae))
+
 ## 0.4.1 (2026-10-09)
 
 ### Fixes and performance
