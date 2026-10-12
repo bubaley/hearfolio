@@ -77,7 +77,7 @@ class TileRecordingActivity : Activity() {
         if(starting || RecordingService.busy())return
         starting=true
         val dir=File(filesDir,"hearfolio-quick-recordings").apply{mkdirs()}
-        val target=File(dir,"hearfolio-recording-${UUID.randomUUID()}.wav.partial")
+        val target=File(dir,"hearfolio-recording-${UUID.randomUUID()}.wav.partial").canonicalFile
         val ticket=RecordingService.starts.reserve(target.path,quick=true,revision=RecordingService.stateRevision+1) { error -> runOnUiThread { starting=false;if(error!=null)failure=tr("Не удалось начать запись. Откройте Hearfolio.","Could not start recording. Open Hearfolio.");update() } }
         if(ticket==null) {starting=false;update();return}
         try {ContextCompat.startForegroundService(this,Intent(this,RecordingService::class.java).setAction(RecordingService.START).putExtra("path",target.path).putExtra("quick",true))}

@@ -52,6 +52,40 @@ class RecorderLifecycleTest {
             for(state in listOf("idle","finished","cancelled","error")) assertFalse(RecorderControlPolicy.shouldRecoverOrphan(state,false))
         } finally {file.delete()}
     }
+    @Test fun rejectedOrCancelledForegroundStartPromotesBeforeStoppingWithoutOpeningCapture() {
+        val events=mutableListOf<String>()
+        val accepted=RecorderForegroundStart.accept(false,{events.add("startForeground")},{events.add("stopSelf")})
+        if(accepted) events.add("open microphone")
+        assertFalse(accepted);assertEquals(listOf("startForeground","stopSelf"),events)
+        events.clear()
+        assertTrue(RecorderForegroundStart.accept(true,{events.add("startForeground")},{events.add("stopSelf")}))
+        assertEquals(listOf("startForeground"),events)
+    }
+    @Test fun aliasedAndroidDataPathUsesSameIdentityForReservationIntentAndControls() {
+        val root=java.nio.file.Files.createTempDirectory("hearfolio-data-alias-")
+        val actual=java.nio.file.Files.createDirectory(root.resolve("user-0"))
+        val alias=java.nio.file.Files.createSymbolicLink(root.resolve("data-data"),actual)
+        try {
+            val raw=alias.resolve("hearfolio-recording-123.wav").toString()
+            val intentPath=File(raw).canonicalPath
+            assertNotEquals(raw,intentPath)
+            // Reproduce the released wiring: raw reservation + canonical Intent.
+            val oldRegistry=RecorderStartRegistry()
+            oldRegistry.reserve(raw) {}
+            assertNull(oldRegistry.claim(intentPath))
+            assertEquals(raw,oldRegistry.pendingPath)
+            // Production canonicalizer runs before reservation and is reused
+            // for stop/pause/cancel, even before the WAV exists.
+            val registry=RecorderStartRegistry();val identity=RecorderPathIdentity.canonical(raw)
+            val ticket=registry.reserve(identity) {}!!
+            assertSame(ticket,registry.claim(intentPath))
+            assertEquals(ticket.path,RecorderPathIdentity.canonical(raw))
+            assertTrue(RecorderControlPolicy.accepts(ticket.path,RecorderPathIdentity.canonical(raw),"recording"))
+            assertTrue(registry.cancel(RecorderPathIdentity.canonical(raw)))
+        } finally {
+            java.nio.file.Files.deleteIfExists(alias);java.nio.file.Files.deleteIfExists(actual);java.nio.file.Files.deleteIfExists(root)
+        }
+    }
     @Test fun cancellationBetweenServiceDispatchAndCaptureOpeningRevokesStart() {
         val registry=RecorderStartRegistry();val calls=mutableListOf<String?>()
         val ticket=registry.reserve("old.wav") {calls.add(it)}!!

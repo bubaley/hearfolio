@@ -83,7 +83,9 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
     fun start(invoke: Invoke) {
         if (RecordingService.busy() || pending != null) { invoke.reject("errors.operationBusy"); return }
         releasePlayer()
-        val requestedPath=invoke.parseArgs(StartArgs::class.java).path
+        val rawPath=invoke.parseArgs(StartArgs::class.java).path
+        val requestedPath=RecorderPathIdentity.canonical(rawPath)
+        Log.i("HearfolioRecording","Start requested: requestedPath=$rawPath; canonicalPath=$requestedPath")
         val ticket=RecordingService.starts.reserve(requestedPath,revision=RecordingService.stateRevision+1) { error -> activity.runOnUiThread {
             if(pending===invoke) { pending=null;startTicket=null;if(error==null)invoke.resolve() else invoke.reject(error) }
         } } ?: run { invoke.reject("errors.operationBusy");return }
@@ -112,7 +114,7 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
     fun recordingNotificationResult(invoke: Invoke) { if(pending===invoke) startGranted(invoke) }
     @Command
     fun acknowledgeRecording(invoke: Invoke) {
-        val requestedPath=invoke.parseArgs(StartArgs::class.java).path
+        val requestedPath=RecorderPathIdentity.canonical(invoke.parseArgs(StartArgs::class.java).path)
         recordingCommand(invoke) {
             if(requestedPath!=RecordingService.path || !RecorderControlPolicy.canAcknowledge(RecordingService.state)) {invoke.reject("errors.recordingUnavailable");return@recordingCommand}
             try {RecordingService.acknowledge(activity.applicationContext,requestedPath);invoke.resolve()}
@@ -122,16 +124,18 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
 
     private fun startGranted(invoke: Invoke) {
         try {
-            val file = File(invoke.parseArgs(StartArgs::class.java).path).canonicalFile
+            val ticket=startTicket ?: return
+            if(pending!==invoke || ticket.cancelled) return
+            val file=File(ticket.path)
             if (!file.path.startsWith(activity.dataDir.canonicalPath + File.separator) || !file.name.startsWith("hearfolio-recording-")) throw IllegalArgumentException()
-            if(pending!==invoke || startTicket?.cancelled!=false) return
-            ContextCompat.startForegroundService(activity, Intent(activity, RecordingService::class.java).setAction(RecordingService.START).putExtra("path", file.path))
-        } catch (_: Exception) { startTicket?.let { RecordingService.starts.complete(it,"errors.recordingStart") } }
+            Log.i("HearfolioRecording","Dispatch recording service: path=${ticket.path}; windowFocus=${activity.hasWindowFocus()}; finishing=${activity.isFinishing}; destroyed=${activity.isDestroyed}; micPermission=${getPermissionState("microphone")}")
+            ContextCompat.startForegroundService(activity, Intent(activity, RecordingService::class.java).setAction(RecordingService.START).putExtra("path", ticket.path))
+        } catch (failure: Exception) {Log.e("HearfolioRecording","Recording service dispatch failed",failure);startTicket?.let { RecordingService.starts.complete(it,"errors.recordingStart") } }
     }
 
     @Command
     fun stop(invoke: Invoke) {
-        val requestedPath=invoke.parseArgs(StartArgs::class.java).path
+        val requestedPath=RecorderPathIdentity.canonical(invoke.parseArgs(StartArgs::class.java).path)
         recordingCommand(invoke) {
             if(requestedPath!=RecordingService.path) {invoke.reject("errors.recordingUnavailable");return@recordingCommand}
             // Rust acknowledges only after it has durably imported this file.
@@ -142,7 +146,7 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
     }
     @Command
     fun cancel(invoke: Invoke) {
-        val requestedPath=invoke.parseArgs(StartArgs::class.java).path
+        val requestedPath=RecorderPathIdentity.canonical(invoke.parseArgs(StartArgs::class.java).path)
         val cancelledStart=RecordingService.starts.cancel(requestedPath)
         recordingCommand(invoke) {
             val owner=RecordingService.instance
@@ -165,8 +169,9 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
     fun recordingControl(invoke: Invoke) {
         val args=invoke.parseArgs(RecordingControlArgs::class.java)
         val stage = args.stage
+        val requestedPath=RecorderPathIdentity.canonical(args.path)
         val paused = when(stage) { "pause" -> true; "resume" -> false; else -> { invoke.reject("errors.recordingUnavailable"); return } }
-        recordingCommand(invoke) { if(RecordingService.instance?.setPaused(paused,args.path)==true) invoke.resolve() else invoke.reject("errors.recordingUnavailable") }
+        recordingCommand(invoke) { if(RecordingService.instance?.setPaused(paused,requestedPath)==true) invoke.resolve() else invoke.reject("errors.recordingUnavailable") }
     }
     @Command
     fun openBatterySettings(invoke: Invoke) {
@@ -180,12 +185,13 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
     fun quickControl(invoke: Invoke) {
         val args=invoke.parseArgs(TransferArgs::class.java)
         val action=args.stage
+        val requestedPath=RecorderPathIdentity.canonical(args.path)
         recordingCommand(invoke) {
-        if(!RecordingService.quickRecording || args.path!=RecordingService.path) {invoke.reject("errors.recordingUnavailable");return@recordingCommand}
+        if(!RecordingService.quickRecording || requestedPath!=RecordingService.path) {invoke.reject("errors.recordingUnavailable");return@recordingCommand}
         when(action) {
-            "pause", "resume" -> { if(RecordingService.instance?.setPaused(action=="pause",args.path)==true) invoke.resolve() else invoke.reject("errors.recordingUnavailable") }
-            "stop" -> { if (RecordingService.state == "finished") invoke.resolve() else { val error=RecordingService.instance?.finish(true,args.path) ?: "errors.recordingUnavailable"; if(error.isEmpty())invoke.resolve() else invoke.reject(error) } }
-            "cancel" -> {if(RecordingService.instance?.discard(args.path)!=false)invoke.resolve() else invoke.reject("errors.recordingUnavailable")}
+            "pause", "resume" -> { if(RecordingService.instance?.setPaused(action=="pause",requestedPath)==true) invoke.resolve() else invoke.reject("errors.recordingUnavailable") }
+            "stop" -> { if (RecordingService.state == "finished") invoke.resolve() else { val error=RecordingService.instance?.finish(true,requestedPath) ?: "errors.recordingUnavailable"; if(error.isEmpty())invoke.resolve() else invoke.reject(error) } }
+            "cancel" -> {if(RecordingService.instance?.discard(requestedPath)!=false)invoke.resolve() else invoke.reject("errors.recordingUnavailable")}
             else -> invoke.reject("errors.recordingUnavailable")
         }
         }

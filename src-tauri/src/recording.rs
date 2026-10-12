@@ -250,9 +250,13 @@ pub async fn start_audio_recording(
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = crate::base()?
-            .join("temp")
-            .join(format!("hearfolio-recording-{unique}.{extension}"));
+        let directory = crate::base()?.join("temp");
+        let path = directory.join(format!("hearfolio-recording-{unique}.{extension}"));
+        // Android dataDir may use /data/data while File.canonicalPath uses
+        // /data/user/0. Allocate one identity before SESSION, ticket or journal
+        // references it; the WAV itself does not exist until native capture.
+        #[cfg(target_os = "android")]
+        let path = validated_native_path(&path, &directory).ok_or("errors.recordingStart")?;
         let writer = if cfg!(target_os = "android") {
             None
         } else {
@@ -1095,6 +1099,33 @@ mod native_recovery_tests {
         let terminal = take_terminal_session(&mut active, "finished", &path).unwrap();
         drop(terminal);
         drop(JobGuard::acquire().unwrap());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn android_data_directory_alias_uses_one_identity_for_session_and_terminal_journal() {
+        let _serial = JOB_TEST_LOCK.lock().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("hearfolio-path-alias-{}", uuid::Uuid::new_v4()));
+        let actual = root.join("user-0");
+        let alias = root.join("data-data");
+        fs::create_dir_all(actual.join("temp")).unwrap();
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        let raw = alias.join("temp/hearfolio-recording-123.wav");
+        let native = actual
+            .canonicalize()
+            .unwrap()
+            .join("temp/hearfolio-recording-123.wav");
+        assert_ne!(raw, native);
+        assert!(!raw.exists());
+        let allocated = validated_native_path(&raw, &alias.join("temp")).unwrap();
+        assert_eq!(allocated, native);
+        let mut active = None;
+        restore_session(&mut active, &allocated).unwrap();
+        assert_eq!(active.as_ref().unwrap().path, native);
+        let stopped = take_terminal_session(&mut active, "finished", &native).unwrap();
+        drop(stopped);
+        drop(JobGuard::acquire().unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn native_recovery_accepts_only_private_allocated_paths_even_before_file_exists() {

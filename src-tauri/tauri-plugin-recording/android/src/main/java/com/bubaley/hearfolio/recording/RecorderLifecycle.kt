@@ -1,8 +1,25 @@
 package com.bubaley.hearfolio.recording
 
+import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.FutureTask
+
+// Android exposes absolute paths that may still contain /data/data aliases.
+// A start ticket, service intent and every control use one canonical identity.
+internal object RecorderPathIdentity {
+    fun canonical(path: String): String = File(path).canonicalPath
+}
+
+internal object RecorderForegroundStart {
+    // Android crashes a startForegroundService that stops before promotion,
+    // including an already-cancelled intent. Keep this order explicit.
+    fun accept(hasTicket: Boolean, promote: () -> Unit, reject: () -> Unit): Boolean {
+        promote()
+        if(!hasTicket) reject()
+        return hasTicket
+    }
+}
 
 // Application scope: Activity recreation never replaces the command queue.
 internal class RecorderLifecycleQueue(private val executor: ExecutorService = Executors.newSingleThreadExecutor { task -> Thread(task, "Hearfolio-recording-control") }) {

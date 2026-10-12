@@ -188,14 +188,24 @@ class RecordingService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         latestStartId=startId
         if(intent==null) { stopSelf(startId);return START_NOT_STICKY }
-        val ticket=if(intent.action==START) starts.claim(intent.getStringExtra("path") ?: "") else null
+        val intentPath=intent.getStringExtra("path") ?: ""
+        val pending=if(intent.action==START) starts.pendingTicket else null
+        val ticket=if(intent.action==START) starts.claim(intentPath) else null
         if(intent.action==START) {
-            if(ticket==null) { if(recorder==null) stopSelf(startId);return START_NOT_STICKY }
-            latestRecordingStartId=startId
+            val reason=when {ticket!=null -> "claimed";pending==null -> "no_pending_ticket";pending.cancelled -> "cancelled_ticket";pending.path!=intentPath -> "path_mismatch";else -> "ticket_changed"}
+            Log.i("HearfolioRecording","Service START: startId=$startId; intentPath=$intentPath; pendingPath=${pending?.path}; claim=$reason")
+            // Even a cancelled queued START came from startForegroundService.
+            // Fulfil that contract before rejecting it; otherwise Android may
+            // crash the process for a foreground service that never promoted.
+            if(ticket!=null) latestRecordingStartId=startId
             try {
-                if(Build.VERSION.SDK_INT>=30) startForeground(ID,notification(),ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE) else startForeground(ID,notification())
+                val accepted=RecorderForegroundStart.accept(ticket!=null,
+                    promote={if(Build.VERSION.SDK_INT>=30) startForeground(ID,notification(),ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE) else startForeground(ID,notification())},
+                    reject={if(recorder==null)stopSelf(startId)})
+                if(!accepted) return START_NOT_STICKY
             } catch(failure:Exception) {
-                starts.complete(ticket,if(failure is SecurityException) "errors.microphonePermissionDenied" else "errors.recordingStart")
+                Log.e("HearfolioRecording","Foreground promotion failed",failure)
+                ticket?.let {starts.complete(it,if(failure is SecurityException) "errors.microphonePermissionDenied" else "errors.recordingStart")}
                 stopSelf(startId);return START_NOT_STICKY
             }
         }
