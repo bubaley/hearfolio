@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.0 (2026-10-12)
+
+### Features
+
+- **android:** recover background work and refine native workflows ([22bc7aa](https://github.com/bubaley/hearfolio/commit/22bc7aa71458be67bb25771ef409008917bb53ea))
+
+### Fixes and performance
+
+- **android:** compile recording recovery services ([9f9a855](https://github.com/bubaley/hearfolio/commit/9f9a855d6ec1ff59a6b2a3452a8db0ef0c59a280))
+
 ## 0.5.0 (2026-10-09)
 
 ### Features
