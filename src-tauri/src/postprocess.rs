@@ -271,46 +271,53 @@ pub async fn apply_postprocess(
     let job = crate::JobGuard::acquire()?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
-        let started = Instant::now();
-        let run_id = unique_id("result");
-        let dir = crate::base()?;
-        let (rule, text) = {
-            let _lock = crate::history_lock()?;
-            snapshot_at(&dir, &id, &rule_id)?
-        };
-        let settings = cloud::load()?;
-        crate::emit(&app, "postprocess", "progress.postprocess", 0, 0, 0);
-        let result = execute(&settings, &rule, &model, &text, run_id.clone(), |text| {
-            let _ = app.emit(
-                "postprocess-text",
-                PartialResult {
-                    record_id: id.clone(),
-                    run_id: run_id.clone(),
-                    text: text.into(),
-                },
-            );
+        let mut operation =
+            crate::background::OperationGuard::start(&app, "postprocess", Some(&id), true)?;
+        let result = (|| {
+            let started = Instant::now();
+            let run_id = unique_id("result");
+            let dir = crate::base()?;
+            let (rule, text) = {
+                let _lock = crate::history_lock()?;
+                snapshot_at(&dir, &id, &rule_id)?
+            };
+            let settings = cloud::load()?;
+            crate::emit(&app, "postprocess", "progress.postprocess", 0, 0, 0);
+            let result = execute(&settings, &rule, &model, &text, run_id.clone(), |text| {
+                let _ = app.emit(
+                    "postprocess-text",
+                    PartialResult {
+                        record_id: id.clone(),
+                        run_id: run_id.clone(),
+                        text: text.into(),
+                    },
+                );
+                crate::emit(
+                    &app,
+                    "postprocess",
+                    "progress.postprocess",
+                    0,
+                    0,
+                    started.elapsed().as_secs(),
+                );
+            })?;
+            crate::background::check_current()?;
+            let result = {
+                let _lock = crate::history_lock()?;
+                save_result_at(&dir, &id, result)?
+            };
             crate::emit(
                 &app,
                 "postprocess",
-                "progress.postprocess",
-                0,
-                0,
+                "progress.done",
+                1,
+                1,
                 started.elapsed().as_secs(),
             );
-        })?;
-        let result = {
-            let _lock = crate::history_lock()?;
-            save_result_at(&dir, &id, result)?
-        };
-        crate::emit(
-            &app,
-            "postprocess",
-            "progress.done",
-            1,
-            1,
-            started.elapsed().as_secs(),
-        );
-        Ok(result)
+            Ok(result)
+        })();
+        operation.finish(&result);
+        result
     })
     .await
     .map_err(|_| "errors.operationFailed")?

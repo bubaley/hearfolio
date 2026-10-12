@@ -208,10 +208,7 @@ pub fn prepare_cloud_chunks(
 mod tests {
     use super::*;
     fn fixture() -> PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = uuid::Uuid::new_v4();
         let directory = std::env::temp_dir().join(format!("hearfolio-decode-{unique}"));
         fs::create_dir_all(&directory).unwrap();
         directory

@@ -75,10 +75,12 @@ internal class RecorderSession(private val onFailure: () -> Unit) {
     private fun capture(active: AudioRecord, file: File, sampleRate: Int) {
         try {
             RandomAccessFile(file, "rw").use { wav ->
-                wav.write(ByteArray(44))
+                WavRecovery.header(wav, 0, sampleRate)
+                wav.fd.sync()
                 val samples = ShortArray(2048)
                 val bytes = ByteArray(samples.size * 2)
                 var count = 0L
+                var checkpoint = 0L
                 while (capturing) {
                     val read = active.read(samples, 0, samples.size, AudioRecord.READ_BLOCKING)
                     if (read < 0) { if (capturing) throw IllegalStateException("Capture failed"); break }
@@ -97,13 +99,11 @@ internal class RecorderSession(private val onFailure: () -> Unit) {
                     level = if (rms <= .001) 0f else ((20 * log10(rms) + 60) / 60).coerceIn(0.0, 1.0).toFloat()
                     wav.write(bytes, 0, read * 2)
                     count += read * 2L
+                    if (count - checkpoint >= sampleRate * 4L) {
+                        WavRecovery.header(wav, count, sampleRate); wav.fd.sync(); checkpoint = count
+                    }
                 }
-                wav.seek(0)
-                fun little(value: Long, size: Int) { repeat(size) { wav.write((value shr (it * 8)).toInt() and 255) } }
-                wav.writeBytes("RIFF"); little(count + 36, 4); wav.writeBytes("WAVEfmt ")
-                little(16, 4); little(1, 2); little(1, 2); little(sampleRate.toLong(), 4)
-                little(sampleRate * 2L, 4); little(2, 2); little(16, 2)
-                wav.writeBytes("data"); little(count, 4); wav.fd.sync()
+                WavRecovery.header(wav, count, sampleRate); wav.fd.sync()
             }
         } catch (_: Exception) { failed = true; capturing = false; level = 0f; onFailure() }
     }

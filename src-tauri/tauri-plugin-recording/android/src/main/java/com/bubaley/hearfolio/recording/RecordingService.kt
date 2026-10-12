@@ -2,11 +2,14 @@ package com.bubaley.hearfolio.recording
 
 import android.app.*
 import android.content.Intent
+import android.content.Context
 import android.content.pm.ServiceInfo
 import android.os.*
 import androidx.core.app.NotificationCompat
 import java.io.File
 import java.util.Locale
+import org.json.JSONObject
+import android.util.AtomicFile
 
 // Own the microphone independently of the activity. Start is only requested by
 // the visible app; notification actions control an already running recording.
@@ -20,14 +23,54 @@ class RecordingService : Service() {
         const val ID = 4103
         @Volatile var instance: RecordingService? = null
         @Volatile var state = "idle"
+        @Volatile var error: String? = null
+        @Volatile var interrupted = false
+        @Volatile var recoveredElapsed = 0L
         @Volatile var inputLevel = 0f
         @Volatile var quickRecording = false
         @Volatile var path = ""
         @Volatile var startedAt = 0L
         @Volatile var pausedAt = 0L
         @Volatile var pausedMillis = 0L
-        fun elapsedSeconds() = if (startedAt == 0L) 0L else ((if (pausedAt > 0L) pausedAt else SystemClock.elapsedRealtime()) - startedAt - pausedMillis).coerceAtLeast(0L) / 1000L
+        fun elapsedSeconds() = if (startedAt == 0L) recoveredElapsed else ((if (pausedAt > 0L) pausedAt else SystemClock.elapsedRealtime()) - startedAt - pausedMillis).coerceAtLeast(0L) / 1000L
         var ready: ((String?) -> Unit)? = null
+        private fun preferences(context: Context) = context.getSharedPreferences("hearfolio-recording", Context.MODE_PRIVATE)
+        fun persist(context: Context) {
+            if(path.isNotEmpty() && !quickRecording) try {
+                val atomic=AtomicFile(File(path+".state.json"));val stream=atomic.startWrite()
+                try { stream.write(JSONObject().put("state",state).put("path",path).put("error",error).put("quick",quickRecording).put("elapsedSeconds",elapsedSeconds()).put("updatedAt",System.currentTimeMillis()).toString().toByteArray());atomic.finishWrite(stream) }
+                catch(error:Exception) {atomic.failWrite(stream)}
+            } catch(_:Exception) {}
+            preferences(context).edit().putString("state",state).putString("path",path).putBoolean("quick",quickRecording)
+                .putLong("elapsed",elapsedSeconds()).putString("error",error).putBoolean("interrupted",interrupted).commit()
+        }
+        fun acknowledge(context: Context) { state = "idle"; path = ""; error = null; interrupted = false; recoveredElapsed = 0L; startedAt = 0L; persist(context) }
+        fun restore(context: Context) {
+            if(instance != null) return
+            if(path.isNotEmpty()) { if(state=="finished" && !File(path).exists()) acknowledge(context);return }
+            val saved=preferences(context)
+            path=saved.getString("path", "") ?: ""
+            state=saved.getString("state","idle") ?: "idle"
+            quickRecording=saved.getBoolean("quick",false)
+            error=saved.getString("error",null);interrupted=saved.getBoolean("interrupted",false)
+            recoveredElapsed=saved.getLong("elapsed",0);startedAt=0L
+            if(path.isEmpty()) return
+            val file=try { File(path).canonicalFile } catch(_: Exception) { acknowledge(context); return }
+            if(!file.path.startsWith(context.dataDir.canonicalPath+File.separator) || !file.name.startsWith("hearfolio-recording-")) { acknowledge(context); return }
+            if(!file.exists()) { acknowledge(context); return }
+            if(state == "recording" || state == "paused") {
+                interrupted=true
+                val recovered=WavRecovery.recover(file)
+                if(recovered != null) {
+                    recoveredElapsed=recovered;state="finished";error="errors.recordingInterrupted"
+                    if(quickRecording && file.name.endsWith(".partial")) {
+                        val target=File(path.removeSuffix(".partial"))
+                        if(file.renameTo(target)) path=target.path else {state="error";error="errors.recordingStop"}
+                    }
+                } else { state="error";error="errors.recordingInterrupted" }
+                persist(context)
+            }
+        }
     }
     private var recorder: RecorderSession? = null
     private var wake: PowerManager.WakeLock? = null
@@ -64,12 +107,15 @@ class RecordingService : Service() {
         if (intent == null) { stopSelf(); return START_NOT_STICKY }
         if (intent.action != START && intent.getStringExtra("path") != path) return START_NOT_STICKY
         when (intent.action) {
-            START -> try {
-                if (recorder != null) throw IllegalStateException()
+            START -> {
+                if (recorder != null) { ready?.invoke("errors.operationBusy");ready=null;return START_NOT_STICKY }
+                var allocated: File? = null
+                try {
                 quickRecording = intent.getBooleanExtra("quick",false)
-                path = intent.getStringExtra("path") ?: throw IllegalArgumentException()
-                val file = File(path).canonicalFile
+                val file = File(intent.getStringExtra("path") ?: throw IllegalArgumentException()).canonicalFile
                 if (!file.path.startsWith(dataDir.canonicalPath + File.separator) || !file.name.startsWith("hearfolio-recording-")) throw IllegalArgumentException()
+                error = null; interrupted = false; recoveredElapsed = 0L
+                require(!file.exists());allocated=file;path=file.path
                 resetLevel(); startedAt = SystemClock.elapsedRealtime(); pausedAt = 0L; pausedMillis = 0L
                 state = "recording"
                 if (Build.VERSION.SDK_INT >= 30) startForeground(ID,notification(),ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE) else startForeground(ID,notification())
@@ -77,14 +123,17 @@ class RecordingService : Service() {
                 require(file.name.removeSuffix(".partial").endsWith(".wav"))
                 recorder = RecorderSession { handler.post { if (recorder != null) finish(true) } }
                 recorder!!.start(file)
+                persist(this)
                 handler.post(sampleLevel)
                 wake = (getSystemService(POWER_SERVICE) as PowerManager).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"Hearfolio:recording").apply { setReferenceCounted(false); acquire(4 * 60 * 60 * 1000L) }
                 handler.postDelayed(deadline,4 * 60 * 60 * 1000L)
                 RecordingTileService.refresh(this)
                 ready?.invoke(null); ready = null
             } catch (error: Exception) {
-                recorder?.release(); recorder = null; File(path).delete(); state = "error"
+                recorder?.release(); recorder = null; allocated?.delete(); state = "error"
+                this.error = if(error is SecurityException) "errors.microphonePermissionDenied" else "errors.recordingStart"; persist(this); releaseWake()
                 ready?.invoke(if (error is SecurityException) "errors.microphonePermissionDenied" else "errors.recordingStart"); ready = null; stopSelf()
+            }
             }
             PAUSE -> if (state == "recording") try { recorder?.pause(); pausedAt = SystemClock.elapsedRealtime(); state = "paused"; inputLevel = 0f; update() } catch (_: Exception) { finish(true) }
             RESUME -> if (state == "paused") try { recorder?.resume(); pausedMillis += SystemClock.elapsedRealtime() - pausedAt; pausedAt = 0L; state = "recording"; update() } catch (_: Exception) { finish(true) }
@@ -92,7 +141,7 @@ class RecordingService : Service() {
         }
         return START_NOT_STICKY
     }
-    private fun update() { RecordingTileService.refresh(this); getSystemService(NotificationManager::class.java).notify(ID,notification()) }
+    private fun update() { persist(this); RecordingTileService.refresh(this); getSystemService(NotificationManager::class.java).notify(ID,notification()) }
     fun finish(fromNotification: Boolean): String {
         val active = recorder ?: return "errors.recordingUnavailable"
         recorder = null
@@ -102,22 +151,30 @@ class RecordingService : Service() {
             check(active.stop()); if (File(path).length() <= 44) throw IllegalStateException()
             if (quickRecording) { val source=File(path);val target=File(path.removeSuffix(".partial"));if(!source.renameTo(target))throw IllegalStateException();path=target.path }
             if (pausedAt == 0L) pausedAt=SystemClock.elapsedRealtime()
-            state = if (fromNotification || quickRecording) "finished" else "idle"
+            state = "finished"
         }
-        catch (_: Exception) { File(path).delete(); state = "error"; error = "errors.recordingEmpty" }
+        catch (_: Exception) {
+            val recovered = WavRecovery.recover(File(path))
+            if(recovered != null) {
+                recoveredElapsed = recovered; startedAt = 0L; state = "finished"; interrupted = true; this.error = "errors.recordingInterrupted"
+                if(quickRecording) { val target=File(path.removeSuffix(".partial"));if(File(path).renameTo(target)) path=target.path else {state="error";error="errors.recordingStop"} }
+            } else { state = "error"; error = "errors.recordingEmpty" }
+        }
         finally { active.release() }
-        // Keep the service alive until Rust atomically archives the completed file.
-        if (fromNotification && error.isEmpty()) getSystemService(NotificationManager::class.java).notify(ID,notification(true))
-        else { stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
-        if (quickRecording) {stopForeground(STOP_FOREGROUND_REMOVE);stopSelf()}
+        this.error = if(error.isNotEmpty()) error else this.error
+        releaseWake(); handler.removeCallbacks(deadline); persist(this)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        if(fromNotification && error.isEmpty()) getSystemService(NotificationManager::class.java).notify(ID,notification(true))
+        stopSelf()
         RecordingTileService.refresh(this)
         return error
     }
-    fun discard() { resetLevel(); try { recorder?.stop() } catch (_: Exception) {} ; recorder?.release(); recorder = null; File(path).delete(); state = "cancelled"; stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
+    fun discard() { resetLevel(); try { recorder?.stop() } catch (_: Exception) {} ; recorder?.release(); recorder = null; File(path).delete(); state = "cancelled"; error = null; releaseWake(); persist(this); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
+    private fun releaseWake() { if(wake?.isHeld == true) wake?.release(); wake = null }
     override fun onDestroy() {
         resetLevel(); handler.removeCallbacks(deadline)
         if (recorder != null) { finish(true) }
-        if (wake?.isHeld == true) wake?.release()
+        releaseWake()
         instance = null; RecordingTileService.refresh(this); super.onDestroy()
     }
     override fun onBind(intent: Intent?): IBinder? = null

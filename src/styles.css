@@ -551,14 +551,42 @@ html.qr-scanning #app { visibility: hidden; }
 .qr-scan-frame { width: min(70vw, 280px); aspect-ratio: 1; border: 2px solid var(--accent); border-radius: 12px; }
 .qr-scan-screen>p { max-width: 360px; margin: 0; padding: 16px; border: 1px solid var(--line); border-radius: 9px; background: var(--canvas); text-align: center; line-height: 1.6; }
 
-.recording-stage {position:relative;isolation:isolate;display:grid;place-items:center;width:min(100%,640px);height:180px;flex:none;}
-.recording-stage::before {content:"";position:absolute;inset:12% 8%;z-index:-1;background:radial-gradient(ellipse,var(--accent) 0%,transparent 68%);opacity:.025;pointer-events:none;}
-.recording-stage .recording-duration {position:relative;margin:0;z-index:1;font-variant-numeric:tabular-nums;}
-.recording-meter {position:absolute;inset:0;display:block;width:100%;height:100%;color:var(--accent);overflow:visible;pointer-events:none;opacity:.15;}
-.recording-meter path {fill:none;stroke:url(#voice-gradient);stroke-linecap:round;stroke-linejoin:round;vector-effect:non-scaling-stroke;}
-.recording-meter .voice-line {stroke-width:1.1;}
-.recording-meter .voice-halo {stroke-width:12;opacity:.1;filter:blur(5px);}
-@media(max-width:760px){.recording-stage {height:160px;}}
+.recording-panel { width: min(100%, 640px); padding: 36px 28px 24px; }
+.recorder-heading { display: flex; justify-content: center; align-items: center; gap: 9px; color: var(--muted); font-size: 13px; }
+.recorder-dot { width: 8px; height: 8px; border-radius: 50%; background: #e75757; }
+.recording-panel .recording-duration { margin: 14px 0 30px; font-size: clamp(46px, 8vw, 64px); letter-spacing: -2px; }
+.recorder-timeline { position: relative; height: 136px; border-block: 1px solid var(--line); overflow: hidden; }
+.recorder-timeline::before { content: ''; position: absolute; top: 50%; width: 100%; height: 1px; background: var(--line); }
+.recorder-bars { position: absolute; inset: 16px 12px 16px 0; display: flex; align-items: center; gap: 3px; }
+.recorder-bars i { flex: 1; min-width: 1px; height: calc(2px + var(--level, 0) * 98px); border-radius: 2px; background: var(--text); opacity: .72; }
+.recorder-playhead { position: absolute; top: 0; bottom: 0; right: 7px; width: 1px; background: #e75757; }
+.recorder-playhead::before { content: ''; position: absolute; top: 0; left: -3px; width: 7px; height: 7px; border-radius: 0 0 3px 3px; background: #e75757; }
+.recorder-ruler { position: absolute; inset: auto 0 0; height: 8px; display: flex; justify-content: space-between; pointer-events: none; }
+.recorder-ruler i { width: 1px; height: 4px; background: var(--line); }
+.recorder-ruler i:nth-child(4n+1) { height: 8px; }
+.recorder-meter-caption { display: flex; justify-content: space-between; gap: 10px; margin-top: 10px; color: var(--muted); font-size: 11px; }
+.recorder-live { color: #d54e4e; }
+.recorder-paused .recorder-dot { background: var(--muted); }
+.recorder-paused .recorder-playhead, .recorder-paused .recorder-playhead::before { background: var(--muted); }
+.recorder-actions { display: grid; grid-template-columns: 1fr 1.35fr; gap: 10px; margin-top: 32px; }
+.recorder-actions button { min-height: 50px; font-size: 13px; justify-content: center; gap: 9px; }
+.recorder-actions svg { width: 18px; height: 18px; }
+.rename-dialog .field { position: relative; }
+.rename-dialog input { padding-right: 62px; }
+.rename-extension { position: absolute; right: 12px; top: 40px; color: var(--muted); font-size: 12px; pointer-events: none; }
+@media(max-width:760px){
+  .recording-panel { padding: 24px 16px 20px; }
+  .recorder-bars { gap: 2px; }
+  .recorder-actions { margin-top: 25px; grid-template-columns: 1fr 1.4fr; }
+  .recorder-actions button { font-size: 12px; padding-inline: 10px; }
+}
+@media(max-height:480px){
+  .recording-panel { padding-block: 12px; }
+  .recording-panel .recording-duration { margin: 4px 0 12px; font-size: 36px; }
+  .recorder-timeline { height: 70px; }
+  .recorder-bars i { height: calc(2px + var(--level, 0) * 44px); }
+  .recorder-actions { margin-top: 16px; }
+}
 /* Saved instructions and their outputs share the archive's quiet visual hierarchy. */
 textarea { font: inherit; }
 .field textarea { width: 100%; resize: vertical; min-height: 150px; padding: 11px; border: 1px solid var(--line); border-radius: 6px; background: var(--canvas); color: var(--text); font-size: 13px; line-height: 1.7; }

@@ -42,7 +42,21 @@ class TextArgs { lateinit var name: String; lateinit var text: String }
 class SeekArgs { var seconds: Double = 0.0 }
 
 @InvokeArg
+class OperationArgs {
+    lateinit var id: String
+    var snapshotPath: String = ""
+    var controlPath: String = ""
+    var kind: String = "transcribe"
+    var network: Boolean = false
+    var stage: String = ""
+    var current: Long = 0
+    var total: Long = 0
+    var success: Boolean = false
+}
+@InvokeArg
 class TransferArgs {
+    var snapshotPath: String = ""
+    var controlPath: String = ""
     lateinit var id: String
     var direction: String = "send"
     var stage: String = "waiting"
@@ -83,7 +97,7 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
     @PermissionCallback
     fun recordingNotificationResult(invoke: Invoke) { startGranted(invoke) }
     @Command
-    fun acknowledgeRecording(invoke: Invoke) { activity.stopService(Intent(activity, RecordingService::class.java)); invoke.resolve() }
+    fun acknowledgeRecording(invoke: Invoke) { RecordingService.acknowledge(activity.applicationContext); activity.stopService(Intent(activity, RecordingService::class.java)); invoke.resolve() }
 
     private fun startGranted(invoke: Invoke) {
         try {
@@ -96,9 +110,9 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun stop(invoke: Invoke) {
-        if (RecordingService.state == "finished") { activity.stopService(Intent(activity, RecordingService::class.java)); invoke.resolve(); return }
+        if (RecordingService.state == "finished") { RecordingService.acknowledge(activity.applicationContext); activity.stopService(Intent(activity, RecordingService::class.java)); invoke.resolve(); return }
         val error = RecordingService.instance?.finish(false) ?: "errors.recordingUnavailable"
-        if (error.isEmpty()) invoke.resolve() else invoke.reject(error)
+        if (error.isEmpty()) { RecordingService.acknowledge(activity.applicationContext); invoke.resolve() } else invoke.reject(error)
     }
     @Command
     fun cancel(invoke: Invoke) {
@@ -109,8 +123,25 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
     fun recordingLevel(invoke: Invoke) { invoke.resolve(JSObject().put("level", RecordingService.inputLevel)) }
     @Command
     fun recordingStatus(invoke: Invoke) {
-        val result = JSObject(); result.put("state", RecordingService.state); result.put("path", RecordingService.path); result.put("elapsedSeconds", RecordingService.elapsedSeconds()); result.put("quick", RecordingService.quickRecording); result.put("level", RecordingService.inputLevel); invoke.resolve(result)
+        RecordingService.restore(activity.applicationContext)
+        val result = JSObject(); result.put("state", RecordingService.state); result.put("path", RecordingService.path); result.put("elapsedSeconds", RecordingService.elapsedSeconds()); result.put("quick", RecordingService.quickRecording); result.put("level", RecordingService.inputLevel); result.put("error",RecordingService.error); result.put("interrupted",RecordingService.interrupted); invoke.resolve(result)
     }
+    @Command
+    fun recordingControl(invoke: Invoke) {
+        val stage = invoke.parseArgs(TransferArgs::class.java).stage
+        val action = when(stage) { "pause" -> RecordingService.PAUSE; "resume" -> RecordingService.RESUME; else -> { invoke.reject("errors.recordingUnavailable"); return } }
+        if(RecordingService.instance == null) { invoke.reject("errors.recordingUnavailable"); return }
+        activity.applicationContext.startService(Intent(activity.applicationContext, RecordingService::class.java).setAction(action).putExtra("path",RecordingService.path))
+        invoke.resolve()
+    }
+    @Command
+    fun openBatterySettings(invoke: Invoke) {
+        try {
+            activity.startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:"+activity.packageName)))
+            invoke.resolve()
+        } catch(_: Exception) { invoke.reject("errors.operationFailed") }
+    }
+
     @Command
     fun quickControl(invoke: Invoke) {
         if (!RecordingService.quickRecording) { invoke.reject("errors.recordingUnavailable"); return }
@@ -125,6 +156,11 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun quickRecordings(invoke: Invoke) {
         val dir=File(activity.filesDir,"hearfolio-quick-recordings")
+        // Keep interrupted quick recordings even if another quick session has
+        // since replaced the single last-session preference.
+        dir.listFiles()?.filter { it.isFile && it.canonicalFile.parentFile==dir.canonicalFile && it.name.startsWith("hearfolio-recording-") && it.name.endsWith(".wav.partial") && (RecordingService.instance==null || it.canonicalPath!=RecordingService.path) }?.forEach { source ->
+            if(WavRecovery.recover(source)!=null) {val target=File(source.path.removeSuffix(".partial"));if(!target.exists())source.renameTo(target)}
+        }
         val files=dir.listFiles()?.filter { it.isFile && it.canonicalFile.parentFile==dir.canonicalFile && it.name.startsWith("hearfolio-recording-") && (it.name.endsWith(".m4a") || it.name.endsWith(".wav")) }?.map { it.canonicalPath } ?: emptyList()
         val result=JSObject();result.put("paths",org.json.JSONArray(files));invoke.resolve(result)
     }
@@ -142,19 +178,56 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
     private fun startInboxGranted(invoke: Invoke) {
         try {
             InboxService.ready = { error -> if (error == null) invoke.resolve() else invoke.reject(error) }
-            ContextCompat.startForegroundService(activity, Intent(activity, InboxService::class.java).setAction(InboxService.START))
+            val args=invoke.parseArgs(TransferArgs::class.java)
+            ContextCompat.startForegroundService(activity, Intent(activity, InboxService::class.java).setAction(InboxService.START).putExtra("snapshotPath",args.snapshotPath).putExtra("controlPath",args.controlPath))
         } catch (_: Exception) { InboxService.ready = null; invoke.reject("errors.transferBackgroundUnavailable") }
     }
     @Command
     fun stopInbox(invoke: Invoke) { activity.stopService(Intent(activity, InboxService::class.java)); invoke.resolve() }
     @Command
     fun inboxStatus(invoke: Invoke) {
-        val result = JSObject(); result.put("active", InboxService.active); invoke.resolve(result)
+        val result = JSObject(); result.put("active", InboxService.active);result.put("error",InboxService.failure);invoke.resolve(result)
     }
     @Command
     fun inboxOffers(invoke: Invoke) {
         val args = invoke.parseArgs(TransferArgs::class.java)
         InboxService.instance?.offers(args.current.toInt(), args.success)
+        invoke.resolve()
+    }
+
+    @Command
+    fun beginOperation(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(OperationArgs::class.java)
+            OperationService.ready = { error -> if(error == null) invoke.resolve() else invoke.reject(error) }
+            ContextCompat.startForegroundService(activity.applicationContext, Intent(activity.applicationContext, OperationService::class.java)
+                .setAction(OperationService.BEGIN).putExtra("id",args.id).putExtra("kind",args.kind).putExtra("network",args.network).putExtra("snapshotPath",args.snapshotPath).putExtra("controlPath",args.controlPath))
+        } catch(_: Exception) { OperationService.ready = null; invoke.reject("errors.operationBackgroundUnavailable") }
+    }
+    @Command
+    fun checkOperation(invoke: Invoke) {
+        val args = invoke.parseArgs(OperationArgs::class.java)
+        invoke.resolve(JSObject().put("cancelled",OperationService.isCancelled(args.id)).put("error",OperationService.error))
+    }
+    @Command
+    fun updateOperation(invoke: Invoke) {
+        val args = invoke.parseArgs(OperationArgs::class.java)
+        if(OperationService.job == args.id) OperationService.instance?.update(args.stage,args.current,args.total)
+        invoke.resolve()
+    }
+    @Command
+    fun finishOperation(invoke: Invoke) {
+        val args = invoke.parseArgs(OperationArgs::class.java)
+        if(OperationService.job == args.id) OperationService.instance?.finish(args.success)
+        invoke.resolve()
+    }
+    @Command
+    fun cancelOperation(invoke: Invoke) {
+        val args = invoke.parseArgs(OperationArgs::class.java)
+        if(OperationService.job == args.id) {
+            OperationService.cancelled = true; OperationService.error = "errors.operationCancelled"
+            OperationService.instance?.update("cancelled",0,0)
+        }
         invoke.resolve()
     }
 
@@ -172,9 +245,8 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
         try {
             val args = invoke.parseArgs(TransferArgs::class.java)
             TransferService.prepare(args.id)
-            if (InboxService.active) { InboxService.instance?.transfer(true, false, args.direction); invoke.resolve(); return }
             TransferService.ready = { error -> if (error == null) invoke.resolve() else invoke.reject(error) }
-            ContextCompat.startForegroundService(activity, Intent(activity, TransferService::class.java).setAction(TransferService.BEGIN).putExtra("id",args.id).putExtra("direction",args.direction))
+            ContextCompat.startForegroundService(activity, Intent(activity, TransferService::class.java).setAction(TransferService.BEGIN).putExtra("id",args.id).putExtra("direction",args.direction).putExtra("snapshotPath",args.snapshotPath).putExtra("controlPath",args.controlPath))
         } catch (error: Exception) { TransferService.ready = null; invoke.reject("errors.transferBackgroundUnavailable") }
     }
 

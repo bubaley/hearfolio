@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "relay": "node server/relay.mjs",
-    "test:transfer": "node --experimental-strip-types --test server/*.test.mjs"
+    "test:transfer": "node --experimental-strip-types --test server/*.test.mjs src/settings-draft.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

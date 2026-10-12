@@ -135,6 +135,9 @@ fn receive_block(c: &Connection, id: &str) -> Result<Option<(u64, Vec<u8>)>, Str
     unreachable!()
 }
 fn server_url(server: &str) -> Result<String, String> {
+    if server.trim().is_empty() {
+        return Err("errors.transferServerRequired".into());
+    }
     let url = reqwest::Url::parse(server.trim()).map_err(error)?;
     let local = match url.host_str().unwrap_or("").parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(ip)) => ip.is_private() || ip.is_loopback(),
@@ -312,121 +315,127 @@ fn emit(app: &tauri::AppHandle, id: &str, status: &str, current: u64, total: u64
 #[tauri::command]
 pub async fn transfer_send(app: tauri::AppHandle, id: String, to: String) -> Result<(), String> {
     let job = crate::JobGuard::acquire()?;
-    let background = crate::background::TransferGuard::start(&app, "send")?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
-        let mut background = background;
-        let c = load()?;
-        let entry = crate::read_history()?
-            .into_iter()
-            .find(|e| e.id == id)
-            .ok_or("Recording missing")?;
-        let path = Path::new(&entry.input_path);
-        let extension = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .ok_or("Audio extension missing")?
-            .to_owned();
-        let (sha256, size) = hash_file(path)?;
-        if size == 0 || size > MAX_SIZE {
-            return Err("Recording must be between 1 byte and 1 GiB".into());
-        }
-        let transcript = if let Some(path) = entry.output_path.as_ref() {
-            let metadata = fs::metadata(path).map_err(error)?;
-            if metadata.len() > 4 * 1024 * 1024 {
-                return Err("Transcript exceeds 4 MiB".into());
-            }
-            fs::read_to_string(path).map_err(error)?
-        } else {
-            String::new()
-        };
-        let manifest = Manifest {
-            version: 1,
-            source_id: entry.transfer_source_id.unwrap_or(entry.id),
-            name: entry.name,
-            extension,
-            size,
-            sha256,
-            transcript,
-            created_at: entry.created_at,
-            completed_at: entry.completed_at,
-            duration_seconds: entry.duration_seconds,
-            model: entry.model,
-            configuration: entry.configuration,
-        };
-        let offered = rpc(
-            &c,
-            "offer",
-            json!({"to":to,"manifest":manifest,"metadataOnly":true}),
-        )?;
-        let session = offered["id"]
-            .as_str()
-            .ok_or("Transfer ID missing")?
-            .to_owned();
+        let mut background = crate::background::TransferGuard::start(&app, "send")?;
         let result = (|| {
-            emit(&app, &session, "waiting", 0, size);
-            background.progress("waiting", 0, size);
-            let started = Instant::now();
-            let audio_required = loop {
-                background.check()?;
-                background.progress("waiting", 0, 0);
-                let status = rpc(&c, "status", json!({"id":session}))?;
-                match status["status"].as_str() {
-                    Some("streaming") => break status["audioRequired"].as_bool().unwrap_or(true),
-                    Some("delivered") => break false,
-                    Some("cancelled") => return Err("Transfer cancelled".into()),
-                    _ => {}
+            background.check()?;
+            let c = load()?;
+            let entry = crate::read_history()?
+                .into_iter()
+                .find(|e| e.id == id)
+                .ok_or("Recording missing")?;
+            let path = Path::new(&entry.input_path);
+            let extension = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .ok_or("Audio extension missing")?
+                .to_owned();
+            let (sha256, size) = hash_file(path)?;
+            if size == 0 || size > MAX_SIZE {
+                return Err("Recording must be between 1 byte and 1 GiB".into());
+            }
+            let transcript = if let Some(path) = entry.output_path.as_ref() {
+                let metadata = fs::metadata(path).map_err(error)?;
+                if metadata.len() > 4 * 1024 * 1024 {
+                    return Err("Transcript exceeds 4 MiB".into());
                 }
-                if started.elapsed() > Duration::from_secs(180) {
-                    return Err("Recipient did not accept".into());
-                }
-                std::thread::sleep(Duration::from_millis(500));
+                fs::read_to_string(path).map_err(error)?
+            } else {
+                String::new()
             };
-            if audio_required {
-                let mut file = fs::File::open(path).map_err(error)?;
-                let mut offset = 0;
-                let mut buf = [0; BLOCK];
+            let manifest = Manifest {
+                version: 1,
+                source_id: entry.transfer_source_id.unwrap_or(entry.id),
+                name: entry.name,
+                extension,
+                size,
+                sha256,
+                transcript,
+                created_at: entry.created_at,
+                completed_at: entry.completed_at,
+                duration_seconds: entry.duration_seconds,
+                model: entry.model,
+                configuration: entry.configuration,
+            };
+            let offered = rpc(
+                &c,
+                "offer",
+                json!({"to":to,"manifest":manifest,"metadataOnly":true}),
+            )?;
+            let session = offered["id"]
+                .as_str()
+                .ok_or("Transfer ID missing")?
+                .to_owned();
+            let result = (|| {
+                emit(&app, &session, "waiting", 0, size);
+                background.progress("waiting", 0, size);
+                let started = Instant::now();
+                let audio_required = loop {
+                    background.check()?;
+                    background.progress("waiting", 0, 0);
+                    let status = rpc(&c, "status", json!({"id":session}))?;
+                    match status["status"].as_str() {
+                        Some("streaming") => {
+                            break status["audioRequired"].as_bool().unwrap_or(true)
+                        }
+                        Some("delivered") => break false,
+                        Some("cancelled") => return Err("Transfer cancelled".into()),
+                        _ => {}
+                    }
+                    if started.elapsed() > Duration::from_secs(180) {
+                        return Err("Recipient did not accept".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                };
+                if audio_required {
+                    let mut file = fs::File::open(path).map_err(error)?;
+                    let mut offset = 0;
+                    let mut buf = [0; BLOCK];
+                    loop {
+                        background.check()?;
+                        let n = file.read(&mut buf).map_err(error)?;
+                        if n == 0 {
+                            break;
+                        }
+                        response(
+                            client()?
+                                .put(format!("{}/transfers/{session}/chunk", c.server))
+                                .bearer_auth(&c.token)
+                                .header("x-offset", offset.to_string())
+                                .body(buf[..n].to_vec())
+                                .send()
+                                .map_err(network_error)?,
+                        )?;
+                        offset += n as u64;
+                        emit(&app, &session, "sending", offset, size);
+                        background.progress("sending", offset, size);
+                    }
+                }
+                let finish = Instant::now();
                 loop {
                     background.check()?;
-                    let n = file.read(&mut buf).map_err(error)?;
-                    if n == 0 {
+                    let s = rpc(&c, "status", json!({"id":session}))?;
+                    if s["status"] == "delivered" {
                         break;
                     }
-                    response(
-                        client()?
-                            .put(format!("{}/transfers/{session}/chunk", c.server))
-                            .bearer_auth(&c.token)
-                            .header("x-offset", offset.to_string())
-                            .body(buf[..n].to_vec())
-                            .send()
-                            .map_err(network_error)?,
-                    )?;
-                    offset += n as u64;
-                    emit(&app, &session, "sending", offset, size);
-                    background.progress("sending", offset, size);
+                    if s["status"] == "cancelled" || finish.elapsed() > Duration::from_secs(60) {
+                        return Err("Recipient did not confirm saving".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
                 }
+                emit(&app, &session, "delivered", size, size);
+                Ok(())
+            })();
+            if result.is_err() {
+                let _ = rpc(&c, "cancel", json!({"id":session}));
             }
-            let finish = Instant::now();
-            loop {
-                background.check()?;
-                let s = rpc(&c, "status", json!({"id":session}))?;
-                if s["status"] == "delivered" {
-                    break;
-                }
-                if s["status"] == "cancelled" || finish.elapsed() > Duration::from_secs(60) {
-                    return Err("Recipient did not confirm saving".into());
-                }
-                std::thread::sleep(Duration::from_millis(250));
+            if result.is_ok() {
+                background.complete();
             }
-            emit(&app, &session, "delivered", size, size);
-            Ok(())
+            result
         })();
-        if result.is_err() {
-            let _ = rpc(&c, "cancel", json!({"id":session}));
-        }
-        if result.is_ok() {
-            background.complete();
-        }
+        background.finish(&result);
         result
     })
     .await
@@ -658,10 +667,11 @@ fn commit_received(
 #[tauri::command]
 pub async fn transfer_receive(app: tauri::AppHandle, id: String) -> Result<HistoryEntry, String> {
     let job = crate::JobGuard::acquire()?;
-    let background = crate::background::TransferGuard::start(&app, "receive")?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
-        let mut background=background;
+        let mut background=crate::background::TransferGuard::start(&app, "receive")?;
+        let result=(|| {
+        background.check()?;
         let c = load()?;
         let dir = crate::base()?;
         // Older relays/senders default to a full transfer.
@@ -745,6 +755,9 @@ pub async fn transfer_receive(app: tauri::AppHandle, id: String) -> Result<Histo
             let _ = rpc(&c, "cancel", json!({"id":id}));
         }
         if result.is_ok() {background.complete();}
+        result
+        })();
+        background.finish(&result);
         result
     })
     .await
@@ -1202,6 +1215,10 @@ mod tests {
     }
     #[test]
     fn http_requires_local_address() {
+        assert_eq!(
+            server_url("  "),
+            Err("errors.transferServerRequired".into())
+        );
         assert!(server_url("http://192.168.1.2:8787").is_ok());
         assert!(server_url("http://example.com").is_err());
         assert!(server_url("https://example.com/path").is_err());

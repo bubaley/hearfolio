@@ -1,4 +1,5 @@
 import {pcmLevel} from './audio-level';
+import {OperationMailbox, type OperationSnapshot} from './operation-recovery';
 import { getVersion } from '@tauri-apps/api/app';
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -50,10 +51,50 @@ if (preview) {
 function emit(name: string, payload: unknown) { previewListeners.get(name)?.forEach(callback => callback(payload)); }
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+const operationMailbox = new OperationMailbox();
+const handledOperationKey='hearfolio-handled-operations';
+const handledOperations=new Set<string>();
+try { for(const id of JSON.parse(localStorage.getItem(handledOperationKey)||'[]')) if(typeof id==='string')handledOperations.add(id); } catch { /* Ignore malformed UI receipts. */ }
+export function operationHandled(id:string) { return handledOperations.has(id); }
+export function markOperationHandled(id:string) {
+  handledOperations.add(id);
+  while(handledOperations.size>50)handledOperations.delete(handledOperations.values().next().value!);
+  try {localStorage.setItem(handledOperationKey,JSON.stringify([...handledOperations]));} catch { /* Native result stays available even without a UI receipt. */ }
+}
+export function observePendingOperation(snapshot:OperationSnapshot) {
+  const result=operationMailbox.observe(snapshot);
+  if(result.terminal&&snapshot.id)markOperationHandled(snapshot.id);
+  return result;
+}
+export type TransferSnapshot={id?:string;direction?:'send'|'receive';state:'idle'|'running'|'finished'|'error'|'interrupted';stage?:string;current?:number;total?:number;error?:string|null;recordId?:string|null;result?:Entry|null};
+function transferOperation(snapshot:TransferSnapshot):OperationSnapshot{return {...snapshot,kind:snapshot.direction==='send'?'transfer_send':'transfer_receive',recordId:null};}
+export function observePendingTransfer(snapshot:TransferSnapshot){return observePendingOperation(transferOperation(snapshot));}
+async function invokeOperation<T>(command:string,args:Record<string,unknown>):Promise<T> {
+  const transfer=command==='transfer_send'||command==='transfer_receive';
+  const kind=command==='transcribe'?'transcribe':command==='apply_postprocess'?'postprocess':command==='import_audio'?'import':transfer?command:null;
+  if(nativePlatform?.os!=='android'||!kind)return invoke<T>(command,args);
+  const snapshotCommand=transfer?'transfer_activity_snapshot':'operation_activity_snapshot';
+  const readSnapshot=()=>invoke<OperationSnapshot|TransferSnapshot>(snapshotCommand).then(snapshot=>transfer?transferOperation(snapshot as TransferSnapshot):snapshot as OperationSnapshot).catch(()=>null);
+  const before=await readSnapshot();
+  return new Promise<T>((resolve,reject)=>{
+    const recordId=kind==='import'||transfer?null:String(args.id||'');
+    const request:Parameters<OperationMailbox['begin']>[0]={kind,recordId,excludedId:before?.id||'',resolve:value=>resolve(value as T),reject};
+    const release=operationMailbox.begin(request);
+    const finish=async(value:T|undefined,error?:unknown)=>{
+      const snapshot=await readSnapshot();
+      if(snapshot?.id&&snapshot.id!==before?.id&&(!request.id||request.id===snapshot.id)&&snapshot.kind===kind&&snapshot.state!=='running'&&snapshot.state!=='idle'&&(recordId===null||snapshot.recordId===recordId))markOperationHandled(snapshot.id);
+      release();if(error!==undefined)reject(error);else resolve(value as T);
+    };
+    invoke<T>(command,args).then(value=>void finish(value),error=>void finish(undefined,error));
+  });
+}
+
 export async function call<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
-  if (!preview) return invoke<T>(command, args);
+  if (!preview) return invokeOperation<T>(command, args);
   let value: unknown;
   switch (command) {
+    case 'recording_activity_snapshot':case 'operation_activity_snapshot':value={state:'idle'};break;
+    case 'import_quick_recordings':value=[];break;
     case 'get_runtime_platform':value={...previewCapabilities};break;
     case 'get_latest_android_release':value=new URLSearchParams(window.location.search).get('update')==='available'?{version:'0.2.0',url:'https://github.com/bubaley/hearfolio/releases/latest'}:null;break;
     case 'runtime_status': value = {ffmpeg:true,whisper:true,nemo:false}; break;
@@ -154,12 +195,13 @@ export async function call<T>(command: string, args: Record<string, unknown> = {
 function releasePreviewFile(path: string) { const selected=previewFiles.get(path); if (selected) URL.revokeObjectURL(selected.url); previewFiles.delete(path); }
 export function registerPreviewFile(file: File) { const path=`preview:${crypto.randomUUID()}`; previewFiles.set(path,{file,url:URL.createObjectURL(file)}); return path; }
 
-type BrowserRecording={stream:MediaStream;context:AudioContext;source:MediaStreamAudioSourceNode;processor:ScriptProcessorNode;mute:GainNode;queue:Promise<void>;pending:number;error:Error|null;chunks:Int16Array[];level:number};
+type BrowserRecording={stream:MediaStream;context:AudioContext;source:MediaStreamAudioSourceNode;processor:ScriptProcessorNode;mute:GainNode;queue:Promise<void>;pending:number;error:Error|null;chunks:Int16Array[];level:number;paused:boolean};
 let browserRecording:BrowserRecording|null=null;
 let browserInputLevel=0;
 export function recordingInputLevel(){return fixtureRecording?browserInputLevel:browserRecording&&!browserRecording.error?browserInputLevel:0;}
 let recordingGeneration=0, recordingStarting=false, fixtureRecording=false;
 let nativeRecordingActive=false;
+export function restoreNativeRecordingFlag(active:boolean){if(!preview&&nativePlatform?.os==='android')nativeRecordingActive=active;}
 function microphoneError(error:unknown):Error {
   if(typeof error==='string'&&error.startsWith('errors.'))return new Error(error);
   if(error instanceof Error&&error.message.startsWith('errors.'))return error;
@@ -193,10 +235,10 @@ export async function startAudioRecording():Promise<void> {
     if(!preview)await call('start_audio_recording',{sampleRate:context.sampleRate});
     if(generation!==recordingGeneration)throw new Error('errors.recordingUnavailable');
     const source=context.createMediaStreamSource(stream),processor=context.createScriptProcessor(4096,1,1),mute=context.createGain();mute.gain.value=0;
-    const recording:BrowserRecording={stream,context,source,processor,mute,queue:Promise.resolve(),pending:0,error:null,chunks:[],level:0};
+    const recording:BrowserRecording={stream,context,source,processor,mute,queue:Promise.resolve(),pending:0,error:null,chunks:[],level:0,paused:false};
     browserInputLevel=0;browserRecording=recording;
     processor.onaudioprocess=event=>{
-      if(recording.error)return;
+      if(recording.error||recording.paused){browserInputLevel=0;return;}
       const input=event.inputBuffer.getChannelData(0),samples=new Int16Array(input.length);
       browserInputLevel=pcmLevel(input);
       recording.level=Math.min(1,Math.sqrt(input.reduce((sum,sample)=>sum+sample*sample,0)/input.length));
@@ -213,6 +255,16 @@ export async function startAudioRecording():Promise<void> {
     if(!preview)await call('cancel_audio_recording').catch(()=>{});
     throw microphoneError(error);
   } finally {recordingStarting=false;}
+}
+export async function pauseAudioRecording():Promise<void>{
+  if(!preview&&nativePlatform?.os==='android'){await call('pause_audio_recording');return;}
+  if(fixtureRecording){browserInputLevel=0;return;}
+  if(!browserRecording)throw new Error('errors.recordingUnavailable');browserRecording.paused=true;browserInputLevel=0;
+}
+export async function resumeAudioRecording():Promise<void>{
+  if(!preview&&nativePlatform?.os==='android'){await call('resume_audio_recording');return;}
+  if(fixtureRecording){browserInputLevel=pcmLevel(Float32Array.from({length:1600},(_,i)=>Math.sin(i*2*Math.PI*440/16000)*1000/32767));return;}
+  if(!browserRecording)throw new Error('errors.recordingUnavailable');browserRecording.paused=false;
 }
 export async function stopAudioRecording():Promise<AudioSelection|null> {
   if(!preview&&nativePlatform?.os==='android'){try{return await call<AudioSelection>('stop_audio_recording');}finally{nativeRecordingActive=false;}}
@@ -332,3 +384,5 @@ export function isNewerVersion(candidate:string,current:string):boolean {
   for(let index=1;index<=3;index++){const difference=Number(next[index])-Number(installed[index]);if(difference!==0)return difference>0;}
   return Boolean(installed[4])&&!next[4];
 }
+
+export async function openAndroidBatterySettings():Promise<void> {if(!preview)await call('open_android_battery_settings');}

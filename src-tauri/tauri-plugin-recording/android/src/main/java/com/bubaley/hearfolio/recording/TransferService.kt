@@ -15,6 +15,8 @@ import android.os.Looper
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import java.util.Locale
+import java.io.File
+import org.json.JSONObject
 
 // The Rust transfer owns the network operation. This service owns its Android
 // lifetime and notification, independent of the activity/WebView lifecycle.
@@ -35,12 +37,32 @@ class TransferService : Service() {
     }
     private var wake: PowerManager.WakeLock? = null
     private var wifi: WifiManager.WifiLock? = null
+    private var stateFile: File? = null
+    private var controlFile: File? = null
+    private val poll = object : Runnable {
+        override fun run() {
+            val control=NativeJobJournal.read(controlFile)
+            if(control!=null && control.optString("id")==job && control.optBoolean("cancelled")) cancelled=true
+            val state=NativeJobJournal.read(stateFile)
+            if(state != null && state.optString("id") == job) {
+                if(state.optString("state") != "running") { complete(state.optBoolean("success"));return }
+                update(state.optString("stage"),state.optLong("current"),state.optLong("total"))
+            }
+            handler.postDelayed(this,1000)
+        }
+    }
+    private fun control() { try { NativeJobJournal.write(controlFile,JSONObject().put("id",job).put("ready",true).put("cancelled",cancelled)) } catch(_:Exception) {} }
+    private fun complete(ok: Boolean) {
+        success=ok;stopForeground(STOP_FOREGROUND_REMOVE)
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification(if(ok) tr("Передача завершена","Transfer completed") else if(cancelled) tr("Передача отменена","Transfer cancelled") else tr("Передача прервана. Повторите в приложении.","Transfer interrupted. Retry in the app."),ongoing=false))
+        releaseLocks();stopSelf()
+    }
     private var title = "Hearfolio"
     private var success = false
     private val handler = Handler(Looper.getMainLooper())
     private val ru get() = Locale.getDefault().language == "ru"
     private fun tr(russian: String, english: String) = if (ru) russian else english
-    private val deadline = Runnable { cancelled = true; stopSelf() }
+    private val deadline = Runnable { cancelled = true;control();complete(false) }
 
     override fun onCreate() {
         super.onCreate(); instance = this
@@ -69,16 +91,12 @@ class TransferService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent == null || intent.getStringExtra("id") != job) return START_NOT_STICKY
         when (intent.action) {
-            CANCEL -> { cancelled = true; update("cancelled", 0, 0) }
-            END -> {
-                success = intent.getBooleanExtra("success", false)
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification(
-                    if (success) tr("Передача завершена", "Transfer completed") else if (cancelled) tr("Передача отменена", "Transfer cancelled") else tr("Передача прервана. Повторите в приложении.", "Transfer interrupted. Retry in the app."), ongoing = false))
-                stopSelf()
-            }
+            CANCEL -> { cancelled = true; control(); update("cancelled", 0, 0) }
+            END -> complete(intent.getBooleanExtra("success",false))
             BEGIN -> {
                 try {
+                releaseLocks()
+                stateFile=NativeJobJournal.privateFile(this,intent.getStringExtra("snapshotPath"));controlFile=NativeJobJournal.privateFile(this,intent.getStringExtra("controlPath"));control()
                 title = if (intent.getStringExtra("direction") == "receive") tr("Получение записи", "Receiving recording") else tr("Отправка записи", "Sending recording")
                 val notification = notification(tr("Подготовка…", "Preparing…"))
                 if (Build.VERSION.SDK_INT >= 29) startForeground(NOTIFICATION, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
@@ -88,6 +106,7 @@ class TransferService : Service() {
                 wifi = (applicationContext.getSystemService(WIFI_SERVICE) as WifiManager).createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "Hearfolio:transfer").apply { setReferenceCounted(false); acquire() }
                 // Bound locks and service lifetime even if a native job never completes.
                 handler.postDelayed(deadline, 2 * 60 * 60 * 1000L)
+                handler.post(poll)
                 ready?.invoke(null); ready = null
                 } catch (error: Exception) {
                     cancelled = true
@@ -100,7 +119,7 @@ class TransferService : Service() {
     }
 
     fun update(stage: String, current: Long, total: Long) {
-        val text = when (stage) {
+        val text = when (if(cancelled) "cancelled" else stage) {
             "waiting" -> tr("Ожидание получателя…", "Waiting for recipient…")
             "cancelled" -> tr("Отменяем передачу…", "Cancelling transfer…")
             "metadata" -> tr("Обновление расшифровки…", "Updating transcription…")
@@ -109,12 +128,16 @@ class TransferService : Service() {
         getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification(text, current, total))
     }
 
-    override fun onTimeout(startId: Int, fgsType: Int) { cancelled = true; stopSelf() }
-    override fun onDestroy() {
-        handler.removeCallbacks(deadline)
+    override fun onTimeout(startId: Int, fgsType: Int) { cancelled = true; control();complete(false) }
+    private fun releaseLocks() {
+        handler.removeCallbacks(deadline);handler.removeCallbacks(poll)
         if (wake?.isHeld == true) wake?.release()
         if (wifi?.isHeld == true) wifi?.release()
-        cancelled = true; instance = null
+        wake=null;wifi=null
+    }
+    override fun onDestroy() {
+        releaseLocks()
+        cancelled = true;control(); instance = null
         super.onDestroy()
         stopped?.invoke(); stopped = null
     }

@@ -1,14 +1,19 @@
-import {recordingWavePath} from './recording-wave';
-import {transferSettingsHtml, devicesHtml, transferBarHtml, shareButtonHtml, bindTransfers, initializeTransfers} from './transfers';
+import {recordNameParts, renamedRecordTitle} from './record-name';
+import {RecorderEnvelope} from './recorder-meter';
+import {pauseAudioRecording, resumeAudioRecording, restoreNativeRecordingFlag, observePendingOperation, operationHandled, markOperationHandled} from './api';
+import type {OperationSnapshot} from './operation-recovery';
+import {transferSettingsHtml, devicesHtml, transferBarHtml, shareButtonHtml, bindTransfers, initializeTransfers, hasTransferDraft, discardTransferDraft, transferActivityLabel} from './transfers';
 import './styles.css';
-import {recordingInputLevel, call, pickAudio, startAudioRecording, stopAudioRecording, cancelAudioRecording, discardAudioRecording, exportText, subscribe, subscribeAudioDrop, registerPreviewFile, audioSource, shareAudio, shareText, saveAudio, prepareNativePlayback, nativePlaybackState, playNativePlayback, pauseNativePlayback, seekNativePlayback, releaseNativePlayback, type NativePlayerState, openExternal, pickStorageParent, loadRuntimePlatform, previewCapabilities, appVersion, checkDesktopUpdate, latestAndroidRelease, restartApp, isNewerVersion, preview, type AudioSelection, type Entry, type Progress, type Settings, type CloudModel, type RecognitionConfig, type RuntimeCapabilities, type AndroidRelease, type AppUpdate} from './api';
+import './transfers.css';
+import {renderSettings, initialSettingsDraft, mergeSettingsDraft, hasSettingsChanges, isSettingsSection, settingsLabel, type SettingsSection, type SettingsDraft} from './settings-ui';
+import {recordingInputLevel, call, pickAudio, startAudioRecording, stopAudioRecording, cancelAudioRecording, discardAudioRecording, exportText, subscribe, subscribeAudioDrop, registerPreviewFile, audioSource, shareAudio, shareText, saveAudio, prepareNativePlayback, nativePlaybackState, playNativePlayback, pauseNativePlayback, seekNativePlayback, releaseNativePlayback, type NativePlayerState, openExternal, openAndroidBatterySettings, pickStorageParent, loadRuntimePlatform, previewCapabilities, appVersion, checkDesktopUpdate, latestAndroidRelease, restartApp, isNewerVersion, preview, type AudioSelection, type Entry, type Progress, type Settings, type CloudModel, type RecognitionConfig, type RuntimeCapabilities, type AndroidRelease, type AppUpdate} from './api';
 import {icon, escapeHtml as esc} from './icons';
 import {tr, locale, countLabel, errorText, setLanguage, currentLanguage, type LanguagePreference} from './i18n';
 
-import {setupPostprocess, rulesHtml, postprocessHtml, resultsHtml, textPickerHtml, textPickerOpen, bindPostprocess, ensureRules, hasRuleDraft, mayLeaveRules} from './postprocess';
+import {setupPostprocess, rulesHtml, postprocessHtml, resultsHtml, textPickerHtml, textPickerOpen, bindPostprocess, ensureRules, hasRuleDraft, mayLeaveRules, restorePostprocessActivity} from './postprocess';
 
 type View = 'work' | 'history' | 'models' | 'settings' | 'rules' | 'devices';
-type SettingsDraft = {url:string;token:string;language:LanguagePreference};
+let settingsSection:SettingsSection|null=null, settingsSaving=false, settingsError='';
 const models = [
   {id:'whisper-tiny',name:'Whisper Tiny',detail:"Для коротких заметок. Быстрее остальных, но чаще ошибается.",size:"75 МБ",installed:false},
   {id:'whisper-base',name:'Whisper Base',detail:"Для повседневных записей. Хороший выбор для начала.",size:"142 МБ",installed:false},
@@ -29,6 +34,7 @@ let runtime={ffmpeg:false,whisper:false,nemo:false};
 let runtimeLoaded=false, historyError='', sidebarCollapsed=localStorage.getItem('hearfolio-sidebar')==='collapsed'||(!localStorage.getItem('hearfolio-sidebar')&&window.innerWidth<=760);
 let theme=localStorage.getItem('hearing-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');
 let operationStarted=0, elapsedTimer:ReturnType<typeof setInterval>|null=null;
+let nativeOperation:OperationSnapshot|null=null, operationPolling=false, operationCancelling=false, recoveringOperation=false;
 let settingsSaveQueue:Promise<unknown>=Promise.resolve(), previousResult:{text:string;saved:boolean}|null=null;
 let receivedPartial=false, audioPosition=0, audioWasPlaying=false, pickingAudio=false;
 let noticeTimer:ReturnType<typeof setTimeout>|null=null;
@@ -38,26 +44,17 @@ let playerId='', playerLoading=false, playerError='', playerState:NativePlayerSt
 const microphone=()=>'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><rect x="9" y="2" width="6" height="13" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg>';
 let nativeRecordingSeconds:number|null=null,externalRecording=false;
 let nativeInputLevel=0, nativeLevelAt=0;
-function recordingMeterHtml(){return `<svg class="recording-meter" viewBox="0 0 640 220" preserveAspectRatio="none" role="img" aria-label="${tr('Уровень микрофона')}"><defs><linearGradient id="voice-gradient"><stop offset="0" stop-color="currentColor" stop-opacity="0"/><stop offset=".22" stop-color="currentColor" stop-opacity=".4"/><stop offset=".5" stop-color="currentColor"/><stop offset=".78" stop-color="currentColor" stop-opacity=".4"/><stop offset="1" stop-color="currentColor" stop-opacity="0"/></linearGradient></defs>${[0,1,2].map(i=>`<path class="voice-halo" d="${recordingWavePath(0,0,i)}"/><path class="voice-line" d="${recordingWavePath(0,0,i)}"/>`).join('')}</svg>`;}
-let waveFrame=0,waveLevel=0,wavePhase=0,waveTime=0;
-const reducedWaveMotion=matchMedia('(prefers-reduced-motion: reduce)');
-function animateRecordingWave(now:number){
-  waveFrame=0;
-  const meter=document.querySelector<SVGElement>('.recording-meter');
-  if(!meter||document.hidden){waveTime=0;waveLevel=0;return;}
-  const dt=waveTime?Math.min(64,now-waveTime):16;waveTime=now;
-  const input=platform.os==='android'&&!preview?(now-nativeLevelAt<700?nativeInputLevel:0):recordingInputLevel();
-  const target=recordingPhase==='recording'&&Number.isFinite(input)?Math.max(0,Math.min(1,input)):0;
-  waveLevel=reducedWaveMotion.matches?target:waveLevel+(target-waveLevel)*(1-Math.exp(-dt/(target>waveLevel?90:260)));
-  if(Math.abs(waveLevel-target)<.001)waveLevel=target;
-  if(!reducedWaveMotion.matches&&target>0)wavePhase+=dt*.0018*(.35+target);
-  meter.querySelectorAll('path').forEach((path,i)=>path.setAttribute('d',recordingWavePath(waveLevel,wavePhase,Math.floor(i/2))));
-  if(!reducedWaveMotion.matches&&(target>0||waveLevel>0))waveFrame=requestAnimationFrame(animateRecordingWave);
-  else waveTime=0;
+const recorderEnvelope=new RecorderEnvelope();
+function recordingMeterHtml(){return `<div class="recorder-timeline" role="img" aria-label="${tr('Уровень микрофона')}"><div class="recorder-bars">${recorderEnvelope.levels().map(level=>`<i style="--level:${level}"></i>`).join('')}</div><div class="recorder-playhead" aria-hidden="true"></div><div class="recorder-ruler" aria-hidden="true">${Array(17).fill('<i></i>').join('')}</div></div>`;}
+function updateRecorderMeter(){
+  if(document.hidden||recordingPhase!=='recording')return;
+  const meter=document.querySelector('.recorder-bars');if(!meter)return;
+  const now=performance.now(),level=platform.os==='android'&&!preview?(now-nativeLevelAt<700?nativeInputLevel:0):recordingInputLevel();
+  if(recorderEnvelope.sample(level,now,true))meter.querySelectorAll<HTMLElement>('i').forEach((bar,i)=>bar.style.setProperty('--level',String(recorderEnvelope.levels()[i])));
 }
-// Wake animation only while this foreground recording surface is present.
-setInterval(()=>{if(!waveFrame&&!document.hidden&&document.querySelector('.recording-meter'))waveFrame=requestAnimationFrame(animateRecordingWave);},100);
-const recordingDuration=()=>formatTime(nativeRecordingSeconds??(recordingStarted?Math.floor((Date.now()-recordingStarted)/1000):0));
+setInterval(updateRecorderMeter,125);
+let recordingPausedAt=0,recordingPausedMillis=0;
+const recordingDuration=()=>formatTime(nativeRecordingSeconds??(recordingStarted?Math.floor(((recordingPausedAt||Date.now())-recordingStarted-recordingPausedMillis)/1000):0));
 document.documentElement.dataset.theme=theme;
 const title:Record<View,string>={work:"Расшифровка",history:"Записи",models:"Модели",settings:"Настройки",devices:"Устройства",rules:"Правила обработки"};
 const modelName=(id:string|null)=>{const normalized=id?.replace(/^openrouter\//,'');return models.find(model=>model.id===normalized)?.name||cloudModels.find(model=>model.id===normalized)?.name||normalized||tr("Модель не выбрана");};
@@ -96,14 +93,16 @@ function beginOperation(kind:Progress['kind'],stage:string) {
   if (elapsedTimer) clearInterval(elapsedTimer);
   elapsedTimer=setInterval(()=>{if(progress){progress.elapsed=Math.max(progress.elapsed,Math.floor((Date.now()-operationStarted)/1000));updateProgress();}},1000);
 }
-function endOperation() {busy=false;progress=null;if(elapsedTimer)clearInterval(elapsedTimer);elapsedTimer=null;}
+function endOperation() {busy=false;progress=null;nativeOperation=null;operationCancelling=false;if(elapsedTimer)clearInterval(elapsedTimer);elapsedTimer=null;}
 function progressHtml():string {
   if (!busy||!progress) return '';
   const p=progress,percent=p.total?Math.min(100,Math.floor(p.current/p.total*100)):null;
   const remaining=p.elapsed>0&&p.current>0&&p.total>p.current?Math.ceil((p.total-p.current)/(p.current/p.elapsed)):0;
-  return `<div class="task-progress" role="status"><div class="progress-label"><span class="spinner"></span><strong>${esc(p.stage)}</strong><span>${percent===null?'':`${percent}%`}</span></div><div class="track ${percent===null?'indeterminate':''}"><i style="width:${percent??25}%"></i></div><div class="progress-detail"><span>${(p.kind==='download'||p.kind==='update')&&p.total?`${(p.current/1048576).toFixed(1)} / ${(p.total/1048576).toFixed(1)}${tr(" МБ · ")}`:''}${tr("Прошло ")}${formatTime(p.elapsed)}</span><span>${remaining?`${tr("Осталось около ")}${formatTime(remaining)}`:tr("Оцениваем время")}</span></div></div>`;
+  return `<div class="task-progress" role="status"><div class="progress-label"><span class="spinner"></span><strong>${esc(p.stage)}</strong><span>${percent===null?'':`${percent}%`}</span></div><div class="track ${percent===null?'indeterminate':''}"><i style="width:${percent??25}%"></i></div><div class="progress-detail"><span>${(p.kind==='download'||p.kind==='update')&&p.total?`${(p.current/1048576).toFixed(1)} / ${(p.total/1048576).toFixed(1)}${tr(" МБ · ")}`:''}${tr("Прошло ")}${formatTime(p.elapsed)}</span><span>${remaining?`${tr("Осталось около ")}${formatTime(remaining)}`:tr("Оцениваем время")}</span></div>${nativeOperation?.state==='running'?`<button type="button" class="text-button" id="cancel-operation" ${operationCancelling?'disabled':''}>${tr(operationCancelling?'Завершаем отмену…':'Отмена')}</button>`:''}</div>`;
 }
-function updateProgress() {const element=document.querySelector('#progress');if(element)element.innerHTML=progressHtml();}
+function updateProgress() {const element=document.querySelector('#progress');if(element)element.innerHTML=progressHtml();bindOperationCancel();}
+function bindOperationCancel(){document.querySelector('#cancel-operation')?.addEventListener('click',()=>{void cancelNativeOperation();});}
+async function cancelNativeOperation(){if(!nativeOperation?.id||operationCancelling)return;operationCancelling=true;updateProgress();try{await call('cancel_background_operation',{id:nativeOperation.id});}catch(error){operationCancelling=false;notice(errorText(error),true);updateProgress();}}
 function groupLabel(timestamp:number) {
   const day=new Date(timestamp);day.setHours(0,0,0,0);const today=new Date();today.setHours(0,0,0,0);
   const age=Math.round((today.getTime()-day.getTime())/86400000);
@@ -126,7 +125,11 @@ function sidebarHtml():string {
   return `${tr("<aside class=\"sidebar\" aria-label=\"Навигация\"><div class=\"sidebar-chrome\" data-tauri-drag-region><button class=\"icon-button\" id=\"collapse\" title=\"Свернуть боковую панель\" aria-label=\"Свернуть боковую панель\" aria-expanded=\"true\">")}${icon('panel')}${tr("</button></div><div class=\"sidebar-body\"><div class=\"brand-row\"><button class=\"brand\" data-view=\"work\" title=\"Hearfolio — расшифровка аудио\">")}${icon('wave')}Hearfolio</button></div><div class="primary-nav"><button class="nav-item" id="new" ${disabled()}>${icon('plus')}${tr("<span>Новая запись</span><kbd>⌘ N</kbd></button><button class=\"nav-item ")}${view==='history'?'active':''}" data-view="history">${icon('search')}${tr("<span>Найти запись</span><kbd>⌘ K</kbd></button></div><div class=\"recent-records\"><div class=\"recent-heading\"><span>Недавние записи</span>")}${history.length?`${tr("<button class=\"text-button\" data-view=\"history\">Все ")}${history.length}</button>`:''}</div>${loading?tr("<div class=\"sidebar-empty\">Загружаем записи…</div>"):historyError?tr("<button class=\"text-button\" id=\"retry-history\">Повторить загрузку</button>"):recent.length?historyItems(recent,true):tr("<div class=\"sidebar-empty\">Здесь появятся ваши записи</div>")}</div><nav class="bottom-nav" aria-label="${tr('Приложение')}">${desktopModelsNav()}<button class="nav-item ${view==='devices'?'active':''}" data-view="devices">${icon('devices')}<span>${tr('Устройства')}</span></button><button class="nav-item ${view==='settings'?'active':''}" data-view="settings">${icon('settings')}${tr("<span>Настройки</span></button></nav><div class=\"sidebar-footer\"><span>")}${icon('headphones')}${tr("Личный аудиоархив</span><button class=\"icon-button\" data-theme title=\"")}${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}" aria-label="${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}">${icon(theme==='dark'?'sun':'moon')}</button></div></div></aside>`;
 }
 function captureHtml():string {
-  if(recordingPhase!=='idle')return `<div class="capture-panel recording-panel"><div class="recording-indicator">${microphone()}<span>${tr(recordingPhase==='starting'?'Подключаем микрофон…':recordingPhase==='stopping'?'Сохраняем аудио…':recordingPhase==='cancelling'?'Отменяем запись…':recordingPhase==='paused'?'Запись на паузе':'Идёт запись')}</span></div><div class="recording-stage">${recordingMeterHtml()}<div class="recording-duration" id="recording-duration" aria-label="${tr('Длительность записи')}">${recordingDuration()}</div></div><p>${tr('После остановки выберите модель и распознайте аудио.')}</p><button class="primary capture-stop" id="stop-recording" ${!['recording','paused'].includes(recordingPhase)?'disabled':''}><span class="stop-symbol"></span>${tr('Остановить и сохранить')}</button><button class="text-button capture-cancel" id="cancel-recording" ${!['recording','paused'].includes(recordingPhase)?'disabled':''}>${tr('Отменить запись')}</button></div>`;
+  if(recordingPhase!=='idle'){
+    const live=['recording','paused'].includes(recordingPhase),paused=recordingPhase==='paused';
+    const label=tr(recordingPhase==='starting'?'Подключаем микрофон…':recordingPhase==='stopping'?'Сохраняем аудио…':recordingPhase==='cancelling'?'Отменяем запись…':paused?'Запись на паузе':'Идёт запись');
+    return `<section class="capture-panel recording-panel ${paused?'recorder-paused':''}" aria-label="${tr('Диктофон')}"><div class="recorder-heading"><span class="recorder-dot" aria-hidden="true"></span><span>${label}</span></div><div class="recording-duration" id="recording-duration" aria-label="${tr('Длительность записи')}">${recordingDuration()}</div>${recordingMeterHtml()}<div class="recorder-meter-caption"><span>${tr('Уровень микрофона')}</span>${paused?`<span>${tr('Пауза')}</span>`:`<span class="recorder-live">${tr('Запись')}</span>`}</div><div class="recorder-actions"><button type="button" class="secondary recorder-pause" id="pause-recording" ${!live?'disabled':''}>${icon(paused?'play':'pause')}<span>${tr(paused?'Продолжить':'Пауза')}</span></button><button type="button" class="primary capture-stop" id="stop-recording" ${!live?'disabled':''}><span class="stop-symbol"></span><span>${tr('Сохранить запись')}</span></button></div><button type="button" class="text-button capture-cancel" id="cancel-recording" ${!live?'disabled':''}>${tr('Отменить запись')}</button></section>`;
+  }
   if(pendingRecording)return `<div class="capture-panel"><div class="empty-symbol">${microphone()}</div><h1>${tr('Аудио записано')}</h1><p>${tr('Добавьте запись в архив, чтобы перейти к распознаванию.')}</p><button class="primary" id="retry-recording" ${disabled()}>${tr('Добавить в архив')}</button><button class="text-button capture-cancel" id="discard-recording" ${disabled()}>${tr('Удалить эту запись')}</button></div>`;
   return `<div class="capture-panel"><div class="empty-symbol">${icon('wave')}</div><h1>${tr('Начните с аудио')}</h1><p>${tr('Запишите голосовую заметку или выберите готовый файл.')}</p>${platform.audioRecording?`<button class="primary capture-start" id="start-recording" ${disabled()}>${microphone()}${tr('Записать аудио')}</button>`:''}<button class="secondary capture-file" data-choose ${disabled()}>${icon('plus')}${tr('Выбрать аудиофайл')}</button><small>${audioFormats}</small></div>`;
 }
@@ -170,7 +173,7 @@ function composerHtml(issue:string):string {
   if(!active&&(platform.mobile||recordingPhase!=='idle'||pendingRecording))return progress?`<div class="composer-area"><div id="progress">${progressHtml()}</div></div>`:'';
   const needsDownload=configuration.provider==='local'&&runtime.ffmpeg&&!models.find(model=>model.id===localChoice)?.installed;
   const needsCatalog=configuration.provider==='openrouter'&&(platform.nativeAudio||runtime.ffmpeg)&&settings.hasToken;
-  const action=needsDownload?`data-download="${localChoice}"`:needsCatalog?'id="open-catalog"':configuration.provider==='openrouter'&&(platform.nativeAudio||runtime.ffmpeg)?'data-view="settings"':'data-view="models"';
+  const action=needsDownload?`data-download="${localChoice}"`:needsCatalog?'id="open-catalog"':configuration.provider==='openrouter'&&(platform.nativeAudio||runtime.ffmpeg)?'data-view="settings" data-settings-target="recognition"':'data-view="models"';
   return `<div class="composer-area"><div class="composer ${active?'has-record':''}">
     <div id="progress">${progressHtml()}</div>
     ${!active?`<div class="composer-top"><button class="attachment" data-choose ${disabled()}>${icon('plus')}${tr("<span>Добавить аудиофайл</span><kbd>⌘ O</kbd></button>")}${runButtonHtml(issue)}</div>`:''}
@@ -181,7 +184,7 @@ function composerHtml(issue:string):string {
 function workHtml():string {
   const issue=readiness(),source=active&&!platform.mobile?audioSource(active):'';
   return `<section class="workspace">
-    ${transferBarHtml(active)}
+    ${recordingPhase==='idle'?transferBarHtml(active):''}
     ${active?`<div class="record-toolbar"><div class="record-info">${icon('wave')}<div><div class="record-name-row"><h1 title="${esc(active.name)}">${esc(active.name)}</h1><button class="icon-button" data-rename="${esc(active.id)}" aria-label="${tr('Переименовать запись')}" ${disabled()}>${icon('edit')}</button></div><span id="text-meta">${resultMeta()}</span></div></div><div class="output-actions" ${outputTab==='results'?'hidden':''}><button class="icon-button" id="copy" title="${tr('Копировать текст')}" aria-label="${tr('Копировать текст')}" ${!text?'disabled':''}>${icon('copy')}</button><button class="icon-button" id="share-text" title="${tr('Поделиться текстом')}" aria-label="${tr('Поделиться текстом')}" ${!text?'disabled':''}>${icon('share')}</button><button class="icon-button" id="export" title="${tr('Экспортировать текст')}" aria-label="${tr('Экспортировать текст')}" ${!text?'disabled':''}>${icon('download')}</button>${shareButtonHtml()}</div></div><div class="audio-bar ${platform.mobile?'native-audio-bar':''}">${platform.mobile?nativePlayerHtml():source?`<audio id="audio" controls preload="metadata" src="${esc(source)}" aria-label="${tr('Прослушать ')}${esc(active.name)}"></audio>`:''}<div class="audio-file-meta"><span>${active.durationSeconds?formatTime(active.durationSeconds)+' · ':''}${dateLabel(active.createdAt)}</span><div class="audio-actions"><button class="icon-button" id="share-audio" aria-label="${tr('Поделиться аудио')}" title="${tr('Поделиться аудио')}" ${disabled()}>${icon('share')}</button><button class="icon-button" id="save-audio" aria-label="${tr('Сохранить аудио')}" title="${tr('Сохранить аудио')}" ${disabled()}>${icon('download')}</button></div></div><p id="playback-error" class="playback-error" role="alert"></p></div>${text||active.results?.length?`<div class="output-tabs"><div class="output-tab-buttons" role="tablist" aria-label="${tr('Текст записи')}"><button role="tab" id="transcript-tab" data-output-tab="transcript" aria-selected="${outputTab==='transcript'}">${tr('Расшифровка')}</button><button role="tab" id="results-tab" data-output-tab="results" aria-selected="${outputTab==='results'}">${tr('Результаты')}${active.results?.length?` <small>${active.results.length}</small>`:''}</button></div>${text&&resultSaved&&outputTab==='transcript'?`<button type="button" id="process-shortcut" class="process-shortcut" ${busy?'disabled':''}>${tr('Обработать текст')}</button>`:''}</div>`:''}`:''}
     <div class="transcript-scroll" id="result" ${active&&(text||active.results?.length)?`role="tabpanel" aria-labelledby="${outputTab==='transcript'?'transcript-tab':'results-tab'}"`:''}>${outputHtml()}${active&&text&&resultSaved&&outputTab==='transcript'?postprocessHtml():''}</div>
     ${previousResult?.saved&&!busy&&!resultSaved?tr("<div class=\"restore-result\"><span>Предыдущая расшифровка сохранена в архиве.</span><button class=\"text-button\" id=\"restore\">Вернуть предыдущий текст</button></div>"):''}
@@ -208,22 +211,14 @@ function modelsHtml():string {
   const installationHelp=platform.os==='linux'?tr('На Debian и Ubuntu установите FFmpeg этой командой. Whisper установите по инструкции проекта whisper.cpp.'):tr('Команда использует Homebrew. Модель скачивается отдельно ниже.');
   return `${tr("<div class=\"page-heading\"><div><h1>Модели на устройстве</h1><p>Скачайте один раз. Дальше записи можно распознавать без интернета.</p></div></div><div class=\"runtime-panel\"><div><h2>Готовность к распознаванию</h2><button class=\"icon-button\" id=\"retry-runtime\" title=\"Проверить снова\" aria-label=\"Проверить готовность снова\">")}${icon('history')}</button></div><div class="runtime-checks">${[{name:'FFmpeg',ready:runtime.ffmpeg},{name:'Whisper',ready:runtime.whisper},{name:'NeMo',ready:runtime.nemo}].map(item=>`<span class="runtime-check ${item.ready?'ready':''}">${icon(item.ready?'check':'alert')}${item.name}<small>${runtimeLoaded?(item.ready?tr("Готов"):tr("Не установлен")):tr("Проверяем")}</small></span>`).join('')}</div>${runtimeLoaded&&(!runtime.ffmpeg||!runtime.whisper)?`${tr("<p>Для Whisper установите инструменты в Терминале, затем проверьте готовность снова.</p><div class=\"install-command\"><code>")}${installationCommand}${tr("</code><button class=\"icon-button\" id=\"copy-install\" title=\"Копировать команду\" aria-label=\"Копировать команду установки\">")}${icon('copy')}</button></div><p class="small-copy">${installationHelp}</p>${platform.os==='linux'?`<a href="https://github.com/ggml-org/whisper.cpp" target="_blank" rel="noreferrer">${tr('Инструкция whisper.cpp')}${icon('chevron')}</a>`:''}`:''}</div><div class="model-list">${models.map(model=>`<article class="model-card"><div class="model-copy"><h2>${model.name}${localChoice===model.id?tr("<span class=\"badge\">Выбрана</span>"):''}</h2><p>${tr(model.detail)}</p><small>${tr(model.size)}${model.installed?tr(" · Скачана"):''}</small></div>${model.installed?`<button class="secondary" data-select="${model.id}" ${busy||localChoice===model.id?'disabled':''}>${localChoice===model.id?icon('check')+tr("Выбрана"):tr("Использовать")}</button>`:`<button class="secondary" data-download="${model.id}" ${disabled()}>${icon('download')}${tr("Скачать</button>")}`}</article>`).join('')}${tr("</div><div class=\"help-note\"><h2>Для Nemotron нужен NeMo</h2><p>Установите NeMo-Speech.cpp по инструкции проекта. Движок добавит команду <code>nemo-speech</code>; затем проверьте готовность снова.</p><a href=\"https://github.com/NVIDIA/NeMo-Speech.cpp\" target=\"_blank\" rel=\"noreferrer\">Инструкция NeMo-Speech.cpp ")}${icon('chevron')}</a></div>`;
 }
-function mobileAppearanceHtml():string {
-  if(!platform.mobile)return '';
-  return `<section class="settings-section"><h2>${tr('Внешний вид')}</h2><div class="setting-row"><div><strong>${tr('Тема приложения')}</strong><p>${tr(theme==='dark'?'Тёмная тема':'Светлая тема')}</p></div><button type="button" class="secondary" data-theme>${icon(theme==='dark'?'sun':'moon')}${tr(theme==='dark'?'Светлая тема':'Тёмная тема')}</button></div></section>`;
-}
-function storageSettingsHtml():string {
-  return `<section class="settings-section"><h2>${tr('Ваш архив')}</h2><p>${platform.customStorage?tr('Выберите родительскую папку. Hearfolio создаст внутри неё папку ')+`<code>${platform.transferMvp?'.hearfolio-transfer-mvp':'.hearfolio'}</code>`+tr(' и безопасно перенесёт текущий архив.'):tr('На Android архив хранится в защищённой папке приложения. Выбор другой папки пока недоступен.')}</p>${platform.customStorage?`<div class="archive-path"><span>${tr('Родительская папка')}</span><code>${esc(settings.storageParent||tr('Определяем расположение…'))}</code></div>`:''}<div class="archive-path"><span>${tr('Архив')}</span><code>${esc(settings.storagePath||tr('Определяем расположение…'))}</code></div>${platform.customStorage?`<button type="button" class="secondary" id="choose-storage" ${disabled()}>${tr('Выбрать папку')}</button>`:''}<small class="storage-help">${tr('Исходные аудиофайлы остаются на своих местах.')}</small></section>`;
-}
 function settingsHtml():string {
-  const draft=settingsDraft||{url:settings.openrouterUrl,token:'',language:settings.language};
-  return `<div class="page-heading"><div><h1>${tr('Настройки')}</h1><p>${tr('Язык, подключение и расположение вашего архива.')}</p></div></div><form id="settings-form" class="settings-panel"><section class="settings-section"><h2>${tr('Язык приложения')}</h2><label class="field"><span>${tr('Язык')}</span><select name="language"><option value="system" ${draft.language==='system'?'selected':''}>${tr('Системный')}</option><option value="ru" ${draft.language==='ru'?'selected':''}>${tr('Русский')}</option><option value="en" ${draft.language==='en'?'selected':''}>English</option></select><small>${tr('Системный язык определяется по настройкам устройства.')}</small></label></section><section class="settings-section"><div class="section-heading"><h2>OpenRouter</h2><span class="badge ${settings.hasToken?'success':''}">${settings.hasToken?tr('Токен подключён'):tr('Нужен API token')}</span></div><p>${tr('Аудио отправляется выбранному провайдеру. Стоимость и обработка данных зависят от модели.')}</p><label class="field"><span>API URL</span><input name="url" type="url" required value="${esc(draft.url)}" placeholder="https://openrouter.ai/api/v1"><small>${tr('Измените адрес для другого совместимого сервиса.')}</small></label><label class="field"><span>API token</span><input name="token" type="password" autocomplete="off" value="${esc(draft.token)}" placeholder="${settings.hasToken?tr('Введите новый токен для замены'):'sk-or-…'}"><small>${settings.hasToken?tr('Оставьте поле пустым, чтобы использовать сохранённый токен.'):tr('Токен хранится в настройках приложения на этом устройстве.')}</small></label>${settings.hasToken?`<button type="button" id="remove-token" class="text-button danger">${tr('Удалить сохранённый токен')}</button>`:''}</section>${storageSettingsHtml()}${mobileAppearanceHtml()}<section class="settings-section"><h2>${tr('Правила обработки')}</h2><p>${tr('Сохраните инструкции, чтобы получать нужный результат из расшифровки.')}</p><button type="button" class="secondary" data-view="rules" ${disabled()}>${icon('file')}${tr('Открыть правила')}</button></section><div class="settings-actions"><button class="primary" type="submit" ${busy||!settingsDraft?'disabled':''}>${tr('Применить')}</button><span>${settingsDraft?tr('Есть неприменённые изменения'):''}</span></div></form>${transferSettingsHtml()}<section class="settings-section about-section"><h2>${tr('О приложении')}</h2><div class="app-version"><strong>Hearfolio</strong><span>${tr('Версия')} ${esc(applicationVersion||'…')}</span></div><div id="about-updates">${updatesHtml()}</div></section>`;
+  return renderSettings({settings,draft:settingsDraft,section:settingsSection||(!platform.mobile&&window.innerWidth>760?'general':null),mobile:platform.mobile,android:platform.os==='android',theme,busy,saving:settingsSaving,error:settingsError,customStorage:platform.customStorage,transferMvp:Boolean(platform.transferMvp),version:applicationVersion,devicesHtml:transferSettingsHtml(),updatesHtml:updatesHtml()});
 }
 function mobileNavHtml():string {
   return `<nav class="mobile-nav" aria-label="${tr('Навигация')}">${(['work','history',...(platform.localRecognition?['models']:[]),'devices','settings'] as View[]).map(target=>`<button type="button" data-view="${target}" class="${view===target||(target==='settings'&&view==='rules')?'active':''}" ${recordingPhase!=='idle'||(target==='work'&&busy)?'disabled':''}>${icon(target==='work'?'wave':target==='history'?'history':target)}<span>${tr(title[target])}</span></button>`).join('')}</nav>`;
 }
 function updateHeaderHtml():string {
-  return pendingUpdate||androidRelease||updateInstalled?`<button type="button" class="text-button update-shortcut" data-view="settings">${icon('download')}<span>${tr(updateInstalled?'Нужен перезапуск':'Доступно обновление')}</span></button>`:'';
+  return pendingUpdate||androidRelease||updateInstalled?`<button type="button" class="text-button update-shortcut" data-view="settings" data-settings-target="app">${icon('download')}<span>${tr(updateInstalled?'Нужен перезапуск':'Доступно обновление')}</span></button>`:'';
 }
 function updatesHtml():string {
   if(platform.transferMvp)return `<p>${currentLanguage()==='ru'?'Тестовая сборка: обновления отключены.':'Test build: updates are disabled.'}</p>`;
@@ -234,7 +229,7 @@ function updatesHtml():string {
 }
 function refreshUpdateUi() {
   const section=document.querySelector('#about-updates');if(section){section.innerHTML=updatesHtml();bindUpdates();}
-  const header=document.querySelector('#update-header');if(header){header.innerHTML=updateHeaderHtml();header.querySelector<HTMLElement>('[data-view]')?.addEventListener('click',()=>changeView('settings'));}
+  const header=document.querySelector('#update-header');if(header){header.innerHTML=updateHeaderHtml();header.querySelector<HTMLElement>('[data-view]')?.addEventListener('click',()=>changeView('settings','app'));}
 }
 async function checkUpdates(manual=false) {
   if(platform.transferMvp||busy||updateChecking||updateInstalled||(!platform.mobile&&platform.os!=='macos'&&platform.os!=='linux'&&platform.os!=='windows')||platform.os==='ios')return;
@@ -285,7 +280,7 @@ function preservePlayback() {
 function render() {
   preservePlayback();
   document.documentElement.dataset.platform=platform.os;
-  app.innerHTML=`<div ${(platform.mobile&&catalogOpen)||textPickerOpen()?'inert':''} class="shell ${sidebarCollapsed?'sidebar-collapsed':''} ${platform.mobile?'mobile-platform':''}">${sidebarHtml()}<main><header class="main-header" data-tauri-drag-region><div class="header-title" data-tauri-drag-region>${!platform.mobile?`${tr("<button class=\"icon-button\" id=\"expand\" title=\"Показать боковую панель\" aria-label=\"Показать боковую панель\" aria-expanded=\"false\">")}${icon('panel')}</button>`:''}<span data-tauri-drag-region>${esc(view==='work'?(active?.name||tr("Новая расшифровка")):tr(title[view]))}</span></div><button type="button" class="icon-button mobile-new" id="mobile-new" aria-label="${tr('Новая запись')}" ${disabled()}>${icon('plus')}</button><div class="header-status"><div id="update-header">${updateHeaderHtml()}</div>${busy?`<span class="header-activity"><span class="spinner"></span>${recordingPhase!=='idle'?tr('Запись аудио'):progress?.kind==='download'?tr("Скачиваем модель"):progress?.kind==='import'?tr("Добавляем запись"):progress?.kind==='storage'?tr('Переносим архив'):progress?.kind==='update'?tr('Устанавливаем обновление'):progress?.kind==='postprocess'?tr('Обрабатываем текст…'):tr("Распознаём")}</span>`:''}${preview?tr("<span class=\"preview-label\">Предпросмотр</span>"):''}</div></header><div class="main-surface ${view==='work'?'work-surface':''}">${view==='work'?workHtml():`<div class="page-scroll ${view==='devices'?'devices-scroll':''}"><div class="page-content ${view==='devices'?'devices-page':''}">${view==='history'?transferBarHtml(null)+historyHtml():view==='models'?modelsHtml():view==='devices'?devicesHtml():view==='rules'?rulesHtml():settingsHtml()}${busy?`<div id="progress">${progressHtml()}</div>`:''}</div></div>`}<div id="status" class="notice ${isError?'error':''}" role="status" aria-live="polite"></div></div>${mobileNavHtml()}</main></div>${platform.mobile&&catalogOpen?`<div class="catalog-backdrop" id="catalog-backdrop">${catalogHtml()}</div>`:''}${textPickerHtml()}`;
+  app.innerHTML=`<div ${(platform.mobile&&catalogOpen)||textPickerOpen()?'inert':''} class="shell ${sidebarCollapsed?'sidebar-collapsed':''} ${platform.mobile?'mobile-platform':''}">${sidebarHtml()}<main><header class="main-header" data-tauri-drag-region><div class="header-title" data-tauri-drag-region>${!platform.mobile?`${tr("<button class=\"icon-button\" id=\"expand\" title=\"Показать боковую панель\" aria-label=\"Показать боковую панель\" aria-expanded=\"false\">")}${icon('panel')}</button>`:''}<span data-tauri-drag-region>${esc(view==='work'?(active?.name||tr("Новая расшифровка")):tr(title[view]))}</span></div><button type="button" class="icon-button mobile-new" id="mobile-new" aria-label="${tr('Новая запись')}" ${disabled()}>${icon('plus')}</button><div class="header-status"><div id="update-header">${updateHeaderHtml()}</div>${busy?`<span class="header-activity"><span class="spinner"></span>${recordingPhase!=='idle'?tr('Запись аудио'):progress?.kind==='download'?tr("Скачиваем модель"):progress?.kind==='import'?tr("Добавляем запись"):progress?.kind==='storage'?tr('Переносим архив'):progress?.kind==='update'?tr('Устанавливаем обновление'):progress?.kind==='postprocess'?tr('Обрабатываем текст…'):progress?.kind==='transcribe'?tr('Распознаём'):transferActivityLabel()||tr('Выполняем…')}</span>`:''}${preview?tr("<span class=\"preview-label\">Предпросмотр</span>"):''}</div></header><div class="main-surface ${view==='work'?'work-surface':''}">${view==='work'?workHtml():`<div class="page-scroll ${view==='devices'?'devices-scroll':''}"><div class="page-content ${view==='devices'?'devices-page':''}">${view==='history'?transferBarHtml(null)+historyHtml():view==='models'?modelsHtml():view==='devices'?devicesHtml():view==='rules'?rulesHtml():settingsHtml()}${busy?`<div id="progress">${progressHtml()}</div>`:''}</div></div>`}<div id="status" class="notice ${isError?'error':''}" role="status" aria-live="polite"></div></div>${mobileNavHtml()}</main></div>${platform.mobile&&catalogOpen?`<div class="catalog-backdrop" id="catalog-backdrop">${catalogHtml()}</div>`:''}${textPickerHtml()}`;
   bind();updateNotice();restorePlayback();if(view==='work'&&active&&platform.mobile&&recordingPhase==='idle')void ensureNativePlayer();else stopPlayerPolling();
 }
 function restorePlayback() {
@@ -323,12 +318,22 @@ function bindNativePlayer(){
 
 function resetPlayback() {stopPlayerPolling();playerGeneration++;playerId='';playerLoading=false;playerError='';playerState={duration:0,currentTime:0,playing:false};void releaseNativePlayback().catch(()=>{});audioPosition=0;audioWasPlaying=false;const audio=document.querySelector<HTMLAudioElement>('#audio');if(audio){audio.pause();audio.currentTime=0;}}
 async function mayReplaceRecord(discardRecording=true) {if(pendingRecording){if(discardRecording){if(!await discardPendingRecording())return false;}else if(!await confirmAction(tr('Удалить записанное аудио?'),tr('Эта запись ещё не добавлена в архив и будет потеряна.'),tr('Продолжить без записи'),false))return false;}return !text||resultSaved||await confirmAction(tr("Неполный текст не сохранён"),tr("Скопируйте или экспортируйте текст, чтобы сохранить его. При переходе к другой записи этот результат будет потерян."),tr("Продолжить без текста"),false);}
-async function mayLeaveSettings() {if(!await mayLeaveRules())return false;return !settingsDraft||await confirmAction(tr("Изменения не применены"),tr("Примените настройки перед уходом или продолжите без этих изменений."),tr("Продолжить без изменений"),false);}
-async function changeView(target:View) {
+async function mayLeaveSettings() {
+  if(settingsSaving||!await mayLeaveRules())return false;
+  if(!settingsDraft&&!hasTransferDraft())return true;
+  if(!await confirmAction(tr("Изменения не применены"),tr("Примените настройки перед уходом или продолжите без этих изменений."),tr("Продолжить без изменений"),false))return false;
+  settingsDraft=null;settingsError='';discardTransferDraft();return true;
+}
+async function changeView(target:View, settingsTarget?:SettingsSection) {
   if(recordingPhase!=='idle'||busy)return;
   if(view==='rules'&&target!=='rules'&&!await mayLeaveRules())return;
   if(target==='models'&&!platform.localRecognition)return;
-  if (view==='settings'&&target!=='settings') {if(!await mayLeaveSettings())return;settingsDraft=null;}
+  if((view==='settings'||view==='devices')&&target!==view&&!await mayLeaveSettings())return;
+  if(target==='settings') {
+    if(view==='settings'&&settingsTarget&&settingsTarget!==settingsSection&&!await mayLeaveSettings())return;
+    if(view!=='settings')settingsSection=settingsTarget||((platform.mobile||window.innerWidth<=760)?null:'general');
+    else if(settingsTarget)settingsSection=settingsTarget;
+  }
   view=target;status='';if(window.innerWidth<=760)sidebarCollapsed=true;render();if(target==='rules')ensureRules();if(target==='history'&&!platform.mobile&&window.innerWidth>760)document.querySelector<HTMLInputElement>('#history-search')?.focus();
 }
 function bindRecordActions() {
@@ -337,12 +342,14 @@ function bindRecordActions() {
   document.querySelectorAll<HTMLElement>('[data-rename]').forEach(element=>element.onclick=()=>renameEntry(element.dataset.rename!));
 }
 function bind() {
+  bindOperationCancel();
   document.querySelector('#start-recording')?.addEventListener('click',startRecording);
   document.querySelector('#stop-recording')?.addEventListener('click',stopRecording);
+  document.querySelector('#pause-recording')?.addEventListener('click',()=>{void toggleRecordingPause();});
   document.querySelector('#cancel-recording')?.addEventListener('click',cancelRecording);
   document.querySelector('#retry-recording')?.addEventListener('click',()=>{if(pendingRecording&&!busy)void importSelection(pendingRecording);});
   document.querySelector('#discard-recording')?.addEventListener('click',async()=>{if(await discardPendingRecording())render();});
-  document.querySelectorAll<HTMLElement>('[data-view]').forEach(element=>element.onclick=()=>changeView(element.dataset.view as View));
+  document.querySelectorAll<HTMLElement>('[data-view]').forEach(element=>element.onclick=()=>changeView(element.dataset.view as View,isSettingsSection(element.dataset.settingsTarget)?element.dataset.settingsTarget:undefined));
   document.querySelectorAll('[data-choose]').forEach(element=>element.addEventListener('click',()=>choose()));
   document.querySelector('#new')?.addEventListener('click',newRecord);
   document.querySelector('#mobile-new')?.addEventListener('click',newRecord);
@@ -373,18 +380,38 @@ function bind() {
 }
 function setSidebar(collapsed:boolean) {sidebarCollapsed=collapsed;localStorage.setItem('hearfolio-sidebar',collapsed?'collapsed':'expanded');render();}
 async function copyText(value:string) {try{await navigator.clipboard.writeText(value);notice(tr("Скопировано"));}catch(error){notice(`${tr("Не удалось скопировать текст: ")}${errorText(error)}`,true);}}
-function readSettingsDraft(form:HTMLFormElement):SettingsDraft {const data=new FormData(form);return {url:String(data.get('url')).trim(),token:String(data.get('token')).trim(),language:String(data.get('language')) as LanguagePreference};}
+function readSettingsDraft(form:HTMLFormElement):SettingsDraft {return mergeSettingsDraft(new FormData(form),settingsDraft||initialSettingsDraft(settings));}
 function bindSettings() {
+  document.querySelectorAll<HTMLElement>('[data-settings-section]').forEach(button=>button.addEventListener('click',async()=>{
+    const target=button.dataset.settingsSection;if(!isSettingsSection(target)||target===settingsSection||settingsSaving)return;
+    if(!await mayLeaveSettings())return;settingsSection=target;render();document.querySelector<HTMLElement>('#settings-category-title')?.focus({preventScroll:true});
+  }));
+  document.querySelector('[data-settings-back]')?.addEventListener('click',async()=>{if(!await mayLeaveSettings())return;const previous=settingsSection;settingsSection=null;render();document.querySelector<HTMLElement>(`[data-settings-section="${previous}"]`)?.focus({preventScroll:true});});
   const form=document.querySelector<HTMLFormElement>('#settings-form');
-  form?.addEventListener('input',()=>{settingsDraft=readSettingsDraft(form);const button=form.querySelector<HTMLButtonElement>('[type=submit]');if(button)button.disabled=busy;const hint=form.querySelector('.settings-actions span');if(hint)hint.textContent=tr("Есть неприменённые изменения");});
+  form?.addEventListener('input',()=>{
+    const draft=readSettingsDraft(form);settingsDraft=hasSettingsChanges(draft,settings)?draft:null;settingsError='';
+    const button=form.querySelector<HTMLButtonElement>('[type=submit]');if(button)button.disabled=busy||settingsSaving||!settingsDraft;
+    const hint=form.querySelector('.settings-actions span');if(hint)hint.textContent=settingsDraft?settingsLabel('Есть несохранённые изменения','Unsaved changes'):settingsLabel('Все изменения сохранены','All changes saved');
+    document.querySelector('.settings-error')?.remove();
+  });
   form?.addEventListener('submit',async event=>{event.preventDefault();await applySettings();});
-  document.querySelector('#remove-token')?.addEventListener('click',async()=>{if(await confirmAction(tr("Удалить API token?"),tr("Для распознавания через OpenRouter потребуется подключить токен снова."),tr("Удалить токен"))){if(await persist('')){cloudModels=[];render();}}});
+  document.querySelector('#remove-token')?.addEventListener('click',async()=>{
+    if(busy||settingsSaving)return;
+    if(!await confirmAction(tr("Удалить API token?"),tr("Для распознавания через OpenRouter потребуется подключить токен снова."),tr("Удалить токен")))return;
+    settingsSaving=true;settingsError='';render();
+    const saved=await persist('');settingsSaving=false;if(saved){cloudModels=[];catalogError='';}else settingsError=settingsLabel('Не удалось удалить токен. Повторите попытку.','Could not remove the token. Try again.');render();
+  });
   document.querySelector('#choose-storage')?.addEventListener('click',changeStorage);
+  document.querySelector('#open-battery-settings')?.addEventListener('click',()=>{void openAndroidBatterySettings().catch(error=>notice(errorText(error),true));});
 }
 async function applySettings():Promise<boolean> {
+  if(busy||settingsSaving)return false;
   const form=document.querySelector<HTMLFormElement>('#settings-form');if(!form||!form.reportValidity())return false;
-  const draft=readSettingsDraft(form),connectionChanged=draft.url!==settings.openrouterUrl||Boolean(draft.token);
-  if(!await persist(draft.token||undefined,{language:draft.language,openrouterUrl:draft.url}))return false;
+  const draft=readSettingsDraft(form),connectionChanged=draft.url.trim()!==settings.openrouterUrl||Boolean(draft.token.trim());
+  settingsDraft=draft;settingsSaving=true;settingsError='';render();
+  const saved=await persist(draft.token.trim()||undefined,{language:draft.language,openrouterUrl:draft.url.trim()});
+  settingsSaving=false;
+  if(!saved){settingsError=settingsLabel('Настройки не сохранены. Ваши изменения остаются здесь; попробуйте ещё раз.','Settings were not saved. Your changes are still here; try again.');render();return false;}
   settingsDraft=null;if(connectionChanged){cloudModels=[];catalogError='';}render();notice(tr("Настройки применены"));return true;
 }
 async function persist(token?:string,snapshot:{language:LanguagePreference;openrouterUrl:string}={language:settings.language,openrouterUrl:settings.openrouterUrl}):Promise<boolean> {
@@ -487,7 +514,7 @@ function clearRecordingTimer(){if(recordingTimer)clearInterval(recordingTimer);r
 async function startRecording(){
   if(busy||active||!platform.audioRecording||!await mayLeaveSettings()||!await mayReplaceRecord())return;
   if(busy||active)return;
-  lastNativeRecordingResult='';nativeRecordingSeconds=null;settingsDraft=null;view='work';recordingPhase='starting';busy=true;status='';recordingStarted=0;render();
+  lastNativeRecordingResult='';nativeRecordingSeconds=null;recordingPausedAt=0;recordingPausedMillis=0;recorderEnvelope.reset();settingsDraft=null;view='work';recordingPhase='starting';busy=true;status='';recordingStarted=0;render();
   try{await startAudioRecording();recordingStarted=Date.now();recordingPhase='recording';recordingTimer=setInterval(()=>{const timer=document.querySelector('#recording-duration');if(timer)timer.textContent=recordingDuration();},250);render();}
   catch(error){recordingPhase='idle';busy=false;render();notice(errorText(error),true);}
 }
@@ -496,6 +523,16 @@ function recordingName(selected:AudioSelection):string {
   const day=currentLanguage()==='ru'?`${pad(date.getDate())}.${pad(date.getMonth()+1)}.${date.getFullYear()}`:`${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}`;
   const extension=(selected.name||selected.path).match(/\.(wav|m4a|webm|ogg|mp3|aac)$/i)?.[1]?.toLowerCase()||(platform.os==='android'?'m4a':'wav');
   return `${tr('Запись')} ${day} ${pad(date.getHours())}.${pad(date.getMinutes())}.${extension}`;
+}
+async function toggleRecordingPause(){
+  if(!['recording','paused'].includes(recordingPhase))return;
+  const paused=recordingPhase==='paused',button=document.querySelector<HTMLButtonElement>('#pause-recording');if(button)button.disabled=true;
+  try{
+    if(externalRecording)await call('recording_quick_control',{action:paused?'resume':'pause'});
+    else if(paused)await resumeAudioRecording();else await pauseAudioRecording();
+    if(paused){if(recordingPausedAt)recordingPausedMillis+=Date.now()-recordingPausedAt;recordingPausedAt=0;}else recordingPausedAt=Date.now();
+    recordingPhase=paused?'recording':'paused';nativeInputLevel=0;render();
+  }catch(error){notice(errorText(error),true);if(button)button.disabled=false;}
 }
 async function stopRecording(){
   if(!['recording','paused'].includes(recordingPhase))return;
@@ -547,20 +584,24 @@ async function loadHistory(id:string) {
 async function renameEntry(id:string) {
   if(busy||document.querySelector('dialog[open]'))return;
   const entry=history.find(item=>item.id===id);if(!entry)return;
+  const parts=recordNameParts(entry.name,entry.inputPath);
   const dialog=document.createElement('dialog');dialog.className='confirmation rename-dialog';
   dialog.setAttribute('aria-labelledby','rename-title');
-  dialog.innerHTML=`${tr("<form><h2 id=\"rename-title\">Переименовать запись</h2><label class=\"field\"><span>Название</span><input name=\"record-name\" value=\"")}${esc(entry.name)}${tr("\" maxlength=\"200\" required autocomplete=\"off\" aria-describedby=\"rename-error\"></label><p id=\"rename-error\" class=\"rename-error\" role=\"alert\" hidden></p><div class=\"rename-actions\"><button type=\"button\" class=\"secondary\" data-cancel>Отмена</button><button type=\"submit\" class=\"primary\">Сохранить</button></div></form>")}`;
+  dialog.innerHTML=`${tr("<form><h2 id=\"rename-title\">Переименовать запись</h2><label class=\"field\"><span>Название</span><input name=\"record-name\" value=\"")}${esc(parts.title)}${tr("\" required autocomplete=\"off\" aria-describedby=\"rename-error\">" )}${parts.extension?`<span class="rename-extension" aria-label="${tr('Формат аудио')}">${esc(parts.extension)}</span>`:''}${tr("</label><p id=\"rename-error\" class=\"rename-error\" role=\"alert\" hidden></p><div class=\"rename-actions\"><button type=\"button\" class=\"secondary\" data-cancel>Отмена</button><button type=\"submit\" class=\"primary\">Сохранить</button></div></form>")}`;
   document.body.append(dialog);
   const input=dialog.querySelector<HTMLInputElement>('input')!,form=dialog.querySelector<HTMLFormElement>('form')!;
+  input.setAttribute('aria-label',tr('Название'));
   const renameError=dialog.querySelector<HTMLElement>('#rename-error')!,saveButton=dialog.querySelector<HTMLButtonElement>('[type=submit]')!,cancelButton=dialog.querySelector<HTMLButtonElement>('[data-cancel]')!;
+  input.maxLength=200-parts.extension.length;
   let saving=false;
-  const close=()=>{dialog.close();dialog.remove();};
+  const previousFocus=document.activeElement as HTMLElement|null;
+  const close=()=>{dialog.close();dialog.remove();if(previousFocus?.isConnected)previousFocus.focus({preventScroll:true});};
   input.addEventListener('input',()=>{input.setCustomValidity('');renameError.hidden=true;});
   cancelButton.onclick=()=>{if(!saving)close();};
   dialog.addEventListener('cancel',event=>{event.preventDefault();if(!saving)close();});
   form.addEventListener('submit',async event=>{
     event.preventDefault();if(saving)return;
-    const name=input.value.trim();input.setCustomValidity(name?'':tr("Введите название записи"));
+    const name=renamedRecordTitle(input.value,parts.extension);input.setCustomValidity(name?'':tr("Введите название записи"));
     if(!form.reportValidity())return;
     if(name===entry.name){close();return;}
     saving=true;saveButton.disabled=true;cancelButton.disabled=true;input.disabled=true;saveButton.textContent=tr("Сохраняем…");
@@ -578,7 +619,7 @@ async function renameEntry(id:string) {
       saving=false;saveButton.disabled=false;cancelButton.disabled=false;input.disabled=false;saveButton.textContent=tr("Сохранить");input.focus();
     }
   });
-  if(platform.mobile||window.innerWidth<=760)cancelButton.setAttribute('autofocus','');dialog.showModal();if(!platform.mobile&&window.innerWidth>760){input.focus();input.select();}else cancelButton.focus();
+  input.setAttribute('autofocus','');dialog.showModal();input.focus();input.select();
 }
 async function deleteEntry(id:string) {
   if(busy)return;const entry=history.find(item=>item.id===id);if(!entry)return;
@@ -625,7 +666,7 @@ function confirmAction(heading:string,message:string,action:string,danger=true):
   });
 }
 
-setupPostprocess({entry:()=>active,transcript:()=>text,saved:()=>resultSaved,busy:()=>busy,render,notice,begin:()=>beginOperation('postprocess',tr('Обрабатываем текст…')),end:endOperation,confirm:confirmAction,updated:entry=>{active=entry;history=history.map(item=>item.id===entry.id?entry:item);},showResults:()=>{outputTab='results';},configure:()=>{void changeView('settings');},copy:copyText,hasToken:()=>settings.hasToken});
+setupPostprocess({entry:()=>active,transcript:()=>text,saved:()=>resultSaved,busy:()=>busy,render,notice,begin:()=>beginOperation('postprocess',tr('Обрабатываем текст…')),end:endOperation,confirm:confirmAction,updated:entry=>{active=entry;history=history.map(item=>item.id===entry.id?entry:item);},showResults:()=>{outputTab='results';},configure:()=>{void changeView('settings','recognition');},copy:copyText,hasToken:()=>settings.hasToken});
 render();
 async function initialize() {
   const initial=await Promise.allSettled([loadRuntimePlatform(),call<Settings>('get_settings'),appVersion()]);
@@ -635,7 +676,7 @@ async function initialize() {
   if(['macos','linux','windows'].includes(platform.os))subscribeAudioDrop(paths=>{if(paths.length){if(paths.length>1)notice(tr("Добавляем первый файл. Остальные можно добавить по одному."));choose(paths[0]);}}).catch(error=>notice(errorText(error),true));
   restoreConfiguration(active);render();
   await Promise.allSettled([refreshHistory(),refreshRuntime()]);ensureRules();
-  if(platform.os==='android'){await syncNativeRecording();await importQuickRecordings();}
+  if(platform.os==='android'){await syncNativeOperation();await syncNativeRecording();await importQuickRecordings();}
   if(!preview)void checkUpdates();
 }
 void initialize();
@@ -643,7 +684,7 @@ void initializeTransfers({refresh:refreshAfterTransfer,busy:()=>busy,setBusy:val
 subscribe<null>('hearfolio-request-restart',()=>{void restartAfterUpdate(false);}).catch(error=>notice(errorText(error),true));
 setInterval(()=>{if(!preview&&Date.now()-lastUpdateCheck>=4*60*60*1000)void checkUpdates();},4*60*60*1000);
 document.addEventListener('visibilitychange',()=>{if(!preview&&document.visibilityState==='visible'&&Date.now()-lastUpdateCheck>=4*60*60*1000)void checkUpdates();});
-subscribe<Progress>('task-progress',payload=>{if(!busy)return;progress={...payload,stage:errorText(payload.stage),elapsed:Math.max(payload.elapsed,Math.floor((Date.now()-operationStarted)/1000))};updateProgress();}).catch(error=>notice(errorText(error),true));
+subscribe<Progress>('task-progress',payload=>{if(!busy||!progress||payload.kind!==progress.kind)return;progress={...payload,stage:errorText(payload.stage),elapsed:Math.max(payload.elapsed,Math.floor((Date.now()-operationStarted)/1000))};updateProgress();}).catch(error=>notice(errorText(error),true));
 subscribe<{text:string}>('partial-text',payload=>{
   if(!busy||progress?.kind!=='transcribe'||!payload.text)return;
   if(!receivedPartial)void call<Settings>('get_settings').then(saved=>{settings=saved;}).catch(()=>{});receivedPartial=true;text=payload.text;resultSaved=false;
@@ -667,7 +708,7 @@ document.addEventListener('keydown',event=>{
   if(key==='enter'&&view==='work'){event.preventDefault();run();}
   if(key==='b'){event.preventDefault();setSidebar(!sidebarCollapsed);}
 });
-window.addEventListener('beforeunload',event=>{if(settingsDraft||hasRuleDraft()||pendingRecording||busy||(text&&!resultSaved))event.preventDefault();});
+window.addEventListener('beforeunload',event=>{if(settingsDraft||settingsSaving||hasTransferDraft()||hasRuleDraft()||pendingRecording||busy||(text&&!resultSaved))event.preventDefault();});
 
 function updateCatalogViewport(){const viewport=window.visualViewport;document.documentElement.style.setProperty('--catalog-height',`${viewport?.height||window.innerHeight}px`);document.documentElement.style.setProperty('--catalog-top',`${viewport?.offsetTop||0}px`);}
 updateCatalogViewport();window.visualViewport?.addEventListener('resize',updateCatalogViewport);window.visualViewport?.addEventListener('scroll',updateCatalogViewport);window.addEventListener('resize',updateCatalogViewport);
@@ -675,11 +716,31 @@ updateCatalogViewport();window.visualViewport?.addEventListener('resize',updateC
 subscribe<{state:string;elapsedSeconds?:number}>('recording-native-state',p=>{if(!['recording','paused'].includes(recordingPhase))return;if(p.elapsedSeconds!==undefined)nativeRecordingSeconds=p.elapsedSeconds;if(p.state==='finished'){clearRecordingTimer();recordingPhase='stopping';render();return;}const next=p.state==='paused'?'paused':p.state==='recording'?'recording':null;if(next&&next!==recordingPhase){recordingPhase=next;render();}}).catch(()=>{});
 type NativeRecordingResult={entry?:Entry;selection?:AudioSelection;error?:string};
 let lastNativeRecordingResult='';
-async function finishNativeRecording(p:NativeRecordingResult){const key=JSON.stringify(p);if(key===lastNativeRecordingResult)return;lastNativeRecordingResult=key;clearRecordingTimer();recordingPhase='idle';recordingStarted=0;busy=false;pendingRecording=p.selection||null;if(p.entry){resetPlayback();active=p.entry;restoreConfiguration(p.entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;view='work';await refreshHistory();}render();if(p.error)notice(errorText(p.error),true);else notice(tr('Запись сохранена'));}
+async function finishNativeRecording(p:NativeRecordingResult){const key=JSON.stringify(p),receipt=p.entry?`recording:${p.entry.id}`:'';if(key===lastNativeRecordingResult||(receipt&&operationHandled(receipt)))return;lastNativeRecordingResult=key;if(receipt)markOperationHandled(receipt);clearRecordingTimer();recordingPhase='idle';recordingStarted=0;busy=false;pendingRecording=p.selection||null;if(p.entry){resetPlayback();active=p.entry;restoreConfiguration(p.entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;view='work';await refreshHistory();}render();if(p.error)notice(errorText(p.error),true);else notice(tr('Запись сохранена'));}
 subscribe<NativeRecordingResult>('recording-native-finished',p=>{void finishNativeRecording(p);}).catch(()=>{});
 let snapshotPolling=false,quickFinishing=false;
 async function finishQuickRecording(){if(quickFinishing)return;quickFinishing=true;try{const entries=await call<Entry[]>('import_quick_recordings');externalRecording=false;recordingPhase='idle';busy=false;clearRecordingTimer();if(entries.length){const entry=entries[entries.length-1];if(!active||resultSaved||!text){resetPlayback();active=entry;restoreConfiguration(entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;}await refreshHistory();notice(tr('Запись сохранена'));}render();}catch(e){if(!String(e).includes('operationBusy')){externalRecording=false;recordingPhase='idle';busy=false;render();notice(errorText(e),true);}}finally{quickFinishing=false;}}
-async function syncNativeRecording(){if(snapshotPolling||document.hidden||platform.os!=='android')return;snapshotPolling=true;try{const p=await call<{state:string;quick?:boolean;elapsedSeconds?:number;level?:number;result?:NativeRecordingResult}>('recording_activity_snapshot');nativeInputLevel=p.level??0;nativeLevelAt=performance.now();const live=p.state==='recording'||p.state==='paused';if(p.quick&&live){if(busy&&recordingPhase==='idle')return;externalRecording=true;busy=true;view='work';const changed=recordingPhase!==p.state;recordingPhase=p.state as 'recording'|'paused';nativeRecordingSeconds=p.elapsedSeconds??0;const timer=document.querySelector('#recording-duration');if(timer)timer.textContent=recordingDuration();if(changed)render();}else if(externalRecording){if(p.state==='finished'){recordingPhase='stopping';await finishQuickRecording();}else if(!live){externalRecording=false;recordingPhase='idle';busy=false;render();}}else if(p.result&&recordingPhase!=='starting'){await finishNativeRecording(p.result);}else if(live&&['recording','paused'].includes(recordingPhase)){nativeRecordingSeconds=p.elapsedSeconds??nativeRecordingSeconds;const next=p.state as 'recording'|'paused';if(next!==recordingPhase){recordingPhase=next;render();}}else if(p.state==='error'&&recordingPhase!=='idle'){await finishNativeRecording({error:'errors.recordingEmpty'});}}catch{/* Poll again on the next foreground tick. */}finally{snapshotPolling=false;}}
+async function syncNativeRecording(){
+  if(snapshotPolling||document.hidden||platform.os!=='android')return;snapshotPolling=true;
+  try{
+    const p=await call<{state:string;quick?:boolean;elapsedSeconds?:number;level?:number;error?:string;interrupted?:boolean;result?:NativeRecordingResult}>('recording_activity_snapshot');
+    nativeInputLevel=p.level??0;nativeLevelAt=performance.now();
+    const live=p.state==='recording'||p.state==='paused';
+    restoreNativeRecordingFlag(live&&!p.quick);
+    if(live){
+      if(busy&&recordingPhase==='idle')return;
+      externalRecording=Boolean(p.quick);busy=true;view='work';
+      const changed=recordingPhase!==p.state;recordingPhase=p.state as 'recording'|'paused';nativeRecordingSeconds=p.elapsedSeconds??0;
+      const timer=document.querySelector('#recording-duration');if(timer)timer.textContent=recordingDuration();
+      if(changed)render();
+    }else if(busy&&recordingPhase==='idle')return;
+    else if(externalRecording){
+      if(p.state==='finished'){recordingPhase='stopping';await finishQuickRecording();if(p.error)notice(errorText(p.error),true);}
+      else{externalRecording=false;recordingPhase='idle';busy=false;render();if(p.error)notice(errorText(p.error),true);}
+    }else if(p.result&&recordingPhase!=='starting')await finishNativeRecording(p.result);
+    else if(p.state==='error'&&recordingPhase!=='idle')await finishNativeRecording({error:p.error||'errors.recordingEmpty'});
+  }catch{/* Poll again on the next foreground tick. */}finally{snapshotPolling=false;}
+}
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)void syncNativeRecording();});
 let lastNativePoll=0;setInterval(()=>{const now=performance.now();if(now-lastNativePoll>=(recordingPhase==='idle'?700:150)){lastNativePoll=now;void syncNativeRecording();}},150);
 
@@ -689,3 +750,49 @@ async function importQuickRecordings(retry=false){if(retry)quickImportFailed=fal
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)void importQuickRecordings(true);});
 
 setInterval(()=>{if(!document.hidden&&platform.os==='android')void importQuickRecordings();},5000);
+
+async function consumeNativeOperation(snapshot:OperationSnapshot){
+  if(!snapshot.id||!snapshot.kind||snapshot.state==='idle')return;
+  if(snapshot.kind!=='transcribe'&&snapshot.kind!=='postprocess'&&snapshot.kind!=='import')return;
+  const pending=observePendingOperation(snapshot);
+  if(pending.terminal)return; // The original UI action now receives this result.
+  if(operationHandled(snapshot.id)||recoveringOperation)return;
+  if(snapshot.state==='running'){
+    if(!pending.matched&&busy&&!nativeOperation)return;
+    const changed=nativeOperation?.id!==snapshot.id;
+    nativeOperation=snapshot;
+    if(!pending.matched&&changed){
+      recoveringOperation=true;
+      try{
+        if(snapshot.recordId){const detail=await call<{entry:Entry;text:string}>('get_history',{id:snapshot.recordId});resetPlayback();active=detail.entry;restoreConfiguration(active);text=detail.text;resultSaved=Boolean(active.outputPath&&detail.text);}
+        beginOperation(snapshot.kind,errorText(snapshot.progress?.stage||`progress.${snapshot.kind}`));
+        view='work';outputTab=snapshot.kind==='postprocess'?'results':'transcript';
+        restorePostprocessActivity(snapshot.recordId||null,snapshot.kind==='postprocess');
+        render();
+      }catch(error){nativeOperation=null;notice(errorText(error),true);}finally{recoveringOperation=false;}
+    }
+    if(snapshot.progress){progress={...snapshot.progress,kind:snapshot.kind,stage:errorText(snapshot.progress.stage)};operationStarted=Date.now()-progress.elapsed*1000;}
+    updateProgress();return;
+  }
+  // A newly opened WebView has no pending invoke. Read the already committed
+  // archive rather than starting another (possibly paid) request.
+  if(busy&&!nativeOperation)return;
+  recoveringOperation=true;
+  try{
+    const imported=snapshot.kind==='import'&&snapshot.state==='finished'?snapshot.result as Entry:null;
+    const id=imported?.id||snapshot.recordId;
+    if(id){const detail=await call<{entry:Entry;text:string}>('get_history',{id});resetPlayback();active=detail.entry;restoreConfiguration(active);text=detail.text;resultSaved=Boolean(active.outputPath&&detail.text);previousResult=null;view='work';outputTab=snapshot.kind==='postprocess'?'results':'transcript';}
+    if(imported)pendingRecording=null;
+    restorePostprocessActivity(null,false);endOperation();
+    await refreshHistory();markOperationHandled(snapshot.id);
+    notice(snapshot.state==='finished'?tr(snapshot.kind==='import'?'Запись сохранена':snapshot.kind==='postprocess'?'Результат сохранён':'Готово'):errorText(snapshot.error||'errors.operationInterrupted'),snapshot.state!=='finished');
+  }catch(error){notice(errorText(error),true);}finally{recoveringOperation=false;}
+}
+async function syncNativeOperation(){
+  if(preview||operationPolling||document.hidden||platform.os!=='android')return;
+  operationPolling=true;
+  try{await consumeNativeOperation(await call<OperationSnapshot>('operation_activity_snapshot'));}catch{/* The persisted snapshot can be read on the next foreground tick. */}finally{operationPolling=false;}
+}
+subscribe<OperationSnapshot>('operation-native-finished',snapshot=>{if(platform.os==='android')void consumeNativeOperation(snapshot);}).catch(()=>{});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)void syncNativeOperation();});
+setInterval(()=>{void syncNativeOperation();},1000);

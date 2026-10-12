@@ -19,12 +19,13 @@ Releases use SemVer derived from Conventional Commits, with a changelog and down
 ## Features
 
 - Import M4A, MP3, WAV, AAC, FLAC, OGG, and MP4 files.
-- Record with the microphone, watch the actual input level, stop and save the audio, or cancel it. Android and desktop record mono PCM WAV.
+- Record with the microphone, watch a measured waveform and timer, pause, resume, save, or cancel. Android and desktop record mono PCM WAV.
 - Transcribe locally with Whisper Tiny, Base, or Small, or Nemotron 3.5 Streaming.
 - Download models from the app with download size, percentage, and estimated time remaining.
 - Connect OpenRouter using a base URL and API token, then choose an audio model from the searchable catalog in the recording. The supported endpoint is selected automatically.
 - See processing stages, elapsed time, and partial transcripts. Available progress details depend on the engine.
-- Browse and search recordings by name, play the original audio, and rename recordings.
+- Browse and search recordings by name, play the original audio, and rename the title with its audio extension preserved.
+- Pair your devices through your own relay server using an invitation code or QR, then accept incoming recordings and track transfer progress.
 - Copy or export transcripts as `.txt` files. Renamed recordings use the new name when exporting text.
 - Run transcription again with another model. A failed retry preserves the previous saved transcript.
 - Create reusable post-processing rules, such as a brief summary, meeting decisions, or action items. Apply a rule with a text model from OpenRouter and keep its result alongside the original transcript.
@@ -113,11 +114,19 @@ Android source builds require the [Tauri Android prerequisites](https://v2.tauri
 
 Android playback uses the system media player, including seeking and duration, rather than depending on WebView audio codecs. The system share sheet lets you send a recording to installed apps such as Telegram. Hearfolio grants the selected recipient temporary access to the shared file; the original remains in its private archive.
 
+## Settings and device transfers
+
+On a phone, Settings opens a list of categories with a back button inside each category. On desktop, categories remain visible beside the selected settings. Unsaved connection and language edits are protected when switching sections.
+
+Open **Devices**, enter your own relay URL and this device's name, and connect to the server. There is no preset relay domain. Use **Pair a device** to show a short-lived invitation QR/code, then scan or enter it on your other device and confirm the request. Both devices must use the same relay. Incoming recordings show the sender and file size; sending shows the recipient, progress, and cancellation. Pausing transfers retains the saved connection and archive.
+
 ## Microphone recording
 
-Select **Record audio** on the new recording screen. Allow microphone access when the operating system asks, then select **Stop and save** to review the audio and choose a transcription model. Cancel discards the capture. A failed save keeps the recording available for another attempt.
+Select **Record audio** on the new recording screen. Allow microphone access when the operating system asks, then use **Pause**, **Resume**, or **Save recording**. Cancel discards the capture. A failed archive save keeps the recording available for another attempt.
 
-Keep the app open while recording; background recording is not supported. Recording audio does not send it to OpenRouter until you start transcription with that service selected.
+Android uses foreground services with persistent notifications for recording, transcription, text processing, and transfers. You can lock the screen after starting an operation. Returning to Hearfolio restores its progress or committed result without repeating a cloud request. If the process is killed, recoverable WAV audio is retained and unfinished processing is reported as interrupted. Recording audio does not send it to OpenRouter until you start transcription with that service selected.
+
+Android capture is limited to four hours, cloud processing and transfers to two hours, and background transfer waiting to twelve hours per session. System restrictions can stop work earlier. **Settings → Background tasks** links to the app's Android battery settings if the device interrupts recording. Force-stopping the app ends its work; it does not restart paid processing automatically.
 
 Android captures uncompressed mono samples through `AudioRecord`, using the standard `MIC` source with device preprocessing and a `DEFAULT` fallback. System automatic gain control is enabled when available; devices without it can still record. The waveform shows measured microphone input. Silence or quiet speech does not trigger a microphone warning. On macOS, Hearfolio explicitly requests microphone permission before starting capture. If access was previously denied, enable Hearfolio under **System Settings → Privacy & Security → Microphone**.
 
@@ -142,7 +151,7 @@ Whisper and Nemotron can run locally after their runtimes and models are install
 
 ## OpenRouter setup
 
-Open Settings and enter:
+Open **Settings → Recognition** and enter:
 
 1. The API base URL, normally `https://openrouter.ai/api/v1`.
 2. Your API token.

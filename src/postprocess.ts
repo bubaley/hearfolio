@@ -17,6 +17,9 @@ const starterRules=()=>[
 ];
 export function setupPostprocess(value:Context){context=value;void subscribe<{recordId:string;runId:string;text:string}>('postprocess-text',payload=>{if(!processing||payload.recordId!==runningRecord||(runId&&payload.runId!==runId))return;runId=payload.runId;partial=payload.text;const element=document.querySelector('#processing-text');if(element){const follow=element.scrollHeight-element.scrollTop-element.clientHeight<90;element.textContent=partial;if(follow)element.scrollTop=element.scrollHeight;}}).catch(error=>context.notice(errorText(error),true));}
 export function hasRuleDraft(){return draftDirty;}
+export function restorePostprocessActivity(recordId:string|null,running:boolean){
+  processing=running;runningRecord=running?recordId||'':'';runId='';partial='';
+}
 export async function mayLeaveRules(){if(!draftDirty)return true;if(!await context.confirm(tr('Правило не сохранено'),tr('Сохраните правило перед уходом или продолжите без изменений.'),tr('Продолжить без изменений'),false))return false;draft=null;draftDirty=false;return true;}
 export async function loadRules(){if(rulesLoading)return;rulesLoading=true;rulesError='';context.render();try{rules=await call<Rule[]>('list_postprocess_rules');rulesLoaded=true;if(!rules.some(rule=>rule.id===chosenRule))chosenRule=rules[0]?.id||'';}catch(error){rulesError=errorText(error);}finally{rulesLoading=false;context.render();}}
 export function ensureRules(){if(!rulesLoaded&&!rulesLoading)void loadRules();}

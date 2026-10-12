@@ -560,11 +560,20 @@ fn read_limited_response(
     response: reqwest::blocking::Response,
     limit: u64,
 ) -> Result<String, String> {
-    let mut body = String::new();
-    response
-        .take(limit + 1)
-        .read_to_string(&mut body)
-        .map_err(|_| "errors.cloudResponseRead")?;
+    let mut reader = response.take(limit + 1);
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        crate::background::check_current()?;
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|_| "errors.cloudResponseRead")?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    let body = String::from_utf8(bytes).map_err(|_| "errors.cloudResponseRead")?;
     if body.len() as u64 > limit {
         return Err("errors.postprocessResponseTooLarge".into());
     }
@@ -599,6 +608,7 @@ pub fn postprocess_text(
     if max_tokens == 0 || input_bound.saturating_add(max_tokens) > selected.context_length {
         return Err("errors.postprocessContextTooLong".into());
     }
+    crate::background::check_current()?;
     let response = client_with_timeout(300)?
         .post(format!("{}/chat/completions", settings.openrouter_url))
         .bearer_auth(&settings.token)
@@ -719,6 +729,7 @@ fn consume_sse(
         Ok(false)
     };
     for line in reader.lines() {
+        crate::background::check_current()?;
         let line = line.map_err(|_| "errors.cloudInterrupted")?;
         if line.is_empty() {
             if event(&mut data)? {
@@ -746,6 +757,7 @@ pub fn transcribe(
     audio: &Path,
     mut update: impl FnMut(&str),
 ) -> Result<String, String> {
+    crate::background::check_current()?;
     if s.token.is_empty() {
         return Err("errors.tokenRequired".into());
     }

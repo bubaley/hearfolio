@@ -7,3 +7,7 @@ export function automaticActions(inbox:Inbox,preferences:TransferPreferences,bus
     receive:preferences.autoReceive&&!busy?inbox.offers.find(p=>!attempted.has(`receive:${p.id}`))?.id:null,
   };
 }
+
+// An address exists only when the user or a saved native connection provided it.
+export function configuredServer(value:string|null|undefined){return value?.trim().replace(/\/+$/,'')||'';}
+export function invitationSeconds(expiresAt:number,now:number){return Math.max(0,Math.ceil((expiresAt-now)/1000));}

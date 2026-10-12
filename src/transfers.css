@@ -1,0 +1,114 @@
+/* Device transfer follows the native app's surfaces and system typography. */
+#devices-content {overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;padding:2px 4px 24px 2px}
+.devices-overview {max-width:760px;margin:0 auto}
+.transfer-local-device {display:flex;align-items:center;gap:16px;padding:20px;background:var(--subtle);border:1px solid var(--line);border-radius:12px;margin-bottom:26px}
+.transfer-device-icon,.transfer-setup-icon,.transfer-offer-icon {display:grid;place-items:center;width:42px;height:42px;background:var(--canvas);border:1px solid var(--line);border-radius:10px;flex:none;color:var(--muted)}
+.transfer-device-icon svg,.transfer-setup-icon svg {width:23px;height:23px}
+.transfer-local-device>div {display:grid;gap:5px;flex:1;min-width:0}
+.transfer-local-device strong {font-size:14px;font-weight:600;overflow-wrap:anywhere}
+.transfer-local-device small,.transfer-connection-caption {font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+.transfer-connection-caption {display:flex;align-items:center;gap:7px}
+.transfer-local-device>.text-button {flex:none;min-height:36px}
+.transfer-section-heading {display:flex;align-items:center;justify-content:space-between;gap:12px;padding-bottom:10px}
+.transfer-section-heading h2 {font-size:13px}
+.devices-overview .devices-list {border:0;padding:0;overflow:visible;min-height:0}
+.devices-overview .device-row {padding:17px 0;gap:14px}
+.devices-overview .device-row strong {font-size:13px;font-weight:500}
+.devices-overview .device-row small {font-size:12px;line-height:1.5}
+.devices-overview .device-row .icon-button {width:36px;height:36px}
+.device-dot {display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--faint);flex:none}
+.device-dot.online {background:var(--success)}
+.transfer-empty {display:grid;justify-items:center;text-align:center;padding:34px 20px;gap:10px;background:var(--subtle);border-radius:10px;margin:10px 0 18px}
+.transfer-empty>span {color:var(--muted)}
+.transfer-empty>span svg {width:30px;height:30px}
+.transfer-empty h3 {font-size:13px;font-weight:500;margin:0}
+.transfer-empty p {font-size:12px;line-height:1.7;max-width:390px;color:var(--muted)}
+.transfer-setup {max-width:440px;margin:12px auto 0}
+.transfer-setup-icon {width:48px;height:48px;margin-bottom:18px;background:var(--subtle)}
+.transfer-setup h2 {font-size:18px;letter-spacing:-.3px;margin-bottom:10px}
+.transfer-setup>p {font-size:13px;line-height:1.7;color:var(--muted);margin-bottom:20px}
+.transfer-tabs {display:flex;gap:3px;background:var(--subtle);padding:4px;border:1px solid var(--line);border-radius:8px;margin:18px 0 20px}
+.transfer-tabs button {flex:1;min-width:0;min-height:34px;border-radius:5px;font-size:12px;padding:5px 8px}
+.transfer-tabs button[aria-pressed='true'] {background:var(--canvas);box-shadow:0 1px 4px #0001;font-weight:500}
+.transfer-setup form,.transfer-settings form,.share-dialog form {display:grid;gap:16px;margin:0}
+.transfer-setup .field,.transfer-settings .field {margin:0}
+.transfer-setup .field>small,.transfer-settings .field>small,.share-dialog .field>small {font-size:11px;line-height:1.6;color:var(--muted)}
+.transfer-setup form>.primary,.share-dialog form>.primary {min-height:40px;margin-top:2px}
+.transfer-access {font-size:12px;color:var(--muted)}
+.transfer-access summary,.transfer-advanced summary {cursor:pointer;padding:8px 0;min-height:34px;line-height:1.5}
+.transfer-access .field {margin-top:10px}
+.transfer-setup>[data-scan-invitation] {width:100%;margin-top:12px;min-height:40px}
+.transfer-feedback {font-size:12px;line-height:1.65;color:var(--muted);background:var(--subtle);padding:12px 14px;border-radius:8px;margin:14px 0;overflow-wrap:anywhere}
+.transfer-feedback .secondary {display:flex;margin-top:10px;min-height:36px}
+.transfer-settings>p {font-size:12px;color:var(--muted);margin:0 0 18px;line-height:1.7}
+.transfer-settings>.transfer-connection-caption {margin-bottom:18px;padding:12px 14px;border:1px solid var(--line);border-radius:8px;background:var(--subtle)}
+.transfer-settings form>.secondary {justify-self:start;min-height:38px}
+.transfer-advanced {border-top:1px solid var(--line);margin-top:26px;padding-top:8px;font-size:13px}
+.transfer-advanced .transfer-preferences {margin-top:8px;padding-top:0;border:0}
+.transfer-advanced .transfer-preferences h2 {display:none}
+.transfer-preference input:disabled+i {opacity:.4}
+.share-dialog {width:min(470px,calc(100vw - 32px));padding:24px;max-height:calc(100dvh - 48px);font-size:13px;border-radius:13px}
+.share-heading {margin-bottom:16px}
+.share-heading .icon-button {width:32px;height:32px;border-radius:7px}
+.share-heading .icon-button:hover {background:var(--hover)}
+.share-heading h2 {font-size:18px}
+.share-dialog p {line-height:1.65}
+.share-help {font-size:12px;color:var(--muted);margin:12px 0 18px;line-height:1.65}
+.share-record-detail {display:flex;align-items:center;gap:13px;padding:14px;background:var(--subtle);border-radius:9px;margin-bottom:16px}
+.share-record-detail>svg {color:var(--muted);width:24px;height:24px}
+.share-record-detail>div {display:grid;gap:5px;min-width:0}
+.share-record {font-size:13px;font-weight:500;display:block;margin:0}
+.share-record-detail small {font-size:11px;line-height:1.5}
+.share-peer {border-radius:9px;padding:15px;background:var(--canvas);min-height:69px}
+.share-peer span {font-size:13px;font-weight:500;overflow-wrap:anywhere}
+.share-peer small {display:flex;align-items:center;gap:6px;font-size:11px;line-height:1.5}
+.share-peer:disabled {opacity:.65}
+.share-peer:not(:disabled):hover {border-color:var(--accent);background:var(--accent-soft)}
+.share-dialog .share-code {margin-bottom:18px}
+.share-code strong {font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-weight:600;font-size:30px}
+.share-code small {font-size:11px}
+.share-renew {margin:0 auto;min-height:36px}
+.share-dialog .share-qr {margin:12px auto 16px}
+.share-dialog #share-back {margin-bottom:5px}
+.transfer-offer {display:flex;align-items:center;gap:12px;padding:16px 0;flex-wrap:nowrap}
+.transfer-offer-info {display:grid;gap:5px;flex:1;min-width:0}
+.transfer-offer-info strong {font-size:12px;font-weight:500;overflow-wrap:anywhere}
+.transfer-offer-info small {font-size:11px;line-height:1.6;color:var(--muted)}
+.transfer-offer-actions {display:flex;gap:8px;align-items:center;flex:none}
+.transfer-offer-actions button {min-height:36px}
+.transfer-pending {display:flex;align-items:center;gap:18px;background:var(--subtle);border-radius:9px;padding:16px;margin:18px 0}
+.transfer-pending>div:first-child {flex:1;min-width:0;display:grid;gap:5px}
+.transfer-pending strong {font-size:12px;font-weight:500}
+.transfer-pending p {font-size:12px;overflow-wrap:anywhere}
+.transfer-pending small {font-size:11px;color:var(--muted)}
+.transfer-bar {max-height:40vh;overflow-y:auto}
+.transfer-bar .transfer-offer {max-width:900px;margin:auto}
+@media(max-width:600px){
+ #devices-content {padding:0 0 20px}
+ .transfer-local-device {display:grid;grid-template-columns:42px minmax(0,1fr);padding:16px 14px;gap:10px 12px;margin-bottom:20px}
+ .transfer-local-device>.text-button {grid-column:2;margin:0;padding:0;justify-self:start;justify-content:flex-start}
+ .transfer-section-heading {align-items:flex-start;flex-direction:column;gap:12px}
+ .transfer-section-heading>.secondary {min-height:40px}
+ .devices-overview .device-row {gap:10px}
+ .devices-overview .device-row small {font-size:11px}
+ .transfer-offer {flex-wrap:wrap}
+ .transfer-offer-info {flex-basis:calc(100% - 60px)}
+ .transfer-offer-actions {width:100%;justify-content:flex-end}
+ .transfer-pending {align-items:flex-start;flex-direction:column;gap:12px}
+ .transfer-tabs button {font-size:11px;min-height:38px}
+ .transfer-setup {margin:0 auto;padding-bottom:16px}
+ .share-dialog {position:fixed;inset:auto 0 0;width:100%;max-width:100%;max-height:calc(100dvh - 24px);margin:0;padding:22px 20px calc(22px + env(safe-area-inset-bottom));border-radius:17px 17px 0 0;border-bottom:0}
+ .share-dialog .icon-button {width:40px;height:40px}
+ .share-dialog form>.primary,.share-dialog .secondary {min-height:42px}
+ .share-code strong {font-size:28px;letter-spacing:3px}
+ .transfer-bar {padding:10px 16px}
+}
+@media(prefers-reduced-motion:reduce){.transfer-preference i::after{transition:none}}
+.transfer-disconnect {margin-top:14px;min-height:36px}
+.transfer-pause-help {font-size:11px!important;line-height:1.6!important;margin:4px 0 0!important;color:var(--muted)}
+.transfer-operation {display:flex;align-items:center;gap:16px;padding:12px 0;font-size:12px}
+.transfer-operation>div {display:grid;gap:6px;flex:1;min-width:0}
+.transfer-operation strong {font-weight:500}
+.transfer-operation small {color:var(--muted);font-size:11px}
+.transfer-operation progress {width:100%;height:5px;accent-color:var(--accent)}
+.transfer-operation>.text-button {min-height:36px;flex:none}

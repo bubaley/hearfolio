@@ -168,6 +168,10 @@ fn emit(
     total: u64,
     elapsed: u64,
 ) {
+    background::operation_progress(
+        kind,
+        serde_json::json!({"kind":kind,"stage":stage,"current":current,"total":total,"elapsed":elapsed}),
+    );
     let _ = app.emit(
         "task-progress",
         Progress {
@@ -421,7 +425,10 @@ async fn import_audio(
     let job = JobGuard::acquire()?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
-        import_audio_sync(&app, path, name, configuration)
+        let mut operation = background::OperationGuard::start(&app, "import", None, false)?;
+        let result = import_audio_sync(&app, path, name, configuration);
+        operation.finish(&result);
+        result
     })
     .await
     .map_err(|e| format!("errors.operationFailed|{e}"))?
@@ -468,15 +475,32 @@ fn import_audio_with_id(
     {
         return Err("errors.audioFormatUnsupported".into());
     }
-    let id = stable_id.unwrap_or_else(|| {
-        format!(
-            "hearing-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        )
-    });
+    let id = stable_id
+        .or_else(|| recording::allocated_recording_id(source))
+        .unwrap_or_else(|| {
+            format!(
+                "hearing-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            )
+        });
+    if !is_uri {
+        let existing = {
+            let _lock = history_lock()?;
+            read_history_at(&base()?)?
+                .into_iter()
+                .find(|entry| entry.id == id)
+        };
+        if let Some(entry) = existing {
+            if transfer::hash_file(source)? != transfer::hash_file(Path::new(&entry.input_path))? {
+                return Err("errors.audioRead".into());
+            }
+            recording::imported(source);
+            return Ok(entry);
+        }
+    }
     let staging = base()?.join("temp").join(format!("{id}-import.audio"));
     let mut input = platform::open_audio(&app, &path)?;
     let total = input.metadata().map(|metadata| metadata.len()).unwrap_or(0);
@@ -487,6 +511,7 @@ fn import_audio_with_id(
     let mut buffer = [0u8; 1024 * 1024];
     let copy_result = (|| -> Result<(), String> {
         loop {
+            background::check_current()?;
             let n = input
                 .read(&mut buffer)
                 .map_err(|e| format!("errors.operationFailed|{e}"))?;
@@ -943,198 +968,207 @@ async fn transcribe(
     let job = JobGuard::acquire()?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
-        let settings = cloud::load()?;
-        let entries = read_history()?;
-        let index = entries
-            .iter()
-            .position(|e| e.id == id)
-            .ok_or("errors.recordMissing")?;
-        let mut configuration = configuration
-            .or_else(|| entries[index].configuration.clone())
-            .unwrap_or_else(|| {
-                if let Some(model) = &entries[index].model {
-                    if let Some(id) = model.strip_prefix("openrouter/") {
+        let mut operation = background::OperationGuard::start(&app, "transcribe", Some(&id), true)?;
+        let result = (|| {
+            let settings = cloud::load()?;
+            let entries = read_history()?;
+            let index = entries
+                .iter()
+                .position(|e| e.id == id)
+                .ok_or("errors.recordMissing")?;
+            let mut configuration = configuration
+                .or_else(|| entries[index].configuration.clone())
+                .unwrap_or_else(|| {
+                    if let Some(model) = &entries[index].model {
+                        if let Some(id) = model.strip_prefix("openrouter/") {
+                            return RecognitionConfig {
+                                provider: "openrouter".into(),
+                                model: id.into(),
+                                mode: "streaming".into(),
+                            };
+                        }
                         return RecognitionConfig {
-                            provider: "openrouter".into(),
-                            model: id.into(),
-                            mode: "streaming".into(),
+                            provider: "local".into(),
+                            model: model.clone(),
+                            mode: "local".into(),
                         };
                     }
-                    return RecognitionConfig {
-                        provider: "local".into(),
-                        model: model.clone(),
-                        mode: "local".into(),
-                    };
-                }
-                settings.last_configuration.clone()
-            });
-        platform::validate_configuration(&configuration)?;
-        cloud::normalize_configuration(&settings, &mut configuration)?;
-        {
-            let _lock = history_lock()?;
-            update_configuration_at(&base()?, &id, configuration.clone())?;
-        }
-        let model = configuration.model.clone();
-        let input = PathBuf::from(&entries[index].input_path);
-        if !input.is_file() {
-            return Err("errors.audioMissing".into());
-        }
-        if configuration.provider == "openrouter" {
-            emit(&app, "transcribe", "progress.sendCloudAudio", 0, 0, 0);
-            let start = Instant::now();
-            let chunk_dir = base()?.join("temp").join(format!("{id}-cloud-{}", clock()));
-            fs::create_dir_all(&chunk_dir).map_err(|_| "errors.audioPrepare")?;
-            let result = (|| {
-                emit(&app, "transcribe", "progress.prepareAudio", 0, 0, 0);
-                let chunks = audio::prepare_cloud_chunks(&input, &chunk_dir, |current, total| {
-                    emit(
-                        &app,
-                        "transcribe",
-                        "progress.prepareAudio",
-                        current,
-                        total,
-                        start.elapsed().as_secs(),
-                    )
-                })?;
-                if chunks.is_empty() {
-                    return Err("errors.audioEmpty".into());
-                }
-                let mut parts = Vec::new();
-                let mut promoted = false;
-                for (index, chunk) in chunks.iter().enumerate() {
-                    emit(
-                        &app,
-                        "transcribe",
-                        "progress.sendCloudChunk",
-                        index as u64,
-                        chunks.len() as u64,
-                        start.elapsed().as_secs(),
-                    );
-                    let prior = parts.join("\n");
-                    let text = cloud::transcribe(&settings, &configuration, chunk, |text| {
-                        if !promoted && !text.trim().is_empty() {
-                            promoted = cloud::mark_working(&configuration).is_ok();
-                        }
-                        partial(
-                            &app,
-                            &format!(
-                                "{}{}{}",
-                                prior,
-                                if prior.is_empty() { "" } else { "\n" },
-                                text
-                            ),
-                        );
+                    settings.last_configuration.clone()
+                });
+            platform::validate_configuration(&configuration)?;
+            cloud::normalize_configuration(&settings, &mut configuration)?;
+            {
+                let _lock = history_lock()?;
+                update_configuration_at(&base()?, &id, configuration.clone())?;
+            }
+            let model = configuration.model.clone();
+            let input = PathBuf::from(&entries[index].input_path);
+            if !input.is_file() {
+                return Err("errors.audioMissing".into());
+            }
+            if configuration.provider == "openrouter" {
+                emit(&app, "transcribe", "progress.sendCloudAudio", 0, 0, 0);
+                let start = Instant::now();
+                let chunk_dir = base()?.join("temp").join(format!("{id}-cloud-{}", clock()));
+                fs::create_dir_all(&chunk_dir).map_err(|_| "errors.audioPrepare")?;
+                let result = (|| {
+                    emit(&app, "transcribe", "progress.prepareAudio", 0, 0, 0);
+                    let chunks =
+                        audio::prepare_cloud_chunks(&input, &chunk_dir, |current, total| {
+                            emit(
+                                &app,
+                                "transcribe",
+                                "progress.prepareAudio",
+                                current,
+                                total,
+                                start.elapsed().as_secs(),
+                            )
+                        })?;
+                    if chunks.is_empty() {
+                        return Err("errors.audioEmpty".into());
+                    }
+                    let mut parts = Vec::new();
+                    let mut promoted = false;
+                    for (index, chunk) in chunks.iter().enumerate() {
+                        background::check_current()?;
                         emit(
                             &app,
                             "transcribe",
-                            "progress.recognizeCloud",
+                            "progress.sendCloudChunk",
                             index as u64,
                             chunks.len() as u64,
                             start.elapsed().as_secs(),
                         );
-                    })?;
-                    parts.push(text);
-                    emit(
-                        &app,
-                        "transcribe",
-                        "progress.recognizedChunks",
-                        (index + 1) as u64,
-                        chunks.len() as u64,
-                        start.elapsed().as_secs(),
-                    );
+                        let prior = parts.join("\n");
+                        let text = cloud::transcribe(&settings, &configuration, chunk, |text| {
+                            if !promoted && !text.trim().is_empty() {
+                                promoted = cloud::mark_working(&configuration).is_ok();
+                            }
+                            partial(
+                                &app,
+                                &format!(
+                                    "{}{}{}",
+                                    prior,
+                                    if prior.is_empty() { "" } else { "\n" },
+                                    text
+                                ),
+                            );
+                            emit(
+                                &app,
+                                "transcribe",
+                                "progress.recognizeCloud",
+                                index as u64,
+                                chunks.len() as u64,
+                                start.elapsed().as_secs(),
+                            );
+                        })?;
+                        parts.push(text);
+                        emit(
+                            &app,
+                            "transcribe",
+                            "progress.recognizedChunks",
+                            (index + 1) as u64,
+                            chunks.len() as u64,
+                            start.elapsed().as_secs(),
+                        );
+                    }
+                    Ok::<String, String>(parts.join("\n"))
+                })();
+                let _ = fs::remove_dir_all(chunk_dir);
+                let text = result?;
+                cloud::mark_working(&configuration)?;
+                background::check_current()?;
+                save_transcript(&id, format!("openrouter/{}", configuration.model), &text)?;
+                emit(
+                    &app,
+                    "transcribe",
+                    "progress.done",
+                    1,
+                    1,
+                    start.elapsed().as_secs(),
+                );
+                return Ok(text);
+            }
+            if !model_path(&model)?.exists() {
+                return Err("errors.modelDownloadRequired".into());
+            }
+            let ffmpeg = bin("ffmpeg").ok_or("errors.ffmpegMissing")?;
+            let temp = base()?.join("temp");
+            let wav = temp.join(format!(
+                "{id}.{}",
+                if model == "nemotron-3.5" {
+                    "pcm"
+                } else {
+                    "wav"
                 }
-                Ok::<String, String>(parts.join("\n"))
+            ));
+            let log = temp.join(format!("{id}.log"));
+            let prefix = temp.join(format!("{id}-result"));
+            let result = (|| {
+                emit(&app, "transcribe", "progress.prepareAudio", 0, 0, 0);
+                let mut c = Command::new(ffmpeg);
+                c.args(["-y", "-v", "error", "-i"]).arg(&input).args([
+                    "-ar",
+                    "16000",
+                    "-ac",
+                    "1",
+                    "-c:a",
+                    "pcm_s16le",
+                ]);
+                if model == "nemotron-3.5" {
+                    c.args(["-f", "s16le"]);
+                }
+                c.arg(&wav);
+                let duration = audio_duration(&input).unwrap_or(0.0);
+                let estimated = (duration * 32_000.0) as u64;
+                monitored(
+                    c,
+                    &app,
+                    "transcribe",
+                    "progress.prepareAudio",
+                    &log,
+                    estimated,
+                    Some(&wav),
+                    false,
+                )?;
+                emit(&app, "transcribe", "progress.loadModel", 0, 0, 0);
+                let text = if model == "nemotron-3.5" {
+                    stream_nemotron(&app, &wav, &log, &configuration)?
+                } else {
+                    let exe = bin("whisper-cli").ok_or("errors.whisperMissing")?;
+                    let mut c = Command::new(exe);
+                    c.arg("-m")
+                        .arg(model_path(&model)?)
+                        .arg("-f")
+                        .arg(&wav)
+                        .arg("-otxt")
+                        .arg("-of")
+                        .arg(&prefix)
+                        .arg("-pp");
+                    let live = temp.join(format!("{id}-live.log"));
+                    let run_result = monitored_whisper(c, &app, &log, &live, &configuration);
+                    let _ = fs::remove_file(live);
+                    run_result?;
+                    let output = prefix.with_extension("txt");
+                    let text = fs::read_to_string(&output)
+                        .map_err(|e| format!("errors.transcriptRead|{e}"))?;
+                    let _ = fs::remove_file(output);
+                    text
+                };
+                if text.trim().is_empty() {
+                    return Err("errors.emptyTranscript".into());
+                }
+                cloud::mark_working(&configuration)?;
+                background::check_current()?;
+                save_transcript(&id, model, text.trim())?;
+                emit(&app, "transcribe", "progress.done", 1, 1, 0);
+                Ok(text.trim().to_string())
             })();
-            let _ = fs::remove_dir_all(chunk_dir);
-            let text = result?;
-            cloud::mark_working(&configuration)?;
-            save_transcript(&id, format!("openrouter/{}", configuration.model), &text)?;
-            emit(
-                &app,
-                "transcribe",
-                "progress.done",
-                1,
-                1,
-                start.elapsed().as_secs(),
-            );
-            return Ok(text);
-        }
-        if !model_path(&model)?.exists() {
-            return Err("errors.modelDownloadRequired".into());
-        }
-        let ffmpeg = bin("ffmpeg").ok_or("errors.ffmpegMissing")?;
-        let temp = base()?.join("temp");
-        let wav = temp.join(format!(
-            "{id}.{}",
-            if model == "nemotron-3.5" {
-                "pcm"
-            } else {
-                "wav"
-            }
-        ));
-        let log = temp.join(format!("{id}.log"));
-        let prefix = temp.join(format!("{id}-result"));
-        let result = (|| {
-            emit(&app, "transcribe", "progress.prepareAudio", 0, 0, 0);
-            let mut c = Command::new(ffmpeg);
-            c.args(["-y", "-v", "error", "-i"]).arg(&input).args([
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                "-c:a",
-                "pcm_s16le",
-            ]);
-            if model == "nemotron-3.5" {
-                c.args(["-f", "s16le"]);
-            }
-            c.arg(&wav);
-            let duration = audio_duration(&input).unwrap_or(0.0);
-            let estimated = (duration * 32_000.0) as u64;
-            monitored(
-                c,
-                &app,
-                "transcribe",
-                "progress.prepareAudio",
-                &log,
-                estimated,
-                Some(&wav),
-                false,
-            )?;
-            emit(&app, "transcribe", "progress.loadModel", 0, 0, 0);
-            let text = if model == "nemotron-3.5" {
-                stream_nemotron(&app, &wav, &log, &configuration)?
-            } else {
-                let exe = bin("whisper-cli").ok_or("errors.whisperMissing")?;
-                let mut c = Command::new(exe);
-                c.arg("-m")
-                    .arg(model_path(&model)?)
-                    .arg("-f")
-                    .arg(&wav)
-                    .arg("-otxt")
-                    .arg("-of")
-                    .arg(&prefix)
-                    .arg("-pp");
-                let live = temp.join(format!("{id}-live.log"));
-                let run_result = monitored_whisper(c, &app, &log, &live, &configuration);
-                let _ = fs::remove_file(live);
-                run_result?;
-                let output = prefix.with_extension("txt");
-                let text = fs::read_to_string(&output)
-                    .map_err(|e| format!("errors.transcriptRead|{e}"))?;
-                let _ = fs::remove_file(output);
-                text
-            };
-            if text.trim().is_empty() {
-                return Err("errors.emptyTranscript".into());
-            }
-            cloud::mark_working(&configuration)?;
-            save_transcript(&id, model, text.trim())?;
-            emit(&app, "transcribe", "progress.done", 1, 1, 0);
-            Ok(text.trim().to_string())
+            let _ = fs::remove_file(wav);
+            let _ = fs::remove_file(log);
+            result
         })();
-        let _ = fs::remove_file(wav);
-        let _ = fs::remove_file(log);
+        operation.finish(&result);
         result
     })
     .await
@@ -1213,7 +1247,14 @@ pub fn run() {
             list_history,
             import_audio,
             background::transfer_background,
+            background::transfer_activity_snapshot,
+            background::cancel_transfer_activity,
             recording::recording_activity_snapshot,
+            recording::pause_audio_recording,
+            recording::resume_audio_recording,
+            recording::open_android_battery_settings,
+            background::operation_activity_snapshot,
+            background::cancel_background_operation,
             recording::import_quick_recordings,
             recording::recording_quick_control,
             update_record_configuration,

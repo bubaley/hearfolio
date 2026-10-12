@@ -8,6 +8,12 @@ export function setLanguage(value: LanguagePreference,system?:'ru'|'en') { prefe
 export function locale() { return currentLanguage()==='ru'?'ru-RU':'en-US'; }
 // Only translate static UI fragments. User names, transcripts, model IDs and paths never pass through this table.
 const messages: Record<string,string> = {
+  'Диктофон':'Recorder',
+  'Формат аудио':'Audio format',
+  'Сохранить запись':'Save recording',
+  'Продолжить':'Resume',
+  'Завершаем отмену…':'Cancelling…',
+  'Выполняем…':'Working…',
   "Правила обработки":"Text processing rules",
   "Правила":"Rules",
   "Сохраните инструкции, чтобы получать нужный результат из расшифровки.":"Save instructions to turn transcripts into the results you need.",
@@ -191,6 +197,7 @@ export function countLabel(count:number,kind:'record'|'word') {
 const errorMessages:Record<string,[string,string]>={
   transferBackgroundUnavailable: ['Не удалось запустить фоновую передачу. Откройте приложение и повторите.','Could not start the background transfer. Open the app and retry.'],
   transferCancelled: ['Передача отменена','Transfer cancelled'],
+  transferInterrupted:['Система прервала передачу. Сохранённые записи остались в архиве. Повторите передачу, когда будете готовы.','The system interrupted the transfer. Saved recordings remain in your archive. Retry when you are ready.'],
   cameraPermissionDenied:['Разрешите Hearfolio доступ к камере в настройках телефона. Код можно ввести вручную.','Allow Hearfolio camera access in your phone settings. You can also enter the code manually.'],
   qrScanFailed:['Не удалось запустить сканер. Проверьте доступ к камере или введите код вручную.','Could not start the scanner. Check camera access or enter the code manually.'],
   qrInvitationInvalid:['Это не QR-код приглашения Hearfolio. Создайте приглашение в разделе «Устройства» на другом устройстве.','This is not a Hearfolio invitation QR. Create an invitation in Devices on your other device.'],
@@ -218,6 +225,7 @@ const errorMessages:Record<string,[string,string]>={
   restartFailed:['Не удалось перезапустить приложение. Закройте его и откройте снова.','Could not restart the app. Close it and open it again.'],
   recordingDiscard:['Не удалось удалить записанное аудио. Повторите попытку.','Could not delete the recorded audio. Try again.'],
   recordingEmpty:['Запись не содержит аудио. Запишите ещё раз.','The recording contains no audio. Record again.'],
+  recordingInterrupted:['Система прервала запись. Восстановленная часть аудио сохранена, если её удалось прочитать.','The system interrupted recording. Recoverable audio has been saved where available.'],
   localUnavailableMobile:['На Android доступно распознавание через OpenRouter.','Transcription on Android is available through OpenRouter.'],
   storageChangeUnavailableMobile:['На Android архив хранится в папке приложения.','On Android, the archive is stored in the app folder.'],
   audioPathInvalid:['Не удалось открыть выбранный аудиофайл. Выберите его снова.','Could not open the selected audio file. Choose it again.'],
@@ -271,6 +279,11 @@ const errorMessages:Record<string,[string,string]>={
   "nemotronStream":["Не удалось получить текст от Nemotron.", "Could not receive text from Nemotron."],
   "nemotronTimeout":["Nemotron не ответил вовремя.", "Nemotron did not respond in time."],
   "operationBusy":["Дождитесь завершения текущей операции.", "Wait for the current operation to finish."],
+  "transferServerRequired":["Укажите адрес вашего сервера передачи.", "Enter your transfer server address."],
+  "operationBackgroundUnavailable":["Не удалось запустить фоновую обработку. Откройте приложение и повторите.", "Could not start background processing. Open the app and try again."],
+  "operationCancelled":["Обработка отменена. Сохранённые записи и результаты остались в архиве.", "Processing cancelled. Saved recordings and results remain in your archive."],
+  "operationInterrupted":["Система прервала обработку. Аудио осталось в архиве. Запустите обработку ещё раз, когда будете готовы.", "The system interrupted processing. The audio remains in your archive. Restart processing when you are ready."],
+  "operationTimeout":["Превышено время фоновой обработки. Аудио осталось в архиве.", "Background processing timed out. The audio remains in your archive."],
   "operationFailed":["Не удалось завершить операцию. Повторите попытку.", "Could not complete the operation. Try again."],
   "processFailed":["Движок распознавания завершился с ошибкой.", "The transcription engine failed."],
   "providerUnknown":["Этот провайдер не поддерживается.", "This provider is not supported."],
