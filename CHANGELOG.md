@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.1 (2026-10-12)
+
+### Fixes and performance
+
+- **android:** preserve recorder sessions and simplify sharing ([2379058](https://github.com/bubaley/hearfolio/commit/2379058313d6045ccc8170a2e1931a205539db7f))
+
 ## 0.6.0 (2026-10-12)
 
 ### Features
