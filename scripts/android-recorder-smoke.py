@@ -39,6 +39,8 @@ class Smoke:
         self.socket = None
         self.forward = None
         self.snapshots = []
+        self.pcm_readiness = []
+        self.events = []
 
     def adb(self, *command, binary=False, check=True):
         serial = ['-s', self.args.serial] if self.args.serial else []
@@ -86,12 +88,13 @@ class Smoke:
         self.wait(lambda: self.evaluate(f'!!document.querySelector({json.dumps(selector)}) && !document.querySelector({json.dumps(selector)}).disabled'), f'enabled button {selector}')
         self.evaluate(f'document.querySelector({json.dumps(selector)}).click()')
 
-    def wait(self, predicate, label, timeout=35):
+    def wait(self, predicate, label, timeout=35, check_foreground=True):
         deadline = time.monotonic() + timeout
         last = None
         while time.monotonic() < deadline:
             try:
-                self.foreground()
+                if check_foreground:
+                    self.foreground()
                 value = predicate()
                 if value:
                     return value
@@ -118,6 +121,54 @@ class Smoke:
     def history_entry(self, identifier):
         return next((entry for entry in self.invoke('list_history') if entry['id'] == identifier), None)
 
+    def native_journal(self, source):
+        return json.loads(self.adb('exec-out', 'run-as', self.args.package, 'cat', source + '.state.json'))
+
+    def event(self, action, status=None):
+        self.events.append({'action': action, 'monotonicSeconds': time.monotonic(), 'status': status})
+
+    def reconnect(self):
+        old_forward = self.forward
+        self.wait(self.connect, 'debug WebView after foreground return', timeout=30)
+        if old_forward and old_forward != self.forward:
+            self.adb('forward', '--remove', f'tcp:{old_forward}', check=False)
+
+    def background_capture(self, source):
+        for mode in ['screen-off', 'home']:
+            baseline = self.native_journal(source)
+            self.event(mode + '-begin', baseline)
+            if mode == 'screen-off':
+                self.adb('shell', 'input', 'keyevent', '223')  # KEYCODE_SLEEP
+            else:
+                self.adb('shell', 'input', 'keyevent', '3')  # KEYCODE_HOME
+            time.sleep(2)
+            def advanced():
+                status = self.native_journal(source)
+                assert status['path'] == source and status['state'] == 'recording', status
+                return status if status.get('elapsedMillis', 0) > baseline.get('elapsedMillis', 0) else None
+            # Foreground is intentionally absent here; read the service journal
+            # directly, without calling the WebView or any Tauri command.
+            status = self.wait(advanced, mode + ' native capture progress', timeout=12, check_foreground=False)
+            self.event(mode + '-progress', status)
+            if mode == 'screen-off':
+                self.adb('shell', 'input', 'keyevent', '224')  # KEYCODE_WAKEUP
+                self.adb('shell', 'input', 'keyevent', '82')  # unlock emulator
+            else:
+                self.adb('shell', 'am', 'start', '-W', '-f', '0x24000000', '-n', self.args.package + '/.MainActivity')
+            def foreground_restored():
+                try:
+                    self.foreground()
+                    return True
+                except RuntimeError as error:
+                    if 'crash detected' in str(error):
+                        raise
+                    return False
+            self.wait(foreground_restored, 'foreground restored', timeout=15, check_foreground=False)
+            self.reconnect()
+            restored = self.wait(lambda: self.state('recording'), 'same recording restored')
+            assert restored['path'] == source, 'Background return replaced the recording session'
+            self.event(mode + '-foreground-restored', restored)
+
     def recording(self, pause=False):
         self.click('#start-recording')
         status = self.wait(lambda: self.state('recording'), 'native recording state')
@@ -130,7 +181,17 @@ class Smoke:
         native = self.wait(measured_journal, 'measured native journal')
         assert native['path'] == source and native['state'] == 'recording', native
         assert native.get('elapsedMillis', 0) > 0, native
-        assert len(self.adb('exec-out', 'run-as', self.args.package, 'cat', source, binary=True)) > 44, 'No PCM captured'
+        def flushed_pcm():
+            audio = self.adb('exec-out', 'run-as', self.args.package, 'cat', source, binary=True)
+            observation = {'path': source, 'bytes': len(audio), 'headerHex': audio[:44].hex(), 'elapsedMillis': native.get('elapsedMillis')}
+            self.pcm_readiness.append(observation)
+            # Native capture time counts accepted samples. Buffered WAV output
+            # can still contain only its header until a later disk flush.
+            return observation if len(audio) > 44 and audio[:4] == b'RIFF' and audio[8:12] == b'WAVE' else None
+        pcm = self.wait(flushed_pcm, 'flushed RIFF/WAVE PCM bytes', timeout=35)
+        print(f'Captured PCM readiness: {json.dumps(pcm)}')
+        if pause:
+            self.background_capture(source)
         if pause:
             self.click('#pause-recording')
             self.wait(lambda: self.state('paused'), 'native pause')
@@ -165,13 +226,15 @@ class Smoke:
         self.click('#mobile-new')
         second = self.recording()
         assert first != second, 'Second capture reused the previous session'
-        print('PASS: real UI start/pause/resume/stop/restart; native journal, PCM WAV, foreground and crash checks')
+        print('PASS: real UI start/screen-off/home/pause/resume/stop/restart; native journal, PCM WAV, foreground and crash checks')
 
     def diagnostics(self):
         for buffer in ['main', 'crash']:
             (self.output / f'logcat-{buffer}.txt').write_text(self.adb('logcat', '-d', '-b', buffer, check=False))
         (self.output / 'activity.txt').write_text(self.adb('shell', 'dumpsys', 'activity', 'activities', check=False))
         (self.output / 'snapshots.json').write_text(json.dumps(self.snapshots, indent=2))
+        (self.output / 'pcm-readiness.json').write_text(json.dumps(self.pcm_readiness, indent=2))
+        (self.output / 'events.json').write_text(json.dumps(self.events, indent=2))
         (self.output / 'screen.png').write_bytes(self.adb('exec-out', 'screencap', '-p', binary=True, check=False))
         if self.forward:
             self.adb('forward', '--remove', f'tcp:{self.forward}', check=False)
@@ -182,7 +245,10 @@ if __name__ == '__main__':
     parser.add_argument('--serial')
     parser.add_argument('--package', default='com.bubaley.speechdesk')
     parser.add_argument('--output', default='android-runtime-results')
-    smoke = Smoke(parser.parse_args())
+    args = parser.parse_args()
+    if not pathlib.Path(args.apk).is_file():
+        parser.error(f'APK must be an existing file: {args.apk!r}')
+    smoke = Smoke(args)
     try:
         smoke.run()
     finally:

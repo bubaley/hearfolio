@@ -127,10 +127,7 @@ jobs:
           emulator-options: -no-window -no-snapshot -no-boot-anim -noaudio -gpu swiftshader_indirect -camera-back none -camera-front none
           pre-emulator-launch-script: |
             echo 'hw.audioInput=no' >> "$HOME/.android/avd/test.avd/config.ini"
-          script: |
-            APK=$(find android-debug -type f -name '*x86_64*debug*.apk' -print -quit)
-            test -n "$APK"
-            python3 scripts/android-recorder-smoke.py --apk "$APK" --output android-runtime-results
+          script: python3 scripts/android-recorder-smoke.py --apk "$(find android-debug -type f -name '*x86_64*debug*.apk' -print -quit)" --output android-runtime-results
       - name: Preserve runtime crash logs, snapshots, screenshot and PCM recordings
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
