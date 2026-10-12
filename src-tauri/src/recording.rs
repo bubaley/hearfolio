@@ -638,7 +638,11 @@ pub async fn recording_activity_snapshot(
         {
             let _lifecycle=NATIVE_LIFECYCLE.lock().map_err(|_|"errors.recordingUnavailable")?;
             let mut status:serde_json::Value=native_call(&app,"recordingStatus",serde_json::json!({}))?;
-            if let Some(session)=retire_absent_session(&mut SESSION.lock().map_err(|_|"errors.recordingUnavailable")?,&status) {
+            let absent_session={
+                let mut active=SESSION.lock().map_err(|_|"errors.recordingUnavailable")?;
+                retire_absent_session(&mut active,&status)
+            };
+            if let Some(session)=absent_session {
                 let path=session.path.clone();
                 if path.exists() {
                     FINISHED.lock().map_err(|_|"errors.recordingStop")?.insert(path.clone());
