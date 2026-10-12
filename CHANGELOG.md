@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.2 (2026-10-12)
+
+### Fixes and performance
+
+- **android:** release recovered recorder lock before cleanup ([565ca9c](https://github.com/bubaley/hearfolio/commit/565ca9c6dafc36ee9df3bd1ec755cff49184ae48))
+- **android:** restore recorder ownership across app lifecycle ([bfaf2c0](https://github.com/bubaley/hearfolio/commit/bfaf2c065a22740b12875c8ea41298fce59481b5))
+
 ## 0.6.1 (2026-10-12)
 
 ### Fixes and performance
