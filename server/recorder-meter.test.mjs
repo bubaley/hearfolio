@@ -1,6 +1,48 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {RecorderEnvelope,NativeRecordingOrder} from '../src/recorder-meter.ts';
+import {RecorderEnvelope,NativeRecordingOrder,NativeRecorderClock,RecordingSnapshotPoll} from '../src/recorder-meter.ts';
+
+test('native timer is smooth between measured samples, bounded on stalled capture and exact on pause',()=>{
+ const clock=new NativeRecorderClock();
+ clock.synchronize(1000,'recording',100);
+ assert.equal(clock.milliseconds(150),1050);
+ clock.synchronize(1030,'recording',151);
+ assert.equal(clock.milliseconds(151),1050); // Delivery never makes a live timer run backwards.
+ assert.equal(clock.milliseconds(10000),1380); // A hidden or stalled UI cannot invent minutes of audio.
+ clock.synchronize(1100,'paused',10001);
+ assert.equal(clock.milliseconds(20000),1100);
+ clock.synchronize(1100,'recording',20000);
+ assert.equal(clock.milliseconds(20050),1150);
+ clock.reset();assert.equal(clock.milliseconds(30000),0);
+});
+
+test('state after a control waits for an old poll and then reads fresh without overlap',async()=>{
+ const poll=new RecordingSnapshotPoll();
+ let release;let reads=0;let active=0;let overlap=false;let state='recording';let received;
+ const read=async()=>{reads++;if(++active>1)overlap=true;const value=state;if(reads===1)await new Promise(resolve=>{release=resolve;});received=value;active--;};
+ const first=poll.read(read);await Promise.resolve();
+ const duplicate=poll.read(read);
+ state='paused';const afterPause=poll.read(read,true);
+ release();await Promise.all([first,duplicate,afterPause]);
+ assert.equal(reads,2);assert.equal(overlap,false);assert.equal(received,'paused');
+});
+
+test('a failed old poll does not discard the state refresh required by a control',async()=>{
+ const poll=new RecordingSnapshotPoll();let reject;
+ const old=poll.read(()=>new Promise((_,fail)=>{reject=fail;}));await Promise.resolve();
+ let refreshed=false;const fresh=poll.read(async()=>{refreshed=true;},true);
+ reject(new Error('activity recreated'));
+ await assert.rejects(old);await fresh;assert.equal(refreshed,true);
+});
+
+test('restored pending start belongs to the new recording and can advance to capture',()=>{
+ const order=new NativeRecordingOrder();
+ order.accept({state:'idle',stateRevision:2,path:'old'});
+ assert.equal(order.accept({state:'starting',stateRevision:3,path:'new'}),true);
+ assert.equal(order.acceptResult({stateRevision:2,path:'old'}),false);
+ assert.equal(order.accept({state:'recording',stateRevision:4,path:'new'}),true);
+ assert.equal(order.accept({state:'paused',stateRevision:5,path:'new'}),true);
+});
 
 test('timeline advances only on measured samples and remains still during pause',()=>{
  const meter=new RecorderEnvelope(4,100);

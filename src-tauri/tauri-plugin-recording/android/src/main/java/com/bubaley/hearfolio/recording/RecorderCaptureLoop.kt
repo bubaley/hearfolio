@@ -17,6 +17,8 @@ internal object RecorderControlPolicy {
         path.isNotEmpty() && path == requestedPath && (state == "recording" || state == "paused")
     fun canAcknowledge(state: String) = state != "recording" && state != "paused" && state != "stopping"
     fun canResetMetadata(hasCapture: Boolean) = !hasCapture
+    fun shouldRecoverOrphan(state: String, hasCapture: Boolean) = !hasCapture &&
+        state in listOf("starting", "recording", "paused", "stopping")
 }
 
 internal data class RecorderEnvelope(val levels: List<Float>, val sequence: Long, val elapsedMillis: Long)
@@ -62,7 +64,8 @@ internal class RecorderCaptureLoop(
     private val onRecovery: (Int) -> Unit = {},
     private val now: () -> Long = { System.nanoTime() / 1_000_000 },
     private val idle: () -> Unit = { Thread.sleep(10) },
-    private val retryWait: () -> Unit = { Thread.sleep(100) }
+    private val retryWait: () -> Unit = { Thread.sleep(100) },
+    private val sync: (RandomAccessFile) -> Unit = { it.fd.sync() }
 ) {
     val envelope = RecorderEnvelopeHistory(rate)
     private val gate = Any()
@@ -80,7 +83,7 @@ internal class RecorderCaptureLoop(
         var failure: Exception? = null
         try {
             RandomAccessFile(file, "rw").use { wav ->
-                WavRecovery.header(wav, 0, rate); wav.fd.sync()
+                WavRecovery.header(wav, 0, rate); sync(wav)
                 val samples = ShortArray(2048)
                 val bytes = ByteArray(samples.size * 2)
                 val recoveries = ArrayDeque<Long>()
@@ -124,27 +127,24 @@ internal class RecorderCaptureLoop(
                         }
                         require(read <= samples.size)
                         lastData = now()
-                        synchronized(gate) {
-                            // A completed pause call guarantees that no further
-                            // PCM/history is committed until resume. Keep draining
-                            // the microphone so pause does not surrender capture.
-                            if (running && !paused && phaseRevision==revision) {
-                                require(count + read * 2L <= 0xffffffffL - 36)
-                                for (index in 0 until read) {
-                                    val value = samples[index].toInt()
-                                    bytes[index * 2] = value.toByte(); bytes[index * 2 + 1] = (value shr 8).toByte()
-                                }
-                                wav.write(bytes, 0, read * 2)
-                                count += read * 2L
-                                envelope.append(samples, read)
-                                if (count - checkpoint >= rate * 4L) {
-                                    WavRecovery.header(wav, count, rate); wav.fd.sync(); checkpoint = count
-                                }
+                        // Accept at one short control boundary. Once accepted,
+                        // this pre-pause buffer belongs to the WAV; disk/fsync
+                        // latency must never prevent a stop/pause request.
+                        val accepted=synchronized(gate) {running && !paused && phaseRevision==revision}
+                        if(accepted) {
+                            require(count + read * 2L <= 0xffffffffL - 36)
+                            for(index in 0 until read) {
+                                val value=samples[index].toInt()
+                                bytes[index*2]=value.toByte();bytes[index*2+1]=(value shr 8).toByte()
                             }
+                            wav.write(bytes,0,read*2)
+                            count+=read*2L
+                            envelope.append(samples,read)
+                            if(count-checkpoint>=rate*4L) {WavRecovery.header(wav,count,rate);sync(wav);checkpoint=count}
                         }
                     }
                 } finally {
-                    WavRecovery.header(wav, count, rate); wav.fd.sync()
+                    WavRecovery.header(wav, count, rate); sync(wav)
                 }
             }
         } catch (error: Exception) {

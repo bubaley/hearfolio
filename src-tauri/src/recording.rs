@@ -31,6 +31,11 @@ impl Drop for Session {
 #[cfg(target_os = "android")]
 static LAST_RESULT: Mutex<Option<serde_json::Value>> = Mutex::new(None);
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
+// A terminal journal and the response to an explicit stop describe the same
+// operation. Give exactly one lifecycle operation ownership of that result.
+#[cfg(any(target_os = "android", test))]
+static NATIVE_LIFECYCLE: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 static JOB_TEST_LOCK: Mutex<()> = Mutex::new(());
 static FINISHED: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -63,13 +68,123 @@ fn create_writer(path: &Path, sample_rate: u32) -> Result<Writer, String> {
 }
 
 #[cfg(target_os = "android")]
+fn native_call<T: serde::de::DeserializeOwned + Send + 'static>(
+    app: &tauri::AppHandle,
+    command: &str,
+    payload: serde_json::Value,
+) -> Result<T, String> {
+    // Bound lifecycle ownership without keeping an OS thread for a missing
+    // Activity callback. The detached async bridge remains alive after timeout:
+    // Tauri's callback requires its oneshot receiver for a safe late response.
+    let timeout = if command == "start" { 120 } else { 15 };
+    let app = app.clone();
+    let command = command.to_owned();
+    let (send, receive) = std::sync::mpsc::channel();
+    tauri::async_runtime::spawn(async move {
+        let result = app
+            .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
+            .run_async::<T>(&command, payload)
+            .await;
+        let _ = send.send(result);
+    });
+    await_native_response(receive, std::time::Duration::from_secs(timeout))
+}
+#[cfg(any(target_os = "android", test))]
+fn await_native_response<T>(
+    receive: std::sync::mpsc::Receiver<Result<T, String>>,
+    timeout: std::time::Duration,
+) -> Result<T, String> {
+    receive
+        .recv_timeout(timeout)
+        .map_err(|_| "errors.recordingInterrupted".to_owned())?
+}
+#[cfg(any(target_os = "android", test))]
+fn retire_absent_session(
+    active: &mut Option<Session>,
+    status: &serde_json::Value,
+) -> Option<Session> {
+    // Native idle includes the absence of pending permission/start work, not
+    // merely absence of an AudioRecord instance. Never infer it from a timeout.
+    if status["state"] == "idle" {
+        active.take()
+    } else {
+        None
+    }
+}
+#[cfg(target_os = "android")]
 fn native(app: &tauri::AppHandle, command: &str, path: Option<&Path>) -> Result<(), String> {
-    app.state::<tauri_plugin_recording::Recording<tauri::Wry>>()
-        .run(
-            command,
-            path.map(|path| serde_json::json!({"path":path}))
-                .unwrap_or_else(|| serde_json::json!({})),
-        )
+    native_call(
+        app,
+        command,
+        path.map(|path| serde_json::json!({"path":path}))
+            .unwrap_or_else(|| serde_json::json!({})),
+    )
+}
+#[cfg(any(target_os = "android", test))]
+fn validated_native_path(path: &Path, directory: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() || native_recording_id(path).is_none() {
+        return None;
+    }
+    if path.parent()?.canonicalize().ok()? != directory.canonicalize().ok()? {
+        return None;
+    }
+    Some(directory.canonicalize().ok()?.join(path.file_name()?))
+}
+#[cfg(any(target_os = "android", test))]
+fn restore_session(active: &mut Option<Session>, path: &Path) -> Result<bool, String> {
+    if active.is_some() {
+        return Ok(false);
+    }
+    *active = Some(Session {
+        path: path.to_owned(),
+        writer: None,
+        _job: JobGuard::acquire()?,
+    });
+    Ok(true)
+}
+
+#[cfg(target_os = "android")]
+fn adopt_native_session(app: &tauri::AppHandle, status: &serde_json::Value) -> Result<(), String> {
+    if !matches!(
+        status["state"].as_str(),
+        Some("starting" | "recording" | "paused" | "stopping")
+    ) || status["quick"] == true
+    {
+        return Ok(());
+    }
+    let Some(path) = status["path"]
+        .as_str()
+        .and_then(|path| validated_native_path(Path::new(path), &crate::base().ok()?.join("temp")))
+    else {
+        return Ok(());
+    };
+    let mut active = SESSION.lock().map_err(|_| "errors.recordingUnavailable")?;
+    match restore_session(&mut active, &path) {
+        Ok(true) => monitor(app.clone(), path),
+        Ok(false) => {}
+        Err(error) if error == "errors.operationBusy" => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+#[cfg(target_os = "android")]
+fn native_control_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    if let Some(path) = SESSION
+        .lock()
+        .map_err(|_| "errors.recordingUnavailable")?
+        .as_ref()
+        .map(|session| session.path.clone())
+    {
+        return Ok(path);
+    }
+    let status: serde_json::Value = native_call(app, "recordingStatus", serde_json::json!({}))?;
+    adopt_native_session(app, &status)?;
+    SESSION
+        .lock()
+        .map_err(|_| "errors.recordingUnavailable")?
+        .as_ref()
+        .map(|session| session.path.clone())
+        .ok_or_else(|| "errors.recordingUnavailable".into())
 }
 
 #[tauri::command]
@@ -124,8 +239,12 @@ pub async fn start_audio_recording(
     app: tauri::AppHandle,
     sample_rate: Option<u32>,
 ) -> Result<(), String> {
-    let job = JobGuard::acquire()?;
     tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(target_os = "android")]
+        let _lifecycle = NATIVE_LIFECYCLE
+            .lock()
+            .map_err(|_| "errors.recordingStart")?;
+        let job = JobGuard::acquire()?;
         let extension = "wav";
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -148,11 +267,13 @@ pub async fn start_audio_recording(
             _job: job,
         });
         #[cfg(target_os = "android")]
+        monitor(app.clone(), path.clone());
+        #[cfg(target_os = "android")]
         if let Err(error) = native(&app, "start", Some(&path)) {
-            let mut active = SESSION.lock().map_err(|_| "errors.recordingStart")?;
-            if active.as_ref().is_some_and(|session| session.path == path) {
-                active.take();
-            }
+            // Any bridge failure can race capture already claimed by the
+            // service. An error string is not evidence that native ownership
+            // ended. The monitor or authoritative idle/terminal snapshot will
+            // retire this session; never delete a possible active WAV here.
             return Err(error);
         }
         #[cfg(target_os = "android")]
@@ -161,7 +282,6 @@ pub async fn start_audio_recording(
                 *result = None;
             }
             let _ = fs::remove_file(crate::base()?.join("recording-result.json"));
-            monitor(app.clone(), path);
         }
         #[cfg(not(target_os = "android"))]
         let _ = app;
@@ -193,12 +313,11 @@ pub fn append_audio_recording(samples: Vec<i16>) -> Result<(), String> {
 pub async fn stop_audio_recording(app: tauri::AppHandle) -> Result<AudioSelection, String> {
     tauri::async_runtime::spawn_blocking(move || {
         #[cfg(target_os = "android")]
-        let path = SESSION
+        let _lifecycle = NATIVE_LIFECYCLE
             .lock()
-            .map_err(|_| "errors.recordingStop")?
-            .as_ref()
-            .map(|session| session.path.clone())
-            .ok_or("errors.recordingUnavailable")?;
+            .map_err(|_| "errors.recordingStop")?;
+        #[cfg(target_os = "android")]
+        let path = native_control_path(&app)?;
         // Retain the registered session during the bridge call. If the Activity
         // loses its response, the journal monitor/snapshot can still complete
         // and archive it. Never take a newer recording after a delayed response.
@@ -244,12 +363,16 @@ pub async fn stop_audio_recording(app: tauri::AppHandle) -> Result<AudioSelectio
 pub async fn cancel_audio_recording(app: tauri::AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         #[cfg(target_os = "android")]
+        let _lifecycle = NATIVE_LIFECYCLE
+            .lock()
+            .map_err(|_| "errors.recordingStop")?;
+        #[cfg(target_os = "android")]
         {
-            let path = SESSION
-                .lock()
-                .map_err(|_| "errors.recordingStop")?
-                .as_ref()
-                .map(|session| session.path.clone());
+            let path = match native_control_path(&app) {
+                Ok(path) => Some(path),
+                Err(error) if error == "errors.recordingUnavailable" => None,
+                Err(error) => return Err(error),
+            };
             if let Some(path) = path {
                 native(&app, "cancel", Some(&path))?;
                 let mut active = SESSION.lock().map_err(|_| "errors.recordingStop")?;
@@ -408,6 +531,9 @@ fn monitor(app: tauri::AppHandle, path: PathBuf) {
         let started = std::time::Instant::now();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
+            let Ok(_lifecycle) = NATIVE_LIFECYCLE.lock() else {
+                break;
+            };
             if !SESSION
                 .lock()
                 .is_ok_and(|s| s.as_ref().is_some_and(|s| s.path == path))
@@ -469,6 +595,13 @@ fn monitor(app: tauri::AppHandle, path: PathBuf) {
                     );
                     drop(session);
                     store_recording_result(&payload);
+                    if payload["entry"].is_object() {
+                        let _ = native_call::<()>(
+                            &app,
+                            "acknowledgeRecording",
+                            serde_json::json!({"path":path}),
+                        );
+                    }
                     let _ = app.emit("recording-native-finished", payload);
                     let _ = fs::remove_file(format!("{}.state.json", path.to_string_lossy()));
                 }
@@ -503,8 +636,19 @@ pub async fn recording_activity_snapshot(
     tauri::async_runtime::spawn_blocking(move || {
         #[cfg(target_os="android")]
         {
-            let bridge=app.state::<tauri_plugin_recording::Recording<tauri::Wry>>();
-            let mut status:serde_json::Value=bridge.transfer("recordingStatus",serde_json::json!({}))?;
+            let _lifecycle=NATIVE_LIFECYCLE.lock().map_err(|_|"errors.recordingUnavailable")?;
+            let mut status:serde_json::Value=native_call(&app,"recordingStatus",serde_json::json!({}))?;
+            if let Some(session)=retire_absent_session(&mut SESSION.lock().map_err(|_|"errors.recordingUnavailable")?,&status) {
+                let path=session.path.clone();
+                if path.exists() {
+                    FINISHED.lock().map_err(|_|"errors.recordingStop")?.insert(path.clone());
+                    store_recording_result(&serde_json::json!({"path":path,"error":"errors.recordingInterrupted","selection":{"path":path,"name":"Recording.wav"}}));
+                }
+                drop(session);
+            }
+            // The service survives Activity/WebView recreation. Re-register its
+            // active regular recording before exposing controls to the frontend.
+            adopt_native_session(&app,&status)?;
             // A visible native snapshot is authoritative when a final journal
             // write failed. Claim only the matching terminal session so its job
             // guard is released and its private source survives failed import.
@@ -526,18 +670,17 @@ pub async fn recording_activity_snapshot(
                 };
                 let success=payload["entry"].is_object();
                 store_recording_result(&payload);drop(session);
-                if success { bridge.transfer::<()>("acknowledgeRecording",serde_json::json!({"path":path}))?;status["state"]=serde_json::json!("idle"); }
+                if success { native_call::<()>(&app,"acknowledgeRecording",serde_json::json!({"path":path}))?;status["state"]=serde_json::json!("idle"); }
             } else if status["state"]=="finished" && status["quick"]!=true {
                 // Recover a completed service recording after process recreation.
-                let _job=JobGuard::acquire()?;
-                if let Some(path)=terminal_path {
-                    let base=crate::base()?.join("temp").canonicalize().map_err(|_|"errors.recordingStop")?;
-                    let file=path.canonicalize().map_err(|_|"errors.recordingStop")?;
-                    if file.parent()==Some(base.as_path()) && native_recording_id(&file).is_some() {
+                // A foreground import may already own this completed result.
+                // Keep returning the authoritative snapshot while it finishes.
+                if let (Ok(_job),Some(path))=(JobGuard::acquire(),terminal_path) {
+                    if let Some(file)=validated_native_path(&path,&crate::base()?.join("temp")) {
                         FINISHED.lock().map_err(|_|"errors.recordingStop")?.insert(file.clone());
                         let payload=archive_native_recording(&app,&file,status["error"].as_str(),&status["stateRevision"]);
                         let success=payload["entry"].is_object();store_recording_result(&payload);
-                        if success { bridge.transfer::<()>("acknowledgeRecording",serde_json::json!({"path":file}))?;status["state"]=serde_json::json!("idle"); }
+                        if success { native_call::<()>(&app,"acknowledgeRecording",serde_json::json!({"path":file}))?;status["state"]=serde_json::json!("idle"); }
                     }
                 }
             }
@@ -674,18 +817,21 @@ pub async fn recording_quick_control(
     tauri::async_runtime::spawn_blocking(move || {
         #[cfg(target_os = "android")]
         {
-            let bridge = app.state::<tauri_plugin_recording::Recording<tauri::Wry>>();
+            let _lifecycle = NATIVE_LIFECYCLE
+                .lock()
+                .map_err(|_| "errors.recordingUnavailable")?;
             let path = if let Some(path) = path {
                 path
             } else {
                 let status: serde_json::Value =
-                    bridge.transfer("recordingStatus", serde_json::json!({}))?;
+                    native_call(&app, "recordingStatus", serde_json::json!({}))?;
                 status["path"]
                     .as_str()
                     .ok_or("errors.recordingUnavailable")?
                     .to_owned()
             };
-            bridge.transfer::<()>(
+            native_call::<()>(
+                &app,
                 "quickControl",
                 serde_json::json!({"id":"quick","stage":action,"path":path}),
             )
@@ -739,8 +885,10 @@ fn archive_native_recording(
                 .find(|e| e.id == id)
         };
         if let Some(entry) = existing {
-            if crate::transfer::hash_file(path)?
-                != crate::transfer::hash_file(Path::new(&entry.input_path))?
+            if !Path::new(&entry.input_path).is_file()
+                || (path.exists()
+                    && crate::transfer::hash_file(path)?
+                        != crate::transfer::hash_file(Path::new(&entry.input_path))?)
             {
                 return Err("errors.recordingStop".into());
             }
@@ -800,18 +948,15 @@ async fn control_recording(app: tauri::AppHandle, _stage: &'static str) -> Resul
     tauri::async_runtime::spawn_blocking(move || {
         #[cfg(target_os = "android")]
         {
-            let path = SESSION
+            let _lifecycle = NATIVE_LIFECYCLE
                 .lock()
-                .map_err(|_| "errors.recordingUnavailable")?
-                .as_ref()
-                .map(|session| session.path.clone())
-                .ok_or("errors.recordingUnavailable")?;
-            return app
-                .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
-                .run(
-                    "recordingControl",
-                    serde_json::json!({"stage":_stage,"path":path}),
-                );
+                .map_err(|_| "errors.recordingUnavailable")?;
+            let path = native_control_path(&app)?;
+            native_call::<()>(
+                &app,
+                "recordingControl",
+                serde_json::json!({"stage":_stage,"path":path}),
+            )
         }
         #[cfg(not(target_os = "android"))]
         {
@@ -884,6 +1029,113 @@ mod native_recovery_tests {
         drop(JobGuard::acquire().unwrap());
         discard(&path).unwrap();
         assert!(!path.exists());
+    }
+    #[test]
+    fn lost_bridge_response_releases_lifecycle_and_authoritative_idle_releases_pending_job() {
+        let _serial = JOB_TEST_LOCK.lock().unwrap();
+        let path =
+            std::env::temp_dir().join(format!("hearfolio-pending-{}.wav", uuid::Uuid::new_v4()));
+        let mut active = None;
+        restore_session(&mut active, &path).unwrap();
+        {
+            let _control = NATIVE_LIFECYCLE.lock().unwrap();
+            let (_late_response, receive) = std::sync::mpsc::channel::<Result<(), String>>();
+            assert_eq!(
+                await_native_response(receive, std::time::Duration::from_millis(1)).unwrap_err(),
+                "errors.recordingInterrupted"
+            );
+        }
+        let _next_control = NATIVE_LIFECYCLE.try_lock().unwrap();
+        assert!(retire_absent_session(
+            &mut active,
+            &serde_json::json!({"state":"starting","path":path})
+        )
+        .is_none());
+        assert!(JobGuard::acquire().is_err());
+        drop(retire_absent_session(&mut active, &serde_json::json!({"state":"idle"})).unwrap());
+        assert!(restore_session(&mut active, &path).unwrap());
+        drop(active);
+        drop(JobGuard::acquire().unwrap());
+    }
+    #[test]
+    fn timed_out_old_response_and_terminal_journal_cannot_claim_a_new_recording() {
+        let _serial = JOB_TEST_LOCK.lock().unwrap();
+        let old_path =
+            std::env::temp_dir().join(format!("hearfolio-old-{}.wav", uuid::Uuid::new_v4()));
+        let new_path =
+            std::env::temp_dir().join(format!("hearfolio-new-{}.wav", uuid::Uuid::new_v4()));
+        let (late, receive) = std::sync::mpsc::channel::<Result<(), String>>();
+        assert!(await_native_response(receive, std::time::Duration::from_millis(1)).is_err());
+        let mut active = None;
+        restore_session(&mut active, &new_path).unwrap();
+        // The detached bridge intentionally ignores its send failure after the
+        // caller timed out. It does not mutate SESSION on a late callback.
+        assert!(late.send(Ok(())).is_err());
+        assert!(take_terminal_session(&mut active, "finished", &old_path).is_none());
+        assert!(take_terminal_session(&mut active, "cancelled", &old_path).is_none());
+        assert_eq!(active.as_ref().unwrap().path, new_path);
+        assert!(JobGuard::acquire().is_err());
+        drop(active);
+        drop(JobGuard::acquire().unwrap());
+    }
+    #[test]
+    fn recreated_session_reacquires_job_and_preserves_an_existing_owner() {
+        let _serial = JOB_TEST_LOCK.lock().unwrap();
+        let path =
+            std::env::temp_dir().join(format!("hearfolio-restored-{}.wav", uuid::Uuid::new_v4()));
+        let mut active = None;
+        assert!(restore_session(&mut active, &path).unwrap());
+        assert!(JobGuard::acquire().is_err());
+        assert!(!restore_session(&mut active, Path::new("/foreign.wav")).unwrap());
+        assert_eq!(active.as_ref().unwrap().path, path);
+        let terminal = take_terminal_session(&mut active, "finished", &path).unwrap();
+        drop(terminal);
+        drop(JobGuard::acquire().unwrap());
+    }
+    #[test]
+    fn native_recovery_accepts_only_private_allocated_paths_even_before_file_exists() {
+        let root = std::env::temp_dir().join(format!("hearfolio-path-{}", uuid::Uuid::new_v4()));
+        let private = root.join("temp");
+        let foreign = root.join("foreign").join("temp");
+        fs::create_dir_all(&private).unwrap();
+        fs::create_dir_all(&foreign).unwrap();
+        let path = private.join("hearfolio-recording-123.wav");
+        assert_eq!(
+            validated_native_path(&path, &private),
+            Some(
+                private
+                    .canonicalize()
+                    .unwrap()
+                    .join("hearfolio-recording-123.wav")
+            )
+        );
+        assert!(
+            validated_native_path(&foreign.join("hearfolio-recording-123.wav"), &private).is_none()
+        );
+        assert!(validated_native_path(&private.join("unknown.wav"), &private).is_none());
+        assert!(
+            validated_native_path(Path::new("temp/hearfolio-recording-123.wav"), &private)
+                .is_none()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn explicit_stop_claim_is_serialized_against_journal_monitor() {
+        let _serial = JOB_TEST_LOCK.lock().unwrap();
+        let path =
+            std::env::temp_dir().join(format!("hearfolio-race-{}.wav", uuid::Uuid::new_v4()));
+        let mut active = None;
+        restore_session(&mut active, &path).unwrap();
+        // A stop owns lifecycle while waiting for its native response. The
+        // journal reader must not claim the just-finished session underneath it.
+        let control = NATIVE_LIFECYCLE.lock().unwrap();
+        assert!(NATIVE_LIFECYCLE.try_lock().is_err());
+        let stopped = take_terminal_session(&mut active, "finished", &path).unwrap();
+        drop(control);
+        let _monitor = NATIVE_LIFECYCLE.lock().unwrap();
+        assert!(take_terminal_session(&mut active, "finished", &path).is_none());
+        drop(stopped);
+        drop(JobGuard::acquire().unwrap());
     }
     #[test]
     fn only_allocated_native_wav_names_get_a_stable_archive_id() {

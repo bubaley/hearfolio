@@ -736,7 +736,7 @@ textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; 
 .recorder-meter-caption {margin-top:9px;font-size:10px}
 .recorder-meter-caption span:last-child {position:absolute;left:50%;transform:translateX(-50%)}
 .recorder-meter-caption {position:relative}
-.recorder-actions {margin-top:28px;grid-template-columns:1fr 1.3fr;gap:10px}
+.recorder-actions {margin-top:28px;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}
 .recorder-actions button {min-height:48px}
 .mobile-new[hidden] {display:none!important}
 @media(max-width:600px){
@@ -756,7 +756,7 @@ textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; 
  .recorder-bars {gap:1px;inset-block:12px}
  .recorder-bars i {height:calc(1px + var(--level,0) * 156px)}
  .recording-panel .recording-duration {font-size:48px;margin-bottom:24px}
- .recorder-actions {grid-template-columns:1fr 1.35fr;margin-top:26px}
+ .recorder-actions {grid-template-columns:minmax(0,1fr) minmax(0,1fr);margin-top:26px}
  .recorder-actions button {min-height:48px;font-size:12px}
 }
 @media(max-height:560px){

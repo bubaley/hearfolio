@@ -1,6 +1,6 @@
 import {recordNameParts, renamedRecordTitle} from './record-name';
 import {normalizeAudioCatalog, readAudioCatalog, saveAudioCatalog} from './cloud-catalog';
-import {RecorderEnvelope,NativeRecordingOrder} from './recorder-meter';
+import {RecorderEnvelope,NativeRecordingOrder,NativeRecorderClock,RecordingSnapshotPoll} from './recorder-meter';
 import {pauseAudioRecording, resumeAudioRecording, restoreNativeRecordingFlag, observePendingOperation, operationHandled, markOperationHandled} from './api';
 import type {OperationSnapshot} from './operation-recovery';
 import {transferSettingsHtml, devicesHtml, transferBarHtml, shareRecordingToDevice, bindTransfers, initializeTransfers, hasTransferDraft, discardTransferDraft, transferActivityLabel} from './transfers';
@@ -46,8 +46,10 @@ const microphone=()=>'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
 let nativeRecordingSeconds:number|null=null,nativeRecordingMillis:number|null=null,nativeRecordingPath='',externalRecording=false,recordingControlPending=false,nativeCaptureGeneration=0;
 const recorderEnvelope=new RecorderEnvelope();
 const nativeRecordingOrder=new NativeRecordingOrder();
+const nativeRecorderClock=new NativeRecorderClock();
+const recordingSnapshotPoll=new RecordingSnapshotPoll();
 type NativeCapture={state:string;stateRevision?:number;path?:string;elapsedSeconds?:number;elapsedMillis?:number;level?:number;envelope?:number[];envelopeSequence?:number;envelopeIntervalMs?:number};
-function recordingMilliseconds(){return nativeRecordingMillis??(nativeRecordingSeconds!==null?nativeRecordingSeconds*1000:recordingStarted?Math.max(0,(recordingPausedAt||Date.now())-recordingStarted-recordingPausedMillis):0);}
+function recordingMilliseconds(){return nativeRecordingMillis!==null?nativeRecorderClock.milliseconds(performance.now()):(nativeRecordingSeconds!==null?nativeRecordingSeconds*1000:recordingStarted?Math.max(0,(recordingPausedAt||Date.now())-recordingStarted-recordingPausedMillis):0);}
 function recorderRulerHtml(){const seconds=recordingMilliseconds()/1000,span=recorderEnvelope.size*recorderEnvelope.interval/1000;return Array.from({length:5},(_,index)=>{const time=seconds+(index-2)*span/2;return `<span>${time>=0?formatTime(time):''}</span>`;}).join('');}
 function recordingMeterHtml(){return `<div class="recorder-timeline" role="img" aria-label="${tr('Уровень микрофона')}"><div class="recorder-ruler" aria-hidden="true">${recorderRulerHtml()}</div><div class="recorder-wave"><div class="recorder-bars">${recorderEnvelope.levels().map(level=>`<i style="--level:${level}"></i>`).join('')}</div><div class="recorder-playhead" aria-hidden="true"></div></div></div>`;}
 function paintRecorderMeter(){const meter=document.querySelector('.recorder-bars');if(meter)meter.querySelectorAll<HTMLElement>('i').forEach((bar,index)=>bar.style.setProperty('--level',String(recorderEnvelope.levels()[index])));const ruler=document.querySelector('.recorder-ruler');if(ruler)ruler.innerHTML=recorderRulerHtml();const timer=document.querySelector('#recording-duration');if(timer)timer.textContent=recordingDuration();}
@@ -55,8 +57,8 @@ function applyNativeCapture(p:NativeCapture){
   const sameSession=!p.path||p.path===nativeRecordingPath;
   const old=Boolean(['recording','paused'].includes(p.state)&&sameSession&&p.elapsedMillis!==undefined&&nativeRecordingMillis!==null&&p.elapsedMillis<nativeRecordingMillis);
   if(old||!nativeRecordingOrder.accept(p))return false;
-  if(p.path&&p.path!==nativeRecordingPath){nativeRecordingPath=p.path;nativeRecordingMillis=null;nativeRecordingSeconds=null;recorderEnvelope.reset();}
-  if(p.elapsedMillis!==undefined)nativeRecordingMillis=p.elapsedMillis;
+  if(p.path&&p.path!==nativeRecordingPath){nativeRecordingPath=p.path;nativeRecordingMillis=null;nativeRecordingSeconds=null;nativeRecorderClock.reset();recorderEnvelope.reset();}
+  if(p.elapsedMillis!==undefined){nativeRecordingMillis=p.elapsedMillis;nativeRecorderClock.synchronize(p.elapsedMillis,p.state,performance.now());}
   if(p.elapsedSeconds!==undefined)nativeRecordingSeconds=p.elapsedSeconds;
   if(p.envelope&&p.envelopeSequence!==undefined&&p.path)recorderEnvelope.synchronize(p.envelope,p.envelopeSequence,p.path);
   paintRecorderMeter();return true;
@@ -146,7 +148,7 @@ function captureHtml():string {
   if(recordingPhase!=='idle'){
     const live=['recording','paused'].includes(recordingPhase),paused=recordingPhase==='paused';
     const label=tr(recordingPhase==='starting'?'Подключаем микрофон…':recordingPhase==='stopping'?'Сохраняем аудио…':recordingPhase==='cancelling'?'Отменяем запись…':paused?'Запись на паузе':'Идёт запись');
-    return `<section class="capture-panel recording-panel ${paused?'recorder-paused':''}" aria-label="${tr('Диктофон')}"><div class="recorder-heading"><span class="recorder-dot" aria-hidden="true"></span><span>${label}</span></div><div class="recording-duration" id="recording-duration" aria-label="${tr('Длительность записи')}">${recordingDuration()}</div>${recordingMeterHtml()}<div class="recorder-meter-caption"><span>${tr('Записанный звук')}</span><span>${tr('Сейчас')}</span></div><div class="recorder-actions"><button type="button" class="secondary recorder-pause" id="pause-recording" ${!live||recordingControlPending?'disabled':''}>${icon(paused?'play':'pause')}<span>${tr(paused?'Продолжить':'Пауза')}</span></button><button type="button" class="primary capture-stop" id="stop-recording" ${!live||recordingControlPending?'disabled':''}><span class="stop-symbol"></span><span>${tr('Сохранить запись')}</span></button></div><button type="button" class="text-button capture-cancel" id="cancel-recording" ${!live||recordingControlPending?'disabled':''}>${tr('Отменить запись')}</button></section>`;
+    return `<section class="capture-panel recording-panel ${paused?'recorder-paused':''}" aria-label="${tr('Диктофон')}"><div class="recorder-heading"><span class="recorder-dot" aria-hidden="true"></span><span>${label}</span></div><div class="recording-duration" id="recording-duration" aria-label="${tr('Длительность записи')}">${recordingDuration()}</div>${recordingMeterHtml()}<div class="recorder-meter-caption"><span>${tr('Записанный звук')}</span><span>${tr('Сейчас')}</span></div><div class="recorder-actions"><button type="button" class="secondary recorder-pause" id="pause-recording" ${!live||recordingControlPending?'disabled':''}>${icon(paused?'play':'pause')}<span>${tr(paused?'Продолжить':'Пауза')}</span></button><button type="button" class="primary capture-stop" id="stop-recording" ${!live||recordingControlPending?'disabled':''}><span class="stop-symbol"></span><span>${tr('Сохранить')}</span></button></div><button type="button" class="text-button capture-cancel" id="cancel-recording" ${!live||recordingControlPending?'disabled':''}>${tr('Отменить запись')}</button></section>`;
   }
   if(pendingRecording)return `<div class="capture-panel"><div class="empty-symbol">${microphone()}</div><h1>${tr('Аудио записано')}</h1><p>${tr('Добавьте запись в архив, чтобы перейти к распознаванию.')}</p><button class="primary" id="retry-recording" ${disabled()}>${tr('Добавить в архив')}</button><button class="text-button capture-cancel" id="discard-recording" ${disabled()}>${tr('Удалить эту запись')}</button></div>`;
   return `<div class="capture-panel"><div class="empty-symbol">${icon('wave')}</div><h1>${tr('Начните с аудио')}</h1><p>${tr('Запишите голосовую заметку или выберите готовый файл.')}</p>${platform.audioRecording?`<button class="primary capture-start" id="start-recording" ${disabled()}>${microphone()}${tr('Записать аудио')}</button>`:''}<button class="secondary capture-file" data-choose ${disabled()}>${icon('plus')}${tr('Выбрать аудиофайл')}</button><small>${audioFormats}</small></div>`;
@@ -543,12 +545,16 @@ async function discardPendingRecording():Promise<boolean> {
   finally{busy=false;render();}
 }
 function clearRecordingTimer(){if(recordingTimer)clearInterval(recordingTimer);recordingTimer=null;}
+function resetRecorderUi(){
+  clearRecordingTimer();recordingPhase='idle';recordingStarted=0;externalRecording=false;busy=false;
+  nativeRecordingSeconds=null;nativeRecordingMillis=null;nativeRecorderClock.reset();restoreNativeRecordingFlag(false);
+}
 async function startRecording(){
   if(busy||active||!platform.audioRecording||!await mayLeaveSettings()||!await mayReplaceRecord())return;
   if(busy||active)return;
-  nativeCaptureGeneration++;nativeRecordingOrder.beginStart();lastNativeRecordingResult='';nativeRecordingSeconds=null;nativeRecordingMillis=null;nativeRecordingPath='';recordingPausedAt=0;recordingPausedMillis=0;recorderEnvelope.reset();settingsDraft=null;view='work';recordingPhase='starting';busy=true;status='';recordingStarted=0;render();
-  try{await startAudioRecording();nativeRecordingOrder.confirmStart();recordingStarted=Date.now();recordingPhase='recording';recordingTimer=setInterval(()=>{const timer=document.querySelector('#recording-duration');if(timer)timer.textContent=recordingDuration();},100);await syncNativeRecording();render();}
-  catch(error){nativeRecordingOrder.abortStart();recordingPhase='idle';busy=false;render();notice(errorText(error),true);}
+  nativeCaptureGeneration++;nativeRecordingOrder.beginStart();lastNativeRecordingResult='';nativeRecordingSeconds=null;nativeRecordingMillis=null;nativeRecordingPath='';recordingPausedAt=0;recordingPausedMillis=0;nativeRecorderClock.reset();recorderEnvelope.reset();settingsDraft=null;view='work';recordingPhase='starting';busy=true;status='';recordingStarted=0;render();
+  try{await startAudioRecording();nativeRecordingOrder.confirmStart();recordingStarted=Date.now();recordingPhase='recording';recordingTimer=setInterval(()=>{const timer=document.querySelector('#recording-duration');if(timer)timer.textContent=recordingDuration();},100);await syncNativeRecording(true);render();}
+  catch(error){nativeRecordingOrder.abortStart();recordingPhase='idle';busy=false;if(platform.os==='android'&&!preview)await syncNativeRecording(true);render();if(recordingPhase==='idle')notice(errorText(error),true);}
 }
 function recordingName(selected:AudioSelection):string {
   const date=new Date(recordingStarted||Date.now()),pad=(value:number)=>String(value).padStart(2,'0');
@@ -564,7 +570,10 @@ async function toggleRecordingPause(){
     else if(paused)await resumeAudioRecording();else await pauseAudioRecording();
     if(platform.os==='android'&&!preview){await syncNativeRecording(true);}
     else{if(paused){if(recordingPausedAt)recordingPausedMillis+=Date.now()-recordingPausedAt;recordingPausedAt=0;}else recordingPausedAt=Date.now();recordingPhase=paused?'recording':'paused';}
-  }catch(error){notice(errorText(error),true);}
+  }catch(error){
+    if(platform.os==='android'&&!preview)await syncNativeRecording(true);
+    if(recordingPhase===(paused?'paused':'recording'))notice(errorText(error),true);
+  }
   finally{recordingControlPending=false;render();}
 }
 async function stopRecording(){
@@ -573,7 +582,7 @@ async function stopRecording(){
   try{
     if(externalRecording){
       try{await call('recording_quick_control',{action:'stop',path:nativeRecordingPath||undefined});await finishQuickRecording();}
-      catch(error){notice(errorText(error),true);await syncNativeRecording(true);}
+      catch(error){await syncNativeRecording(true);if(['recording','paused'].includes(recordingPhase))notice(errorText(error),true);}
       return;
     }
     pendingRecording=await stopAudioRecording();recordingPhase='idle';
@@ -581,15 +590,18 @@ async function stopRecording(){
     pendingRecording={...pendingRecording,name:recordingName(pendingRecording)};
     await importSelection(pendingRecording);
   }catch(error){
-    if(platform.os==='android'&&!preview){await syncNativeRecording(true);render();notice(errorText(error),true);}
+    if(platform.os==='android'&&!preview){await syncNativeRecording(true);render();if(['recording','paused'].includes(recordingPhase))notice(errorText(error),true);}
     else{await cancelAudioRecording().catch(()=>{});recordingPhase='idle';busy=false;render();notice(errorText(error),true);}
   }finally{recordingControlPending=false;render();}
 }
 async function cancelRecording(){
   if(!['recording','paused'].includes(recordingPhase)||recordingControlPending)return;
-  nativeCaptureGeneration++;clearRecordingTimer();recordingPhase='cancelling';render();
-  try{if(externalRecording)await call('recording_quick_control',{action:'cancel',path:nativeRecordingPath||undefined});else await cancelAudioRecording();}catch(error){notice(errorText(error),true);}
-  finally{externalRecording=false;recordingPhase='idle';recordingStarted=0;busy=false;render();}
+  nativeCaptureGeneration++;recordingControlPending=true;clearRecordingTimer();recordingPhase='cancelling';render();
+  try{if(externalRecording)await call('recording_quick_control',{action:'cancel',path:nativeRecordingPath||undefined});else await cancelAudioRecording();
+    if(platform.os==='android'&&!preview)await syncNativeRecording(true);
+    else resetRecorderUi();
+  }catch(error){if(platform.os==='android'&&!preview)await syncNativeRecording(true);else resetRecorderUi();if(!['idle'].includes(recordingPhase))notice(errorText(error),true);}
+  finally{recordingControlPending=false;render();}
 }
 async function importSelection(selected:AudioSelection):Promise<boolean>{
   beginOperation('import',tr('Добавляем запись'));settingsDraft=null;view='work';render();
@@ -758,19 +770,25 @@ updateCatalogViewport();window.visualViewport?.addEventListener('resize',updateC
 subscribe<NativeCapture>('recording-native-state',p=>{if(!['recording','paused','stopping'].includes(recordingPhase)||recordingControlPending)return;if(p.path&&nativeRecordingPath&&p.path!==nativeRecordingPath)return;if(!applyNativeCapture(p))return;if(p.state==='finished'){clearRecordingTimer();recordingPhase='stopping';render();void syncNativeRecording(true);return;}const next=p.state==='paused'?'paused':p.state==='recording'?'recording':p.state==='stopping'?'stopping':null;if(next&&next!==recordingPhase){if(next==='stopping')clearRecordingTimer();recordingPhase=next;render();}}).catch(()=>{});
 type NativeRecordingResult={entry?:Entry;selection?:AudioSelection;error?:string;path?:string;stateRevision?:number};
 let lastNativeRecordingResult='';
-async function finishNativeRecording(p:NativeRecordingResult){const key=JSON.stringify(p),receipt=p.entry?`recording:${p.entry.id}`:'';if(key===lastNativeRecordingResult||(receipt&&operationHandled(receipt)))return;lastNativeRecordingResult=key;if(receipt)markOperationHandled(receipt);clearRecordingTimer();recordingPhase='idle';recordingStarted=0;busy=false;pendingRecording=p.selection||null;if(p.entry){resetPlayback();active=p.entry;restoreConfiguration(p.entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;view='work';await refreshHistory();}render();if(p.error)notice(errorText(p.error),true);else notice(tr('Запись сохранена'));}
+async function finishNativeRecording(p:NativeRecordingResult){const key=JSON.stringify(p),receipt=p.entry?`recording:${p.entry.id}`:'';if(key===lastNativeRecordingResult||(receipt&&operationHandled(receipt))){if(recordingPhase!=='idle'){resetRecorderUi();render();}return;}lastNativeRecordingResult=key;if(receipt)markOperationHandled(receipt);resetRecorderUi();pendingRecording=p.selection||null;if(p.entry){resetPlayback();active=p.entry;restoreConfiguration(p.entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;view='work';await refreshHistory();}render();if(p.error)notice(errorText(p.error),true);else notice(tr('Запись сохранена'));}
 subscribe<NativeRecordingResult>('recording-native-finished',p=>{if(nativeRecordingOrder.acceptResult(p))void finishNativeRecording(p);}).catch(()=>{});
-let snapshotPolling=false,quickFinishing=false;
+let quickFinishing=false;
 async function finishQuickRecording(){if(quickFinishing)return;quickFinishing=true;try{const entries=await call<Entry[]>('import_quick_recordings');externalRecording=false;recordingPhase='idle';busy=false;clearRecordingTimer();if(entries.length){const entry=entries[entries.length-1];if(!active||resultSaved||!text){resetPlayback();active=entry;restoreConfiguration(entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;}await refreshHistory();notice(tr('Запись сохранена'));}render();}catch(e){if(!String(e).includes('operationBusy')){externalRecording=false;recordingPhase='idle';busy=false;render();notice(errorText(e),true);}}finally{quickFinishing=false;}}
 async function syncNativeRecording(afterControl=false){
-  if(snapshotPolling||document.hidden||platform.os!=='android'||recordingPhase==='starting'||recordingPhase==='cancelling'||(recordingControlPending&&!afterControl))return;snapshotPolling=true;
+  if((document.hidden&&!afterControl)||platform.os!=='android'||((recordingPhase==='cancelling'||recordingControlPending)&&!afterControl))return;
+  return recordingSnapshotPoll.read(()=>readNativeRecordingSnapshot(),afterControl);
+}
+async function readNativeRecordingSnapshot(){
   const generation=nativeCaptureGeneration;
   try{
     const p=await call<NativeCapture&{quick?:boolean;error?:string;interrupted?:boolean;result?:NativeRecordingResult}>('recording_activity_snapshot');
     if(generation!==nativeCaptureGeneration||!applyNativeCapture(p))return;
     const live=p.state==='recording'||p.state==='paused';
     restoreNativeRecordingFlag(live&&!p.quick);
-    if(p.state==='stopping'){
+    if(p.state==='starting'){
+      externalRecording=Boolean(p.quick);busy=true;view='work';
+      if(recordingPhase!=='starting'){recordingPhase='starting';render();}
+    }else if(p.state==='stopping'){
       externalRecording=Boolean(p.quick);busy=true;view='work';
       if(recordingPhase!=='stopping'){clearRecordingTimer();recordingPhase='stopping';render();}
     }else if(live){
@@ -783,12 +801,13 @@ async function syncNativeRecording(afterControl=false){
     else if(externalRecording){
       if(p.state==='finished'){recordingPhase='stopping';await finishQuickRecording();if(p.error)notice(errorText(p.error),true);}
       else{externalRecording=false;recordingPhase='idle';busy=false;render();if(p.error)notice(errorText(p.error),true);}
-    }else if(p.result){if(nativeRecordingOrder.acceptResult(p.result))await finishNativeRecording(p.result);}
+    }else if(p.result&&nativeRecordingOrder.acceptResult(p.result)){await finishNativeRecording(p.result);}
     else if(p.state==='error'&&recordingPhase!=='idle')await finishNativeRecording({error:p.error||'errors.recordingEmpty'});
-  }catch{/* Poll again on the next foreground tick. */}finally{snapshotPolling=false;}
+    else if(['idle','cancelled'].includes(p.state)&&recordingPhase!=='idle'){resetRecorderUi();render();}
+  }catch{/* A failed read cannot change the microphone's confirmed state. */}
 }
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)void syncNativeRecording();});
-let lastNativePoll=0;setInterval(()=>{const now=performance.now();if(now-lastNativePoll>=(recordingPhase==='idle'?700:150)){lastNativePoll=now;void syncNativeRecording();}},150);
+let lastNativePoll=0;setInterval(()=>{const now=performance.now();if(now-lastNativePoll>=(recordingPhase==='idle'?1200:300)){lastNativePoll=now;void syncNativeRecording();}},150);
 
 
 let importingQuick=false,quickImportFailed=false;

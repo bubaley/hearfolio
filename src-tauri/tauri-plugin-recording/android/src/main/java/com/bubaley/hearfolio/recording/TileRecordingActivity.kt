@@ -50,7 +50,7 @@ class TileRecordingActivity : Activity() {
             background=GradientDrawable().apply{cornerRadius=dp(12).toFloat();setColor(if(primary)Color.rgb(236,236,238)else Color.rgb(33,33,35));if(!primary)setStroke(dp(1),Color.rgb(65,65,69))}
             layoutParams=LinearLayout.LayoutParams(-1,dp(58)).apply{topMargin=dp(12)}
         }
-        save=button(true).apply{text=tr("Остановить и сохранить","Stop and save");setOnClickListener{RecordingService.instance?.finish(true);update()}};root.addView(save)
+        save=button(true).apply{text=tr("Остановить и сохранить","Stop and save");setOnClickListener{val path=RecordingService.path;RecordingService.execute { RecordingService.instance?.finish(true,path) };update()}};root.addView(save)
         pause=button(false).apply{setOnClickListener{val action=if(RecordingService.state=="paused")RecordingService.RESUME else RecordingService.PAUSE;startService(Intent(this@TileRecordingActivity,RecordingService::class.java).setAction(action).putExtra("path",RecordingService.path))}};root.addView(pause)
         root.addView(button(false).apply{text=tr("Закрыть экран","Close screen");setOnClickListener{finish()}})
         root.addView(text(14f).apply{text=tr("Закрытие экрана не останавливает запись. Сохранённое аудио появится в архиве при открытии Hearfolio.","Closing this screen keeps recording. Saved audio appears in the archive when you open Hearfolio.");setTextColor(Color.rgb(156,156,166))})
@@ -58,7 +58,7 @@ class TileRecordingActivity : Activity() {
     }
     override fun onPostResume(){
         super.onPostResume();handler.post(refresh)
-        if(!requested){requested=true;if(RecordingService.instance==null)requestRecording()}
+        if(!requested){requested=true;if(!RecordingService.busy())requestRecording()}
     }
     private fun requestRecording(){
         if(ContextCompat.checkSelfPermission(this,Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO),1);return}
@@ -74,13 +74,14 @@ class TileRecordingActivity : Activity() {
     private fun begin(){
         if(!hasWindowFocus()){awaitingFocus=true;return}
         awaitingFocus=false
-        if(starting || RecordingService.instance!=null)return
+        if(starting || RecordingService.busy())return
         starting=true
         val dir=File(filesDir,"hearfolio-quick-recordings").apply{mkdirs()}
         val target=File(dir,"hearfolio-recording-${UUID.randomUUID()}.wav.partial")
-        RecordingService.ready={error->starting=false;if(error!=null)failure=tr("Не удалось начать запись. Откройте Hearfolio.","Could not start recording. Open Hearfolio.");update()}
+        val ticket=RecordingService.starts.reserve(target.path,quick=true,revision=RecordingService.stateRevision+1) { error -> runOnUiThread { starting=false;if(error!=null)failure=tr("Не удалось начать запись. Откройте Hearfolio.","Could not start recording. Open Hearfolio.");update() } }
+        if(ticket==null) {starting=false;update();return}
         try {ContextCompat.startForegroundService(this,Intent(this,RecordingService::class.java).setAction(RecordingService.START).putExtra("path",target.path).putExtra("quick",true))}
-        catch(_:Exception){starting=false;RecordingService.ready=null;failure=tr("Не удалось начать запись. Откройте Hearfolio.","Could not start recording. Open Hearfolio.");update()}
+        catch(_:Exception){starting=false;RecordingService.starts.cancel(target.path);failure=tr("Не удалось начать запись. Откройте Hearfolio.","Could not start recording. Open Hearfolio.");update()}
     }
     private fun update(){
         val state=RecordingService.state

@@ -276,7 +276,7 @@ export async function resumeAudioRecording():Promise<void>{
   if(!browserRecording)throw new Error('errors.recordingUnavailable');browserRecording.paused=false;
 }
 export async function stopAudioRecording():Promise<AudioSelection|null> {
-  if(!preview&&nativePlatform?.os==='android'){try{return await call<AudioSelection>('stop_audio_recording');}finally{nativeRecordingActive=false;}}
+  if(!preview&&nativePlatform?.os==='android'){const result=await call<AudioSelection>('stop_audio_recording');nativeRecordingActive=false;return result;}
   if(fixtureRecording){fixtureRecording=false;const samples=Int16Array.from({length:48000},(_,index)=>Math.round(Math.sin(index*2*Math.PI*440/16000)*1000));const file=recordingWav([samples],16000);return {path:registerPreviewFile(file),name:file.name};}
   const recording=browserRecording;if(!recording)throw new Error('errors.recordingUnavailable');browserRecording=null;
   closeBrowserRecording(recording);await recording.queue;
@@ -287,6 +287,7 @@ export async function stopAudioRecording():Promise<AudioSelection|null> {
 }
 export async function cancelAudioRecording():Promise<void> {
   recordingGeneration++;fixtureRecording=false;
+  if(!preview&&nativePlatform?.os==='android'){await call('cancel_audio_recording');nativeRecordingActive=false;return;}
   nativeRecordingActive=false;
   const recording=browserRecording;browserRecording=null;
   if(recording){closeBrowserRecording(recording);await recording.queue;}

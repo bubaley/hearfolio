@@ -1,6 +1,38 @@
 const levelValue=(value:number)=>Number.isFinite(value)?Math.max(0,Math.min(1,value)):0;
 const sessionPath=(path:string|undefined)=>path?.endsWith('.wav.partial')?path.slice(0,-8):path;
 
+/** Smooth only the small interval between measured native samples, never a suspended UI. */
+export class NativeRecorderClock {
+  private measured=0;
+  private receivedAt=0;
+  private running=false;
+  private displayed=0;
+  reset(){this.measured=0;this.receivedAt=0;this.running=false;this.displayed=0;}
+  synchronize(millis:number,state:string,now:number){
+    if(!Number.isFinite(millis)||millis<0||!Number.isFinite(now))return;
+    this.measured=millis;this.receivedAt=now;this.running=state==='recording';
+    if(!this.running)this.displayed=millis;
+  }
+  milliseconds(now:number){
+    const advance=this.running?Math.min(350,Math.max(0,now-this.receivedAt)):0;
+    this.displayed=this.running?Math.max(this.displayed,this.measured+advance):this.measured;
+    return this.displayed;
+  }
+}
+
+/** A control must read fresh state after an older in-flight snapshot, not skip it. */
+export class RecordingSnapshotPoll {
+  private active:Promise<void>|null=null;
+  read(read:()=>Promise<void>,fresh=false):Promise<void>{
+    if(this.active){
+      return fresh?this.active.then(()=>this.read(read,true),()=>this.read(read,true)):this.active;
+    }
+    const active=Promise.resolve().then(read);
+    this.active=active;
+    return active.finally(()=>{if(this.active===active)this.active=null;});
+  }
+}
+
 /** Orders native state and completion deliveries across pause and session changes. */
 export class NativeRecordingOrder {
   private revision=-1;
@@ -15,17 +47,18 @@ export class NativeRecordingOrder {
     payload={...payload,path:sessionPath(payload.path)};
     const revision=typeof payload.stateRevision==='number'&&Number.isSafeInteger(payload.stateRevision)?payload.stateRevision:undefined;
     const live=payload.state==='recording'||payload.state==='paused';
+    const active=live||payload.state==='starting'||payload.state==='stopping';
     if(revision!==undefined&&revision<this.revision)return false;
     if(this.starting){
       const confirmedEnd=this.startConfirmed&&['stopping','finished','error','idle','cancelled'].includes(payload.state||'')&&revision!==undefined;
       if((!live&&!confirmedEnd)||!payload.path||payload.path===this.path||(revision!==undefined&&revision<=this.revision))return false;
       this.starting=false;
     }else if(payload.path&&this.path&&payload.path!==this.path){
-      if(!live||revision===undefined||revision<=this.revision)return false;
+      if(!active||revision===undefined||revision<=this.revision)return false;
     }
     if(revision!==undefined)this.revision=revision;
     if(payload.path)this.path=payload.path;
-    this.live=live;
+    this.live=active;
     return true;
   }
   acceptResult(payload:{stateRevision?:number;path?:string}):boolean {
