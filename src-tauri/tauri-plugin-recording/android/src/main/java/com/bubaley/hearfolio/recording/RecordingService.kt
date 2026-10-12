@@ -131,7 +131,7 @@ class RecordingService : Service() {
                 ready?.invoke(null); ready = null
             } catch (error: Exception) {
                 recorder?.release(); recorder = null; allocated?.delete(); state = "error"
-                this.error = if(error is SecurityException) "errors.microphonePermissionDenied" else "errors.recordingStart"; persist(this); releaseWake()
+                RecordingService.error = if(error is SecurityException) "errors.microphonePermissionDenied" else "errors.recordingStart"; persist(this); releaseWake()
                 ready?.invoke(if (error is SecurityException) "errors.microphonePermissionDenied" else "errors.recordingStart"); ready = null; stopSelf()
             }
             }
@@ -156,12 +156,12 @@ class RecordingService : Service() {
         catch (_: Exception) {
             val recovered = WavRecovery.recover(File(path))
             if(recovered != null) {
-                recoveredElapsed = recovered; startedAt = 0L; state = "finished"; interrupted = true; this.error = "errors.recordingInterrupted"
+                recoveredElapsed = recovered; startedAt = 0L; state = "finished"; interrupted = true; RecordingService.error = "errors.recordingInterrupted"
                 if(quickRecording) { val target=File(path.removeSuffix(".partial"));if(File(path).renameTo(target)) path=target.path else {state="error";error="errors.recordingStop"} }
             } else { state = "error"; error = "errors.recordingEmpty" }
         }
         finally { active.release() }
-        this.error = if(error.isNotEmpty()) error else this.error
+        RecordingService.error = if(error.isNotEmpty()) error else RecordingService.error
         releaseWake(); handler.removeCallbacks(deadline); persist(this)
         stopForeground(STOP_FOREGROUND_REMOVE)
         if(fromNotification && error.isEmpty()) getSystemService(NotificationManager::class.java).notify(ID,notification(true))

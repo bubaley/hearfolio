@@ -20,7 +20,7 @@ internal object WavRecovery {
         RandomAccessFile(file,"rw").use { wav ->
             if(wav.length() <= 44) return null
             val bytes = ByteArray(44); wav.readFully(bytes)
-            fun tag(offset: Int, value: String) = String(bytes,offset,value.length(),Charsets.US_ASCII) == value
+            fun tag(offset: Int, value: String) = String(bytes,offset,value.length,Charsets.US_ASCII) == value
             fun little(offset: Int,size: Int): Long { var value=0L;repeat(size){value=value or ((bytes[offset+it].toLong() and 255) shl (8*it))};return value }
             if(!tag(0,"RIFF") || !tag(8,"WAVEfmt ") || !tag(36,"data") || little(20,2)!=1L || little(22,2)!=1L || little(34,2)!=16L) return null
             val rate=little(24,4).toInt(); if(rate !in 8000..192000) return null
