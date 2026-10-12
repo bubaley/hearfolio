@@ -1,15 +1,15 @@
 .settings-layout { display: grid; grid-template-columns: 190px minmax(0,1fr); gap: 32px; min-width: 0; }
 .settings-navigation { min-width: 0; }
 .settings-navigation h1 { font-size: 19px; margin: 0 0 22px 9px; }
-.settings-navigation nav { display: grid; gap: 3px; }
-.settings-nav-item { justify-content: flex-start; text-align: left; width: 100%; padding: 11px 10px; border-radius: 7px; gap: 10px; min-height: 43px; }
+.settings-navigation nav { display: grid; gap: 4px; }
+.settings-nav-item { justify-content: flex-start; text-align: left; width: 100%; padding: 12px 10px; border-radius: 7px; gap: 10px; min-height: 60px; }
 .settings-nav-item:hover { background: var(--hover); }
+.settings-nav-item:active { background: var(--selected); }
 .settings-nav-item.selected { background: var(--selected); }
 .settings-nav-item>svg:first-child { width: 16px; height: 16px; color: var(--muted); }
-.settings-nav-item>svg:last-child { display: none; }
 .settings-nav-item span { min-width: 0; }
 .settings-nav-item strong { display: block; font-size: 12px; font-weight: 500; }
-.settings-nav-item small { display: none; }
+.settings-nav-item small { display: block; margin-top: 3px; font-size: 11px; line-height: 1.5; color: var(--muted); }
 .settings-detail { min-width: 0; max-width: 650px; }
 .settings-detail-heading { margin-bottom: 26px; }
 .settings-detail-heading h1 { font-size: 21px; }
@@ -40,13 +40,10 @@
   .settings-layout.has-selection .settings-navigation { display: none; }
   .settings-layout:not(.has-selection) .settings-detail { display: none; }
   .settings-navigation h1 { font-size: 24px; margin: 0 0 24px; }
-  .settings-navigation nav { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; gap: 0; }
-  .settings-nav-item { min-height: 70px; padding: 14px; border-radius: 0; gap: 12px; }
-  .settings-nav-item+.settings-nav-item { border-top: 1px solid var(--line); }
+  .settings-navigation nav { gap: 4px; }
+  .settings-nav-item { min-height: 70px; padding: 14px 4px; gap: 12px; }
   .settings-nav-item>svg:first-child { width: 20px; height: 20px; }
-  .settings-nav-item>svg:last-child { display: block; margin-left: auto; color: var(--faint); width: 16px; }
   .settings-nav-item strong { font-size: 14px; }
-  .settings-nav-item small { display: block; margin-top: 3px; font-size: 11px; line-height: 1.5; color: var(--muted); }
   .settings-back { display: inline-flex; min-height: 44px; margin: -13px 0 13px -7px; padding: 0 7px; color: var(--accent); font-size: 13px; }
   .settings-back svg { transform: rotate(180deg); width: 16px; }
   .settings-detail-heading h1 { font-size: 24px; }
@@ -63,6 +60,4 @@
 .settings-mobile:not(.has-selection) .settings-detail { display: none; }
 .settings-mobile .settings-back { display: inline-flex; min-height: 44px; color: var(--accent); }
 .settings-mobile .settings-back svg { transform: rotate(180deg); }
-.settings-mobile .settings-nav-item { min-height: 70px; }
-.settings-mobile .settings-nav-item small { display: block; color: var(--muted); font-size: 11px; margin-top: 3px; }
-.settings-mobile .settings-nav-item>svg:last-child { display: block; margin-left: auto; }
+.settings-mobile .settings-nav-item { min-height: 70px; padding: 14px 4px; }

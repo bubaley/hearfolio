@@ -122,7 +122,9 @@ Open **Devices**, enter your own relay URL and this device's name, and connect t
 
 ## Microphone recording
 
-Select **Record audio** on the new recording screen. Allow microphone access when the operating system asks, then use **Pause**, **Resume**, or **Save recording**. Cancel discards the capture. A failed archive save keeps the recording available for another attempt.
+Select **Record audio** on the new recording screen. Allow microphone access when the operating system asks, then use **Pause**, **Resume**, or **Save recording**. Cancel discards the capture. A failed archive save keeps the recording available for another attempt. Open **Share** on a saved recording to send its audio or text, transfer it to another device, save a copy, or copy the transcript. Text actions appear once a transcript is available.
+
+The recorder shows measured audio history to the left of the current-time marker. On Android, its timer and waveform come from captured PCM, survive returning from the background, and exclude paused time. Recoverable microphone failures recreate the audio input while keeping the same WAV file and sample rate. If recovery fails, the captured audio is preserved with an interruption warning. A pending disk write must finish before the recording becomes available for playback or export.
 
 Android uses foreground services with persistent notifications for recording, transcription, text processing, and transfers. You can lock the screen after starting an operation. Returning to Hearfolio restores its progress or committed result without repeating a cloud request. If the process is killed, recoverable WAV audio is retained and unfinished processing is reported as interrupted. Recording audio does not send it to OpenRouter until you start transcription with that service selected.
 

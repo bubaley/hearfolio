@@ -192,13 +192,25 @@ pub fn append_audio_recording(samples: Vec<i16>) -> Result<(), String> {
 #[tauri::command]
 pub async fn stop_audio_recording(app: tauri::AppHandle) -> Result<AudioSelection, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let mut session = SESSION
+        #[cfg(target_os = "android")]
+        let path = SESSION
             .lock()
             .map_err(|_| "errors.recordingStop")?
-            .take()
+            .as_ref()
+            .map(|session| session.path.clone())
             .ok_or("errors.recordingUnavailable")?;
+        // Retain the registered session during the bridge call. If the Activity
+        // loses its response, the journal monitor/snapshot can still complete
+        // and archive it. Never take a newer recording after a delayed response.
         #[cfg(target_os = "android")]
-        native(&app, "stop", None)?;
+        native(&app, "stop", Some(&path))?;
+        let mut active = SESSION.lock().map_err(|_| "errors.recordingStop")?;
+        #[cfg(target_os = "android")]
+        let mut session = take_terminal_session(&mut active, "finished", &path)
+            .ok_or("errors.recordingUnavailable")?;
+        #[cfg(not(target_os = "android"))]
+        let mut session = active.take().ok_or("errors.recordingUnavailable")?;
+        drop(active);
         #[cfg(not(target_os = "android"))]
         let _ = app;
         if let Some(writer) = session.writer.take() {
@@ -232,14 +244,25 @@ pub async fn stop_audio_recording(app: tauri::AppHandle) -> Result<AudioSelectio
 pub async fn cancel_audio_recording(app: tauri::AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         #[cfg(target_os = "android")]
-        let result = native(&app, "cancel", None);
+        {
+            let path = SESSION
+                .lock()
+                .map_err(|_| "errors.recordingStop")?
+                .as_ref()
+                .map(|session| session.path.clone());
+            if let Some(path) = path {
+                native(&app, "cancel", Some(&path))?;
+                let mut active = SESSION.lock().map_err(|_| "errors.recordingStop")?;
+                take_terminal_session(&mut active, "cancelled", &path);
+            }
+            return Ok(());
+        }
         #[cfg(not(target_os = "android"))]
-        let result = {
+        {
             let _ = app;
+            SESSION.lock().map_err(|_| "errors.recordingStop")?.take();
             Ok(())
-        };
-        SESSION.lock().map_err(|_| "errors.recordingStop")?.take();
-        result
+        }
     })
     .await
     .map_err(|_| "errors.recordingStop")?
@@ -373,6 +396,11 @@ fn take_terminal_session(
     }
 }
 
+#[cfg(any(target_os = "android", test))]
+fn native_state_payload(status: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"state":status["state"],"stateRevision":status["stateRevision"],"path":status["path"],"elapsedSeconds":status["elapsedSeconds"],"elapsedMillis":status["elapsedMillis"].as_u64().unwrap_or_else(||status["elapsedSeconds"].as_u64().unwrap_or(0)*1000),"envelope":status["envelope"],"envelopeSequence":status["envelopeSequence"],"envelopeIntervalMs":status["envelopeIntervalMs"]})
+}
+
 #[cfg(target_os = "android")]
 fn monitor(app: tauri::AppHandle, path: PathBuf) {
     use tauri::Emitter;
@@ -400,7 +428,7 @@ fn monitor(app: tauri::AppHandle, path: PathBuf) {
                     if let Ok(mut paths) = FINISHED.lock() {
                         paths.insert(path.clone());
                     }
-                    let payload = serde_json::json!({"error":"errors.recordingInterrupted","selection":{"path":path,"name":"Recording.wav"}});
+                    let payload = serde_json::json!({"path":path,"error":"errors.recordingInterrupted","selection":{"path":path,"name":"Recording.wav"}});
                     store_recording_result(&payload);
                     drop(session);
                     let _ = app.emit("recording-native-finished", payload);
@@ -419,10 +447,7 @@ fn monitor(app: tauri::AppHandle, path: PathBuf) {
                 continue;
             }
             let state = status["state"].as_str().unwrap_or("");
-            let _ = app.emit(
-            "recording-native-state",
-            serde_json::json!({"state":state,"elapsedSeconds":status["elapsedSeconds"].as_u64().unwrap_or(0)+if state=="recording" {crate::clock().saturating_sub(status["updatedAt"].as_u64().unwrap_or(crate::clock()))/1000} else {0}}),
-        );
+            let _ = app.emit("recording-native-state", native_state_payload(&status));
             if state == "finished" {
                 let session = SESSION.lock().ok().and_then(|mut s| {
                     if s.as_ref().is_some_and(|s| s.path == path) {
@@ -436,7 +461,12 @@ fn monitor(app: tauri::AppHandle, path: PathBuf) {
                     if let Ok(mut paths) = FINISHED.lock() {
                         paths.insert(path.clone());
                     }
-                    let payload = archive_native_recording(&app, &path, status["error"].as_str());
+                    let payload = archive_native_recording(
+                        &app,
+                        &path,
+                        status["error"].as_str(),
+                        &status["stateRevision"],
+                    );
                     drop(session);
                     store_recording_result(&payload);
                     let _ = app.emit("recording-native-finished", payload);
@@ -457,7 +487,7 @@ fn monitor(app: tauri::AppHandle, path: PathBuf) {
                     }
                     session.take();
                 }
-                let payload = serde_json::json!({"error":status["error"].as_str().unwrap_or("errors.recordingEmpty"),"selection":if state=="error" && path.exists() {Some(serde_json::json!({"path":path,"name":"Recording.wav"}))} else {None}});
+                let payload = serde_json::json!({"path":path,"stateRevision":status["stateRevision"],"error":status["error"].as_str().unwrap_or("errors.recordingEmpty"),"selection":if state=="error" && path.exists() {Some(serde_json::json!({"path":path,"name":"Recording.wav"}))} else {None}});
                 store_recording_result(&payload);
                 let _ = app.emit("recording-native-finished", payload);
                 break;
@@ -490,13 +520,13 @@ pub async fn recording_activity_snapshot(
                     FINISHED.lock().map_err(|_|"errors.recordingStop")?.insert(path.clone());
                 }
                 let payload=if terminal_state=="finished" {
-                    archive_native_recording(&app,&path,status["error"].as_str())
+                    archive_native_recording(&app,&path,status["error"].as_str(),&status["stateRevision"])
                 } else {
-                    serde_json::json!({"error":status["error"].as_str().unwrap_or("errors.recordingInterrupted"),"selection":if path.exists(){Some(serde_json::json!({"path":path,"name":"Recording.wav"}))}else{None}})
+                    serde_json::json!({"path":path,"stateRevision":status["stateRevision"],"error":status["error"].as_str().unwrap_or("errors.recordingInterrupted"),"selection":if path.exists(){Some(serde_json::json!({"path":path,"name":"Recording.wav"}))}else{None}})
                 };
                 let success=payload["entry"].is_object();
                 store_recording_result(&payload);drop(session);
-                if success { bridge.transfer::<()>("acknowledgeRecording",serde_json::json!({}))?;status["state"]=serde_json::json!("idle"); }
+                if success { bridge.transfer::<()>("acknowledgeRecording",serde_json::json!({"path":path}))?;status["state"]=serde_json::json!("idle"); }
             } else if status["state"]=="finished" && status["quick"]!=true {
                 // Recover a completed service recording after process recreation.
                 let _job=JobGuard::acquire()?;
@@ -505,14 +535,16 @@ pub async fn recording_activity_snapshot(
                     let file=path.canonicalize().map_err(|_|"errors.recordingStop")?;
                     if file.parent()==Some(base.as_path()) && native_recording_id(&file).is_some() {
                         FINISHED.lock().map_err(|_|"errors.recordingStop")?.insert(file.clone());
-                        let payload=archive_native_recording(&app,&file,status["error"].as_str());
+                        let payload=archive_native_recording(&app,&file,status["error"].as_str(),&status["stateRevision"]);
                         let success=payload["entry"].is_object();store_recording_result(&payload);
-                        if success { bridge.transfer::<()>("acknowledgeRecording",serde_json::json!({}))?;status["state"]=serde_json::json!("idle"); }
+                        if success { bridge.transfer::<()>("acknowledgeRecording",serde_json::json!({"path":file}))?;status["state"]=serde_json::json!("idle"); }
                     }
                 }
             }
             let result=LAST_RESULT.lock().map_err(|_|"errors.recordingStop")?.clone().or_else(||fs::read(crate::base().ok()?.join("recording-result.json")).ok().and_then(|b|serde_json::from_slice(&b).ok()));
-            Ok(serde_json::json!({"state":status["state"],"quick":status["quick"],"level":status["level"],"elapsedSeconds":status["elapsedSeconds"],"path":status["path"],"error":status["error"],"interrupted":status["interrupted"],"result":result}))
+            let mut snapshot=native_state_payload(&status);
+            snapshot["quick"]=status["quick"].clone();snapshot["level"]=status["level"].clone();snapshot["error"]=status["error"].clone();snapshot["interrupted"]=status["interrupted"].clone();snapshot["result"]=serde_json::json!(result);
+            Ok(snapshot)
         }
         #[cfg(not(target_os="android"))]
         {let _=app; Ok(serde_json::json!({"state":"idle"}))}
@@ -631,22 +663,36 @@ mod quick_tests {
 }
 
 #[tauri::command]
-pub async fn recording_quick_control(app: tauri::AppHandle, action: String) -> Result<(), String> {
-    if !["stop", "cancel"].contains(&action.as_str()) {
+pub async fn recording_quick_control(
+    app: tauri::AppHandle,
+    action: String,
+    path: Option<String>,
+) -> Result<(), String> {
+    if !["stop", "cancel", "pause", "resume"].contains(&action.as_str()) {
         return Err("errors.recordingUnavailable".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
         #[cfg(target_os = "android")]
         {
-            app.state::<tauri_plugin_recording::Recording<tauri::Wry>>()
-                .transfer::<()>(
-                    "quickControl",
-                    serde_json::json!({"id":"quick","stage":action}),
-                )
+            let bridge = app.state::<tauri_plugin_recording::Recording<tauri::Wry>>();
+            let path = if let Some(path) = path {
+                path
+            } else {
+                let status: serde_json::Value =
+                    bridge.transfer("recordingStatus", serde_json::json!({}))?;
+                status["path"]
+                    .as_str()
+                    .ok_or("errors.recordingUnavailable")?
+                    .to_owned()
+            };
+            bridge.transfer::<()>(
+                "quickControl",
+                serde_json::json!({"id":"quick","stage":action,"path":path}),
+            )
         }
         #[cfg(not(target_os = "android"))]
         {
-            let _ = (app, action);
+            let _ = (app, action, path);
             Err("errors.recordingUnavailable".into())
         }
     })
@@ -682,6 +728,7 @@ fn archive_native_recording(
     app: &tauri::AppHandle,
     path: &Path,
     warning: Option<&str>,
+    state_revision: &serde_json::Value,
 ) -> serde_json::Value {
     let result = (|| {
         let id = native_recording_id(path).ok_or("errors.recordingStop")?;
@@ -710,9 +757,11 @@ fn archive_native_recording(
         )
     })();
     match result {
-        Ok(entry) => serde_json::json!({"entry":entry,"warning":warning}),
+        Ok(entry) => {
+            serde_json::json!({"path":path,"stateRevision":state_revision,"entry":entry,"warning":warning,"error":warning})
+        }
         Err(error) => {
-            serde_json::json!({"error":error,"warning":warning,"selection":{"path":path,"name":"Recording.wav"}})
+            serde_json::json!({"path":path,"stateRevision":state_revision,"error":error,"warning":warning,"selection":{"path":path,"name":"Recording.wav"}})
         }
     }
 }
@@ -750,12 +799,20 @@ pub async fn resume_audio_recording(app: tauri::AppHandle) -> Result<(), String>
 async fn control_recording(app: tauri::AppHandle, _stage: &'static str) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         #[cfg(target_os = "android")]
-        return app
-            .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
-            .run(
-                "recordingControl",
-                serde_json::json!({"id":"recording","stage":_stage}),
-            );
+        {
+            let path = SESSION
+                .lock()
+                .map_err(|_| "errors.recordingUnavailable")?
+                .as_ref()
+                .map(|session| session.path.clone())
+                .ok_or("errors.recordingUnavailable")?;
+            return app
+                .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
+                .run(
+                    "recordingControl",
+                    serde_json::json!({"stage":_stage,"path":path}),
+                );
+        }
         #[cfg(not(target_os = "android"))]
         {
             let _ = app;
@@ -785,6 +842,24 @@ pub async fn open_android_battery_settings(app: tauri::AppHandle) -> Result<(), 
 #[cfg(test)]
 mod native_recovery_tests {
     use super::*;
+    #[test]
+    fn native_state_preserves_session_revision_and_measured_time_without_wall_clock_extrapolation()
+    {
+        let status = serde_json::json!({"state":"paused","stateRevision":7,"path":"/private/recording.wav","elapsedSeconds":3,"elapsedMillis":3125,"updatedAt":0,"envelope":[0.1,0.7],"envelopeSequence":25,"envelopeIntervalMs":125});
+        let payload = native_state_payload(&status);
+        assert_eq!(payload["elapsedMillis"], 3125);
+        assert_eq!(payload["elapsedSeconds"], 3);
+        assert_eq!(payload["stateRevision"], 7);
+        assert_eq!(payload["path"], status["path"]);
+        assert_eq!(payload["envelope"], status["envelope"]);
+        let mut resumed = status.clone();
+        resumed["state"] = serde_json::json!("recording");
+        resumed["stateRevision"] = serde_json::json!(8);
+        let next = native_state_payload(&resumed);
+        assert_eq!(next["elapsedMillis"], payload["elapsedMillis"]);
+        assert_eq!(next["envelopeSequence"], payload["envelopeSequence"]);
+        assert!(next["stateRevision"].as_u64() > payload["stateRevision"].as_u64());
+    }
     #[test]
     fn terminal_snapshot_releases_matching_session_after_journal_failure_and_preserves_source() {
         let _serial = JOB_TEST_LOCK.lock().unwrap();

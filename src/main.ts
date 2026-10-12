@@ -1,8 +1,9 @@
 import {recordNameParts, renamedRecordTitle} from './record-name';
-import {RecorderEnvelope} from './recorder-meter';
+import {normalizeAudioCatalog, readAudioCatalog, saveAudioCatalog} from './cloud-catalog';
+import {RecorderEnvelope,NativeRecordingOrder} from './recorder-meter';
 import {pauseAudioRecording, resumeAudioRecording, restoreNativeRecordingFlag, observePendingOperation, operationHandled, markOperationHandled} from './api';
 import type {OperationSnapshot} from './operation-recovery';
-import {transferSettingsHtml, devicesHtml, transferBarHtml, shareButtonHtml, bindTransfers, initializeTransfers, hasTransferDraft, discardTransferDraft, transferActivityLabel} from './transfers';
+import {transferSettingsHtml, devicesHtml, transferBarHtml, shareRecordingToDevice, bindTransfers, initializeTransfers, hasTransferDraft, discardTransferDraft, transferActivityLabel} from './transfers';
 import './styles.css';
 import './transfers.css';
 import {renderSettings, initialSettingsDraft, mergeSettingsDraft, hasSettingsChanges, isSettingsSection, settingsLabel, type SettingsSection, type SettingsDraft} from './settings-ui';
@@ -42,19 +43,32 @@ let recordingPhase:'idle'|'starting'|'recording'|'paused'|'stopping'|'cancelling
 let outputTab:'transcript'|'results'='transcript';
 let playerId='', playerLoading=false, playerError='', playerState:NativePlayerState={duration:0,currentTime:0,playing:false}, playerPoll:ReturnType<typeof setTimeout>|null=null, playerGeneration=0;
 const microphone=()=>'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><rect x="9" y="2" width="6" height="13" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg>';
-let nativeRecordingSeconds:number|null=null,externalRecording=false;
-let nativeInputLevel=0, nativeLevelAt=0;
+let nativeRecordingSeconds:number|null=null,nativeRecordingMillis:number|null=null,nativeRecordingPath='',externalRecording=false,recordingControlPending=false,nativeCaptureGeneration=0;
 const recorderEnvelope=new RecorderEnvelope();
-function recordingMeterHtml(){return `<div class="recorder-timeline" role="img" aria-label="${tr('Уровень микрофона')}"><div class="recorder-bars">${recorderEnvelope.levels().map(level=>`<i style="--level:${level}"></i>`).join('')}</div><div class="recorder-playhead" aria-hidden="true"></div><div class="recorder-ruler" aria-hidden="true">${Array(17).fill('<i></i>').join('')}</div></div>`;}
+const nativeRecordingOrder=new NativeRecordingOrder();
+type NativeCapture={state:string;stateRevision?:number;path?:string;elapsedSeconds?:number;elapsedMillis?:number;level?:number;envelope?:number[];envelopeSequence?:number;envelopeIntervalMs?:number};
+function recordingMilliseconds(){return nativeRecordingMillis??(nativeRecordingSeconds!==null?nativeRecordingSeconds*1000:recordingStarted?Math.max(0,(recordingPausedAt||Date.now())-recordingStarted-recordingPausedMillis):0);}
+function recorderRulerHtml(){const seconds=recordingMilliseconds()/1000,span=recorderEnvelope.size*recorderEnvelope.interval/1000;return Array.from({length:5},(_,index)=>{const time=seconds+(index-2)*span/2;return `<span>${time>=0?formatTime(time):''}</span>`;}).join('');}
+function recordingMeterHtml(){return `<div class="recorder-timeline" role="img" aria-label="${tr('Уровень микрофона')}"><div class="recorder-ruler" aria-hidden="true">${recorderRulerHtml()}</div><div class="recorder-wave"><div class="recorder-bars">${recorderEnvelope.levels().map(level=>`<i style="--level:${level}"></i>`).join('')}</div><div class="recorder-playhead" aria-hidden="true"></div></div></div>`;}
+function paintRecorderMeter(){const meter=document.querySelector('.recorder-bars');if(meter)meter.querySelectorAll<HTMLElement>('i').forEach((bar,index)=>bar.style.setProperty('--level',String(recorderEnvelope.levels()[index])));const ruler=document.querySelector('.recorder-ruler');if(ruler)ruler.innerHTML=recorderRulerHtml();const timer=document.querySelector('#recording-duration');if(timer)timer.textContent=recordingDuration();}
+function applyNativeCapture(p:NativeCapture){
+  const sameSession=!p.path||p.path===nativeRecordingPath;
+  const old=Boolean(['recording','paused'].includes(p.state)&&sameSession&&p.elapsedMillis!==undefined&&nativeRecordingMillis!==null&&p.elapsedMillis<nativeRecordingMillis);
+  if(old||!nativeRecordingOrder.accept(p))return false;
+  if(p.path&&p.path!==nativeRecordingPath){nativeRecordingPath=p.path;nativeRecordingMillis=null;nativeRecordingSeconds=null;recorderEnvelope.reset();}
+  if(p.elapsedMillis!==undefined)nativeRecordingMillis=p.elapsedMillis;
+  if(p.elapsedSeconds!==undefined)nativeRecordingSeconds=p.elapsedSeconds;
+  if(p.envelope&&p.envelopeSequence!==undefined&&p.path)recorderEnvelope.synchronize(p.envelope,p.envelopeSequence,p.path);
+  paintRecorderMeter();return true;
+}
 function updateRecorderMeter(){
-  if(document.hidden||recordingPhase!=='recording')return;
-  const meter=document.querySelector('.recorder-bars');if(!meter)return;
-  const now=performance.now(),level=platform.os==='android'&&!preview?(now-nativeLevelAt<700?nativeInputLevel:0):recordingInputLevel();
-  if(recorderEnvelope.sample(level,now,true))meter.querySelectorAll<HTMLElement>('i').forEach((bar,i)=>bar.style.setProperty('--level',String(recorderEnvelope.levels()[i])));
+  if(document.hidden||!['recording','paused'].includes(recordingPhase))return;
+  if(platform.os==='android'&&!preview){paintRecorderMeter();return;}
+  if(recordingPhase==='recording'&&recorderEnvelope.sample(recordingInputLevel(),performance.now(),true))paintRecorderMeter();
 }
 setInterval(updateRecorderMeter,125);
 let recordingPausedAt=0,recordingPausedMillis=0;
-const recordingDuration=()=>formatTime(nativeRecordingSeconds??(recordingStarted?Math.floor(((recordingPausedAt||Date.now())-recordingStarted-recordingPausedMillis)/1000):0));
+const recordingDuration=()=>{const millis=recordingMilliseconds();return `${String(Math.floor(millis/60000)).padStart(2,'0')}:${String(Math.floor(millis/1000)%60).padStart(2,'0')}.${String(Math.floor(millis/10)%100).padStart(2,'0')}`;};
 document.documentElement.dataset.theme=theme;
 const title:Record<View,string>={work:"Расшифровка",history:"Записи",models:"Модели",settings:"Настройки",devices:"Устройства",rules:"Правила обработки"};
 const modelName=(id:string|null)=>{const normalized=id?.replace(/^openrouter\//,'');return models.find(model=>model.id===normalized)?.name||cloudModels.find(model=>model.id===normalized)?.name||normalized||tr("Модель не выбрана");};
@@ -70,7 +84,11 @@ function readiness():string {
   if(platform.os==='unknown')return tr(runtimeLoaded?'Не удалось определить платформу. Перезапустите приложение.':'Проверяем готовность…');
   if (!runtimeLoaded) return tr("Проверяем готовность…");
   if (!runtime.ffmpeg&&(configuration.provider==='local'||!platform.nativeAudio)) return tr("Установите FFmpeg для подготовки аудио.");
-  if (configuration.provider==='openrouter') return !settings.hasToken?tr("Добавьте API token OpenRouter."):cloudLoading?tr("Загружаем модели…"):catalogError?tr("Обновите каталог моделей."):!cloudModels.some(model=>model.id===configuration.model&&model.modes.includes(configuration.mode as 'streaming'|'transcription'))?tr("Выберите доступную модель OpenRouter."):'';
+  if (configuration.provider==='openrouter') {
+    if(!settings.hasToken)return tr("Добавьте API token OpenRouter.");
+    if(cloudModels.some(model=>model.id===configuration.model&&model.modes.includes(configuration.mode as 'streaming'|'transcription')))return '';
+    return cloudLoading?tr("Загружаем модели…"):catalogError?tr("Обновите каталог моделей."):tr("Выберите доступную модель OpenRouter.");
+  }
   const chosen=models.find(model=>model.id===localChoice);
   if (!chosen?.installed) return tr("Скачайте выбранную модель.");
   if (localChoice==='nemotron-3.5'&&!runtime.nemo) return tr("Установите движок NeMo для этой модели.");
@@ -128,7 +146,7 @@ function captureHtml():string {
   if(recordingPhase!=='idle'){
     const live=['recording','paused'].includes(recordingPhase),paused=recordingPhase==='paused';
     const label=tr(recordingPhase==='starting'?'Подключаем микрофон…':recordingPhase==='stopping'?'Сохраняем аудио…':recordingPhase==='cancelling'?'Отменяем запись…':paused?'Запись на паузе':'Идёт запись');
-    return `<section class="capture-panel recording-panel ${paused?'recorder-paused':''}" aria-label="${tr('Диктофон')}"><div class="recorder-heading"><span class="recorder-dot" aria-hidden="true"></span><span>${label}</span></div><div class="recording-duration" id="recording-duration" aria-label="${tr('Длительность записи')}">${recordingDuration()}</div>${recordingMeterHtml()}<div class="recorder-meter-caption"><span>${tr('Уровень микрофона')}</span>${paused?`<span>${tr('Пауза')}</span>`:`<span class="recorder-live">${tr('Запись')}</span>`}</div><div class="recorder-actions"><button type="button" class="secondary recorder-pause" id="pause-recording" ${!live?'disabled':''}>${icon(paused?'play':'pause')}<span>${tr(paused?'Продолжить':'Пауза')}</span></button><button type="button" class="primary capture-stop" id="stop-recording" ${!live?'disabled':''}><span class="stop-symbol"></span><span>${tr('Сохранить запись')}</span></button></div><button type="button" class="text-button capture-cancel" id="cancel-recording" ${!live?'disabled':''}>${tr('Отменить запись')}</button></section>`;
+    return `<section class="capture-panel recording-panel ${paused?'recorder-paused':''}" aria-label="${tr('Диктофон')}"><div class="recorder-heading"><span class="recorder-dot" aria-hidden="true"></span><span>${label}</span></div><div class="recording-duration" id="recording-duration" aria-label="${tr('Длительность записи')}">${recordingDuration()}</div>${recordingMeterHtml()}<div class="recorder-meter-caption"><span>${tr('Записанный звук')}</span><span>${tr('Сейчас')}</span></div><div class="recorder-actions"><button type="button" class="secondary recorder-pause" id="pause-recording" ${!live||recordingControlPending?'disabled':''}>${icon(paused?'play':'pause')}<span>${tr(paused?'Продолжить':'Пауза')}</span></button><button type="button" class="primary capture-stop" id="stop-recording" ${!live||recordingControlPending?'disabled':''}><span class="stop-symbol"></span><span>${tr('Сохранить запись')}</span></button></div><button type="button" class="text-button capture-cancel" id="cancel-recording" ${!live||recordingControlPending?'disabled':''}>${tr('Отменить запись')}</button></section>`;
   }
   if(pendingRecording)return `<div class="capture-panel"><div class="empty-symbol">${microphone()}</div><h1>${tr('Аудио записано')}</h1><p>${tr('Добавьте запись в архив, чтобы перейти к распознаванию.')}</p><button class="primary" id="retry-recording" ${disabled()}>${tr('Добавить в архив')}</button><button class="text-button capture-cancel" id="discard-recording" ${disabled()}>${tr('Удалить эту запись')}</button></div>`;
   return `<div class="capture-panel"><div class="empty-symbol">${icon('wave')}</div><h1>${tr('Начните с аудио')}</h1><p>${tr('Запишите голосовую заметку или выберите готовый файл.')}</p>${platform.audioRecording?`<button class="primary capture-start" id="start-recording" ${disabled()}>${microphone()}${tr('Записать аудио')}</button>`:''}<button class="secondary capture-file" data-choose ${disabled()}>${icon('plus')}${tr('Выбрать аудиофайл')}</button><small>${audioFormats}</small></div>`;
@@ -138,7 +156,7 @@ function outputHtml():string {
   if(!active&&(platform.mobile||recordingPhase!=='idle'||pendingRecording))return captureHtml();
   if(active&&outputTab==='results')return resultsHtml();
   if (text) return `<article class="transcript">${esc(text)}</article>`;
-  if (active) return `<div class="record-empty"><div class="empty-symbol">${icon('wave')}</div><h2>${busy&&progress?.kind==='transcribe'?tr("Распознаём запись…"):tr("Запись готова к распознаванию")}</h2><p>${busy&&progress?.kind==='transcribe'?tr("Текст будет появляться здесь по мере обработки."):tr("Выберите способ распознавания внизу и нажмите «Распознать».")}</p></div>`;
+  if (active) return `<div class="record-empty"><h2>${busy&&progress?.kind==='transcribe'?tr("Распознаём запись…"):tr("Аудио готово")}</h2><p>${busy&&progress?.kind==='transcribe'?tr("Текст будет появляться здесь по мере обработки."):tr("Выберите модель и нажмите «Распознать».")}</p></div>`;
   return `<div class="welcome" id="drop-area"><div class="empty-symbol">${icon('wave')}</div><h1>${tr('Превратите запись в текст')}</h1><p>${tr('Встреча, интервью или голосовая заметка —')}<br>${tr(platform.audioRecording?'выберите аудиофайл или запишите голос.':'добавьте аудиофайл, чтобы начать.')}</p><div class="welcome-actions"><button class="secondary choose-file" data-choose ${disabled()}>${icon('plus')}${tr('Выбрать аудиофайл')}<kbd>⌘ O</kbd></button>${platform.audioRecording?`<button class="secondary choose-file" id="start-recording" ${disabled()}>${microphone()}${tr('Записать аудио')}</button>`:''}</div><small>${tr('Или перетащите файл сюда')} · ${audioFormats}</small></div>`;
 }
 function resultMeta():string {return busy&&progress?.kind==='transcribe'?tr("Распознавание…"):text?`${countLabel(words(),'word')} · ${resultSaved?tr("Сохранено в архиве"):tr("Неполный текст · не сохранён")}`:tr("Аудиофайл");}
@@ -159,10 +177,11 @@ function catalogHtml():string {
   return `${tr("<section class=\"model-catalog\" role=\"dialog\" aria-label=\"Модели OpenRouter\"><div class=\"catalog-heading\"><strong>Модели OpenRouter</strong><button type=\"button\" class=\"icon-button\" id=\"catalog-close\" aria-label=\"Закрыть\">")}${icon('close')}</button></div><label class="search-field">${icon('search')}${tr("<input type=\"search\" id=\"catalog-search\" placeholder=\"Найти модель\" value=\"")}${esc(catalogSearch)}${tr("\" aria-label=\"Найти модель\"></label><div id=\"catalog-results\">")}${catalogResults(matches)}</div><button type="button" class="text-button" id="catalog-refresh" ${cloudLoading?'disabled':''}${tr(">Обновить каталог</button></section>")}`;
 }
 function catalogResults(matches:CloudModel[]):string {
-  if(cloudLoading)return tr("<div class=\"catalog-empty\"><span class=\"spinner\"></span> Загружаем модели…</div>");
-  if(catalogError)return `<div class="catalog-empty" role="alert">${esc(catalogError)}</div>`;
+  if(cloudLoading&&!cloudModels.length)return tr("<div class=\"catalog-empty\"><span class=\"spinner\"></span> Загружаем модели…</div>");
+  const warning=catalogError?`<div class="catalog-empty" role="alert">${esc(catalogError)}</div>`:'';
+  if(catalogError&&!cloudModels.length)return warning;
   if(!matches.length)return `<div class="catalog-empty">${cloudModels.length?tr("Модели не найдены"):tr("Нет моделей с поддержкой аудио")}</div>`;
-  return `<div class="catalog-list">${matches.map(model=>`<button type="button" class="catalog-option ${configuration.model===model.id?'selected':''}" data-cloud-model="${esc(model.id)}"><span><strong>${esc(model.name)}</strong><small>${esc(model.id)}</small></span>${configuration.model===model.id?icon('check'):''}</button>`).join('')}</div>`;
+  return `${warning}<div class="catalog-list">${matches.map(model=>`<button type="button" class="catalog-option ${configuration.model===model.id?'selected':''}" data-cloud-model="${esc(model.id)}"><span><strong>${esc(model.name)}</strong><small>${esc(model.id)}</small></span>${configuration.model===model.id?icon('check'):''}</button>`).join('')}</div>`;
 }
 function runButtonHtml(issue:string):string {
   const label=resultSaved?tr("Распознать ещё раз"):tr("Распознать");
@@ -173,19 +192,19 @@ function composerHtml(issue:string):string {
   if(!active&&(platform.mobile||recordingPhase!=='idle'||pendingRecording))return progress?`<div class="composer-area"><div id="progress">${progressHtml()}</div></div>`:'';
   const needsDownload=configuration.provider==='local'&&runtime.ffmpeg&&!models.find(model=>model.id===localChoice)?.installed;
   const needsCatalog=configuration.provider==='openrouter'&&(platform.nativeAudio||runtime.ffmpeg)&&settings.hasToken;
-  const action=needsDownload?`data-download="${localChoice}"`:needsCatalog?'id="open-catalog"':configuration.provider==='openrouter'&&(platform.nativeAudio||runtime.ffmpeg)?'data-view="settings" data-settings-target="recognition"':'data-view="models"';
+  const action=needsDownload?`data-download="${localChoice}"`:needsCatalog?(catalogError?'id="retry-catalog"':'id="open-catalog"'):configuration.provider==='openrouter'&&(platform.nativeAudio||runtime.ffmpeg)?'data-view="settings" data-settings-target="recognition"':'data-view="models"';
   return `<div class="composer-area"><div class="composer ${active?'has-record':''}">
     <div id="progress">${progressHtml()}</div>
     ${!active?`<div class="composer-top"><button class="attachment" data-choose ${disabled()}>${icon('plus')}${tr("<span>Добавить аудиофайл</span><kbd>⌘ O</kbd></button>")}${runButtonHtml(issue)}</div>`:''}
     <div class="composer-controls">${providerControlsHtml()}${active?runButtonHtml(issue):''}</div>
-    ${issue?`<div class="composer-requirement"><span>${esc(issue)}</span>${runtimeLoaded?`<button class="text-button" ${action} ${disabled()}>${needsDownload?tr("Скачать модель"):needsCatalog?tr('Выбрать модель'):tr("Настроить")}${icon('chevron')}</button>`:''}</div>`:''}
+    ${issue?`<div class="composer-requirement"><span>${esc(issue)}</span>${runtimeLoaded?`<button class="text-button" ${action} ${busy||cloudLoading?'disabled':''}>${needsDownload?tr("Скачать модель"):needsCatalog?tr(catalogError?'Обновить каталог':'Выбрать модель'):tr("Настроить")}${icon('chevron')}</button>`:''}</div>`:''}
   </div></div>`;
 }
 function workHtml():string {
   const issue=readiness(),source=active&&!platform.mobile?audioSource(active):'';
   return `<section class="workspace">
     ${recordingPhase==='idle'?transferBarHtml(active):''}
-    ${active?`<div class="record-toolbar"><div class="record-info">${icon('wave')}<div><div class="record-name-row"><h1 title="${esc(active.name)}">${esc(active.name)}</h1><button class="icon-button" data-rename="${esc(active.id)}" aria-label="${tr('Переименовать запись')}" ${disabled()}>${icon('edit')}</button></div><span id="text-meta">${resultMeta()}</span></div></div><div class="output-actions" ${outputTab==='results'?'hidden':''}><button class="icon-button" id="copy" title="${tr('Копировать текст')}" aria-label="${tr('Копировать текст')}" ${!text?'disabled':''}>${icon('copy')}</button><button class="icon-button" id="share-text" title="${tr('Поделиться текстом')}" aria-label="${tr('Поделиться текстом')}" ${!text?'disabled':''}>${icon('share')}</button><button class="icon-button" id="export" title="${tr('Экспортировать текст')}" aria-label="${tr('Экспортировать текст')}" ${!text?'disabled':''}>${icon('download')}</button>${shareButtonHtml()}</div></div><div class="audio-bar ${platform.mobile?'native-audio-bar':''}">${platform.mobile?nativePlayerHtml():source?`<audio id="audio" controls preload="metadata" src="${esc(source)}" aria-label="${tr('Прослушать ')}${esc(active.name)}"></audio>`:''}<div class="audio-file-meta"><span>${active.durationSeconds?formatTime(active.durationSeconds)+' · ':''}${dateLabel(active.createdAt)}</span><div class="audio-actions"><button class="icon-button" id="share-audio" aria-label="${tr('Поделиться аудио')}" title="${tr('Поделиться аудио')}" ${disabled()}>${icon('share')}</button><button class="icon-button" id="save-audio" aria-label="${tr('Сохранить аудио')}" title="${tr('Сохранить аудио')}" ${disabled()}>${icon('download')}</button></div></div><p id="playback-error" class="playback-error" role="alert"></p></div>${text||active.results?.length?`<div class="output-tabs"><div class="output-tab-buttons" role="tablist" aria-label="${tr('Текст записи')}"><button role="tab" id="transcript-tab" data-output-tab="transcript" aria-selected="${outputTab==='transcript'}">${tr('Расшифровка')}</button><button role="tab" id="results-tab" data-output-tab="results" aria-selected="${outputTab==='results'}">${tr('Результаты')}${active.results?.length?` <small>${active.results.length}</small>`:''}</button></div>${text&&resultSaved&&outputTab==='transcript'?`<button type="button" id="process-shortcut" class="process-shortcut" ${busy?'disabled':''}>${tr('Обработать текст')}</button>`:''}</div>`:''}`:''}
+    ${active&&recordingPhase==='idle'?`<div class="record-toolbar"><div class="record-info">${icon('wave')}<div><div class="record-name-row"><h1 title="${esc(active.name)}">${esc(active.name)}</h1><button class="icon-button" data-rename="${esc(active.id)}" aria-label="${tr('Переименовать запись')}" ${disabled()}>${icon('edit')}</button></div><span id="text-meta">${dateLabel(active.createdAt)} · ${resultMeta()}</span></div></div><button type="button" class="secondary record-share-button" id="record-share" aria-haspopup="dialog" aria-expanded="false" aria-controls="record-actions-dialog" aria-label="${tr('Поделиться записью')}">${icon('share')}<span>${tr('Поделиться')}</span></button></div><div class="audio-bar ${platform.mobile?'native-audio-bar':''}">${platform.mobile?nativePlayerHtml():source?`<audio id="audio" controls controlslist="nodownload noplaybackrate" preload="metadata" src="${esc(source)}" aria-label="${tr('Прослушать ')}${esc(active.name)}"></audio>`:''}<p id="playback-error" class="playback-error" role="alert"></p></div>${text||active.results?.length?`<div class="output-tabs"><div class="output-tab-buttons" role="tablist" aria-label="${tr('Текст записи')}"><button role="tab" id="transcript-tab" data-output-tab="transcript" aria-selected="${outputTab==='transcript'}">${tr('Расшифровка')}</button><button role="tab" id="results-tab" data-output-tab="results" aria-selected="${outputTab==='results'}">${tr('Результаты')}${active.results?.length?` <small>${active.results.length}</small>`:''}</button></div>${text&&resultSaved&&outputTab==='transcript'?`<button type="button" id="process-shortcut" class="process-shortcut" ${busy?'disabled':''}>${tr('Обработать текст')}</button>`:''}</div>`:''}`:''}
     <div class="transcript-scroll" id="result" ${active&&(text||active.results?.length)?`role="tabpanel" aria-labelledby="${outputTab==='transcript'?'transcript-tab':'results-tab'}"`:''}>${outputHtml()}${active&&text&&resultSaved&&outputTab==='transcript'?postprocessHtml():''}</div>
     ${previousResult?.saved&&!busy&&!resultSaved?tr("<div class=\"restore-result\"><span>Предыдущая расшифровка сохранена в архиве.</span><button class=\"text-button\" id=\"restore\">Вернуть предыдущий текст</button></div>"):''}
     ${active&&outputTab==='results'?`<div class="results-process-footer"><button class="secondary" data-output-tab="transcript" ${busy?'disabled':''}>${tr('Обработать текст')}</button></div>`:''}
@@ -194,7 +213,7 @@ function workHtml():string {
 }
 function nativePlayerHtml():string {
   const duration=playerState.duration||active?.durationSeconds||0;
-  return `<div class="native-player" aria-label="${tr('Прослушать ')}${esc(active?.name||'')}"><button type="button" id="native-play" class="icon-button" aria-label="${tr(playerState.playing?'Пауза':'Воспроизвести')}" ${playerLoading||playerError?'disabled':''}>${playerLoading?'<span class="spinner"></span>':icon(playerState.playing?'pause':'play')}</button><div class="player-track"><input type="range" id="native-seek" min="0" max="${Math.max(duration,1)}" value="${playerState.currentTime}" step="0.1" aria-label="${tr('Позиция воспроизведения')}" ${playerLoading||playerError||!duration?'disabled':''}><div><span id="native-position">${formatTime(playerState.currentTime)}</span><span id="native-duration">${duration?formatTime(duration):tr('Определяем длительность…')}</span></div></div></div>${playerError?`<div class="player-error" role="alert"><span>${esc(playerError)}</span><button type="button" class="text-button" id="retry-playback">${tr('Повторить')}</button></div>`:''}`;
+  return `<div class="native-player" aria-label="${tr('Прослушать ')}${esc(active?.name||'')}"><button type="button" id="native-play" class="icon-button" aria-label="${tr(playerState.playing?'Пауза':'Воспроизвести')}" ${playerLoading||playerError?'disabled':''}>${playerLoading?'<span class="spinner"></span>':icon(playerState.playing?'pause':'play')}</button><div class="player-track"><input type="range" id="native-seek" min="0" max="${Math.max(duration,1)}" value="${playerState.currentTime}" step="0.1" aria-label="${tr('Позиция воспроизведения')}" ${playerLoading||playerError||!duration?'disabled':''}><div><span id="native-position">${formatTime(playerState.currentTime)}</span><span id="native-duration">${duration?formatTime(duration):'—'}</span></div></div></div>${playerError?`<div class="player-error" role="alert"><span>${esc(playerError)}</span><button type="button" class="text-button" id="retry-playback">${tr('Повторить')}</button></div>`:''}`;
 }
 function historyResults():string {
   const entries=history.filter(entry=>entry.name.toLocaleLowerCase().includes(search.toLocaleLowerCase()));
@@ -280,7 +299,7 @@ function preservePlayback() {
 function render() {
   preservePlayback();
   document.documentElement.dataset.platform=platform.os;
-  app.innerHTML=`<div ${(platform.mobile&&catalogOpen)||textPickerOpen()?'inert':''} class="shell ${sidebarCollapsed?'sidebar-collapsed':''} ${platform.mobile?'mobile-platform':''}">${sidebarHtml()}<main><header class="main-header" data-tauri-drag-region><div class="header-title" data-tauri-drag-region>${!platform.mobile?`${tr("<button class=\"icon-button\" id=\"expand\" title=\"Показать боковую панель\" aria-label=\"Показать боковую панель\" aria-expanded=\"false\">")}${icon('panel')}</button>`:''}<span data-tauri-drag-region>${esc(view==='work'?(active?.name||tr("Новая расшифровка")):tr(title[view]))}</span></div><button type="button" class="icon-button mobile-new" id="mobile-new" aria-label="${tr('Новая запись')}" ${disabled()}>${icon('plus')}</button><div class="header-status"><div id="update-header">${updateHeaderHtml()}</div>${busy?`<span class="header-activity"><span class="spinner"></span>${recordingPhase!=='idle'?tr('Запись аудио'):progress?.kind==='download'?tr("Скачиваем модель"):progress?.kind==='import'?tr("Добавляем запись"):progress?.kind==='storage'?tr('Переносим архив'):progress?.kind==='update'?tr('Устанавливаем обновление'):progress?.kind==='postprocess'?tr('Обрабатываем текст…'):progress?.kind==='transcribe'?tr('Распознаём'):transferActivityLabel()||tr('Выполняем…')}</span>`:''}${preview?tr("<span class=\"preview-label\">Предпросмотр</span>"):''}</div></header><div class="main-surface ${view==='work'?'work-surface':''}">${view==='work'?workHtml():`<div class="page-scroll ${view==='devices'?'devices-scroll':''}"><div class="page-content ${view==='devices'?'devices-page':''}">${view==='history'?transferBarHtml(null)+historyHtml():view==='models'?modelsHtml():view==='devices'?devicesHtml():view==='rules'?rulesHtml():settingsHtml()}${busy?`<div id="progress">${progressHtml()}</div>`:''}</div></div>`}<div id="status" class="notice ${isError?'error':''}" role="status" aria-live="polite"></div></div>${mobileNavHtml()}</main></div>${platform.mobile&&catalogOpen?`<div class="catalog-backdrop" id="catalog-backdrop">${catalogHtml()}</div>`:''}${textPickerHtml()}`;
+  app.innerHTML=`<div ${(platform.mobile&&catalogOpen)||textPickerOpen()?'inert':''} class="shell ${sidebarCollapsed?'sidebar-collapsed':''} ${platform.mobile?'mobile-platform':''}">${sidebarHtml()}<main><header class="main-header" data-tauri-drag-region><div class="header-title" data-tauri-drag-region>${!platform.mobile?`${tr("<button class=\"icon-button\" id=\"expand\" title=\"Показать боковую панель\" aria-label=\"Показать боковую панель\" aria-expanded=\"false\">")}${icon('panel')}</button>`:''}<span data-tauri-drag-region>${esc(view==='work'?(tr(active?'Запись':recordingPhase!=='idle'?'Диктофон':'Новая расшифровка')):tr(title[view]))}</span></div><button type="button" class="icon-button mobile-new" id="mobile-new" ${recordingPhase!=='idle'?'hidden':''} aria-label="${tr('Новая запись')}" ${disabled()}>${icon('plus')}</button><div class="header-status"><div id="update-header">${updateHeaderHtml()}</div>${busy&&recordingPhase==='idle'?`<span class="header-activity"><span class="spinner"></span>${recordingPhase!=='idle'?'':progress?.kind==='download'?tr("Скачиваем модель"):progress?.kind==='import'?tr("Добавляем запись"):progress?.kind==='storage'?tr('Переносим архив'):progress?.kind==='update'?tr('Устанавливаем обновление'):progress?.kind==='postprocess'?tr('Обрабатываем текст…'):progress?.kind==='transcribe'?tr('Распознаём'):transferActivityLabel()||tr('Выполняем…')}</span>`:''}${preview?tr("<span class=\"preview-label\">Предпросмотр</span>"):''}</div></header><div class="main-surface ${view==='work'?'work-surface':view==='settings'?'settings-surface':''}">${view==='work'?workHtml():`<div class="page-scroll ${view==='devices'?'devices-scroll':''}"><div class="page-content ${view==='devices'?'devices-page':''}">${view==='history'?transferBarHtml(null)+historyHtml():view==='models'?modelsHtml():view==='devices'?devicesHtml():view==='rules'?rulesHtml():settingsHtml()}${busy?`<div id="progress">${progressHtml()}</div>`:''}</div></div>`}<div id="status" class="notice ${isError?'error':''}" role="status" aria-live="polite"></div></div>${mobileNavHtml()}</main></div>${platform.mobile&&catalogOpen?`<div class="catalog-backdrop" id="catalog-backdrop">${catalogHtml()}</div>`:''}${textPickerHtml()}`;
   bind();updateNotice();restorePlayback();if(view==='work'&&active&&platform.mobile&&recordingPhase==='idle')void ensureNativePlayer();else stopPlayerPolling();
 }
 function restorePlayback() {
@@ -292,7 +311,7 @@ function restorePlayback() {
 function stopPlayerPolling(){if(playerPoll)clearTimeout(playerPoll);playerPoll=null;}
 function updateNativePlayer(){
   const duration=playerState.duration||active?.durationSeconds||0,position=document.querySelector('#native-position'),total=document.querySelector('#native-duration'),seek=document.querySelector<HTMLInputElement>('#native-seek'),button=document.querySelector<HTMLButtonElement>('#native-play');
-  if(position)position.textContent=formatTime(playerState.currentTime);if(total)total.textContent=duration?formatTime(duration):tr('Определяем длительность…');
+  if(position)position.textContent=formatTime(playerState.currentTime);if(total)total.textContent=duration?formatTime(duration):'—';
   if(seek){seek.max=String(Math.max(duration,1));if(document.activeElement!==seek)seek.value=String(Math.min(playerState.currentTime,duration));seek.disabled=playerLoading||!!playerError||!duration;}
   if(button){button.innerHTML=playerLoading?'<span class="spinner"></span>':icon(playerState.playing?'pause':'play');button.setAttribute('aria-label',tr(playerState.playing?'Пауза':'Воспроизвести'));button.disabled=playerLoading||!!playerError;}
 }
@@ -362,9 +381,7 @@ function bind() {
   bindCatalog();bindPostprocess();bindNativePlayer();
   document.querySelector('#process-shortcut')?.addEventListener('click',()=>{const controls=document.querySelector<HTMLElement>('.postprocess-controls');if(controls){controls.scrollIntoView({behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth',block:'start'});controls.focus({preventScroll:true});}});
   document.querySelectorAll<HTMLElement>('[data-output-tab]').forEach(element=>element.onclick=()=>{outputTab=element.dataset.outputTab as typeof outputTab;render();});
-  document.querySelector('#share-text')?.addEventListener('click',()=>shareText(active?.name||tr('Расшифровка'),text).catch(error=>notice(errorText(error),true)));
-  document.querySelector('#share-audio')?.addEventListener('click',()=>{if(active)void shareAudio(active).catch(error=>notice(errorText(error),true));});
-  document.querySelector('#save-audio')?.addEventListener('click',()=>{if(active)void saveAudio(active).catch(error=>notice(errorText(error),true));});
+  document.querySelector('#record-share')?.addEventListener('click',openRecordActions);
   document.querySelectorAll<HTMLElement>('[data-download]').forEach(element=>element.onclick=()=>download(element.dataset.download!));
   bindRecordActions();
   document.querySelector<HTMLInputElement>('#history-search')?.addEventListener('input',event=>{search=(event.target as HTMLInputElement).value;document.querySelector('#history-results')!.innerHTML=historyResults();bindRecordActions();document.querySelectorAll('[data-choose]').forEach(element=>element.addEventListener('click',()=>choose()));});
@@ -372,13 +389,24 @@ function bind() {
   document.querySelector('#retry-history')?.addEventListener('click',()=>refreshHistory());
   document.querySelector('#retry-runtime')?.addEventListener('click',()=>refreshRuntime());
   document.querySelector('#copy-install')?.addEventListener('click',()=>copyText(platform.os==='linux'?'sudo apt install ffmpeg':'brew install ffmpeg whisper.cpp'));
-  document.querySelector('#copy')?.addEventListener('click',()=>copyText(text));
-  document.querySelector('#export')?.addEventListener('click',()=>exportText((active?.name||tr("Расшифровка")).replace(/\.(m4a|mp3|wav|mp4|aac|flac|ogg)$/i,'').replace(/[\/\\:\u0000-\u001f]/g,'-')+'.txt',text).catch(error=>notice(errorText(error),true)));
   document.querySelector('#restore')?.addEventListener('click',()=>{if(previousResult){text=previousResult.text;resultSaved=previousResult.saved;previousResult=null;render();}});
   document.querySelectorAll<HTMLAnchorElement>('a[href^="https://"]').forEach(anchor=>anchor.onclick=event=>{event.preventDefault();openExternal(anchor.href).catch(error=>notice(errorText(error),true));});
   bindSettings();bindUpdates();bindTransfers(active);
 }
 function setSidebar(collapsed:boolean) {sidebarCollapsed=collapsed;localStorage.setItem('hearfolio-sidebar',collapsed?'collapsed':'expanded');render();}
+let recordActionsDialog:HTMLDialogElement|null=null;
+function openRecordActions(){
+  if(!active||recordActionsDialog?.open)return;
+  const entry=active,transcript=text,trigger=document.querySelector<HTMLElement>('#record-share');
+  const dialog=document.createElement('dialog');recordActionsDialog=dialog;dialog.className='record-actions-dialog';dialog.id='record-actions-dialog';trigger?.setAttribute('aria-expanded','true');dialog.setAttribute('aria-labelledby','record-actions-title');
+  const action=(name:string,label:string,glyph:string)=>`<button type="button" data-record-action="${name}">${icon(glyph)}<span>${tr(label)}</span></button>`;
+  dialog.innerHTML=`<div class="record-actions-heading"><h2 id="record-actions-title">${tr('Поделиться')}</h2><button type="button" class="icon-button" data-actions-close aria-label="${tr('Закрыть')}">${icon('close')}</button></div><div class="record-actions-group">${action('share-audio','Поделиться аудио','share')}${transcript.trim()?action('share-text','Поделиться текстом','file'):''}${!busy?action('device','На другое устройство','devices'):''}</div><div class="record-actions-group">${action('save-audio','Сохранить аудио','download')}${transcript.trim()?action('save-text','Сохранить текст','download')+action('copy-text','Копировать текст','copy'):''}</div>`;
+  dialog.querySelector('[data-actions-close]')?.addEventListener('click',()=>dialog.close());
+  dialog.querySelectorAll<HTMLElement>('[data-record-action]').forEach(button=>button.onclick=()=>{const choice=button.dataset.recordAction;dialog.close();if(choice==='device'){shareRecordingToDevice(entry);return;}const operation=choice==='share-audio'?shareAudio(entry):choice==='save-audio'?saveAudio(entry):choice==='share-text'?shareText(entry.name,transcript):choice==='save-text'?exportText(recordNameParts(entry.name,entry.inputPath).title.replace(/[\/\\:\u0000-\u001f]/g,'-')+'.txt',transcript):copyText(transcript);void operation.catch(error=>notice(errorText(error),true));});
+  dialog.addEventListener('click',event=>{if(event.target===dialog){const rect=dialog.getBoundingClientRect();if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)dialog.close();}});
+  dialog.addEventListener('close',()=>{dialog.remove();if(recordActionsDialog===dialog)recordActionsDialog=null;trigger?.setAttribute('aria-expanded','false');if(trigger?.isConnected)trigger.focus({preventScroll:true});});
+  document.body.append(dialog);dialog.showModal();dialog.querySelector<HTMLElement>('[data-record-action]')?.focus();
+}
 async function copyText(value:string) {try{await navigator.clipboard.writeText(value);notice(tr("Скопировано"));}catch(error){notice(`${tr("Не удалось скопировать текст: ")}${errorText(error)}`,true);}}
 function readSettingsDraft(form:HTMLFormElement):SettingsDraft {return mergeSettingsDraft(new FormData(form),settingsDraft||initialSettingsDraft(settings));}
 function bindSettings() {
@@ -412,7 +440,7 @@ async function applySettings():Promise<boolean> {
   const saved=await persist(draft.token.trim()||undefined,{language:draft.language,openrouterUrl:draft.url.trim()});
   settingsSaving=false;
   if(!saved){settingsError=settingsLabel('Настройки не сохранены. Ваши изменения остаются здесь; попробуйте ещё раз.','Settings were not saved. Your changes are still here; try again.');render();return false;}
-  settingsDraft=null;if(connectionChanged){cloudModels=[];catalogError='';}render();notice(tr("Настройки применены"));return true;
+  settingsDraft=null;if(connectionChanged){cloudModels=readAudioCatalog(localStorage,settings.openrouterUrl);catalogError='';void loadCloudModels();}render();notice(tr("Настройки применены"));return true;
 }
 async function persist(token?:string,snapshot:{language:LanguagePreference;openrouterUrl:string}={language:settings.language,openrouterUrl:settings.openrouterUrl}):Promise<boolean> {
   const operation=settingsSaveQueue.then(async()=>{try{settings=await call<Settings>('save_settings',{settings:snapshot,...(token!==undefined?{token}:{})});applyLanguagePreference();return true;}catch(error){notice(`${tr("Не удалось применить настройки: ")}${errorText(error)}`,true);return false;}});
@@ -433,7 +461,7 @@ async function changeStorage() {
 }
 function normalizeCatalogConfiguration(candidate:RecognitionConfig):RecognitionConfig {
   const model=candidate.provider==='openrouter'?cloudModels.find(item=>item.id===candidate.model):null;
-  return model&&!model.modes.includes(candidate.mode as 'streaming'|'transcription')?{...candidate,mode:model.preferredMode}:candidate;
+  return model&&candidate.mode!==model.preferredMode?{...candidate,mode:model.preferredMode}:candidate;
 }
 function restoreConfiguration(entry?:Entry|null) {
   const legacyModel=entry?.model?.replace(/^openrouter\//,'');
@@ -465,19 +493,23 @@ function bindCatalog() {
   document.querySelector('#catalog-close')?.addEventListener('click',closeCatalog);
   document.querySelector('#open-catalog')?.addEventListener('click',()=>{catalogOpen=true;render();if(!platform.mobile&&window.innerWidth>760)document.querySelector<HTMLInputElement>('#catalog-search')?.focus();if(!cloudModels.length)void loadCloudModels();});
   document.querySelector('#catalog-refresh')?.addEventListener('click',()=>loadCloudModels());
+  document.querySelector('#retry-catalog')?.addEventListener('click',()=>loadCloudModels());
   document.querySelector<HTMLInputElement>('#catalog-search')?.addEventListener('input',event=>{catalogSearch=(event.target as HTMLInputElement).value;const matches=cloudModels.filter(model=>`${model.name} ${model.id}`.toLocaleLowerCase().includes(catalogSearch.toLocaleLowerCase()));document.querySelector('#catalog-results')!.innerHTML=catalogResults(matches);bindCatalogOptions();});
   bindCatalogOptions();
 }
 async function loadCloudModels() {
-  if(cloudLoading||busy)return;
+  if(cloudLoading)return;
+  const url=settings.openrouterUrl;
   cloudLoading=true;catalogError='';render();
   try{
-    cloudModels=(await call<CloudModel[]>('list_openrouter_models')).filter(model=>model.modes.some(mode=>mode==='streaming'||mode==='transcription')).map(model=>({...model,preferredMode:model.modes.includes('transcription')?'transcription':'streaming'}));
+    const loaded=normalizeAudioCatalog(await call<CloudModel[]>('list_openrouter_models'));
+    if(url!==settings.openrouterUrl)return;
+    cloudModels=loaded;saveAudioCatalog(localStorage,url,loaded);
     const normalized=normalizeCatalogConfiguration(configuration);
-    if(normalized.mode!==configuration.mode)chooseConfiguration(normalized);
+    if(normalized.mode!==configuration.mode){if(!busy)chooseConfiguration(normalized);else if(progress?.kind!=='transcribe')configuration=normalized;}
   }
-  catch(error){catalogError=errorText(error);}
-  finally{cloudLoading=false;render();if(catalogOpen&&!platform.mobile&&window.innerWidth>760)document.querySelector<HTMLInputElement>('#catalog-search')?.focus();}
+  catch(error){if(url===settings.openrouterUrl)catalogError=errorText(error);}
+  finally{cloudLoading=false;render();if(url!==settings.openrouterUrl)void loadCloudModels();else if(catalogOpen&&!platform.mobile&&window.innerWidth>760)document.querySelector<HTMLInputElement>('#catalog-search')?.focus();}
 }
 function sortHistory(entries:Entry[]) {return entries.sort((left,right)=>right.createdAt-left.createdAt);}
 async function refreshAfterTransfer() {
@@ -514,9 +546,9 @@ function clearRecordingTimer(){if(recordingTimer)clearInterval(recordingTimer);r
 async function startRecording(){
   if(busy||active||!platform.audioRecording||!await mayLeaveSettings()||!await mayReplaceRecord())return;
   if(busy||active)return;
-  lastNativeRecordingResult='';nativeRecordingSeconds=null;recordingPausedAt=0;recordingPausedMillis=0;recorderEnvelope.reset();settingsDraft=null;view='work';recordingPhase='starting';busy=true;status='';recordingStarted=0;render();
-  try{await startAudioRecording();recordingStarted=Date.now();recordingPhase='recording';recordingTimer=setInterval(()=>{const timer=document.querySelector('#recording-duration');if(timer)timer.textContent=recordingDuration();},250);render();}
-  catch(error){recordingPhase='idle';busy=false;render();notice(errorText(error),true);}
+  nativeCaptureGeneration++;nativeRecordingOrder.beginStart();lastNativeRecordingResult='';nativeRecordingSeconds=null;nativeRecordingMillis=null;nativeRecordingPath='';recordingPausedAt=0;recordingPausedMillis=0;recorderEnvelope.reset();settingsDraft=null;view='work';recordingPhase='starting';busy=true;status='';recordingStarted=0;render();
+  try{await startAudioRecording();nativeRecordingOrder.confirmStart();recordingStarted=Date.now();recordingPhase='recording';recordingTimer=setInterval(()=>{const timer=document.querySelector('#recording-duration');if(timer)timer.textContent=recordingDuration();},100);await syncNativeRecording();render();}
+  catch(error){nativeRecordingOrder.abortStart();recordingPhase='idle';busy=false;render();notice(errorText(error),true);}
 }
 function recordingName(selected:AudioSelection):string {
   const date=new Date(recordingStarted||Date.now()),pad=(value:number)=>String(value).padStart(2,'0');
@@ -525,30 +557,38 @@ function recordingName(selected:AudioSelection):string {
   return `${tr('Запись')} ${day} ${pad(date.getHours())}.${pad(date.getMinutes())}.${extension}`;
 }
 async function toggleRecordingPause(){
-  if(!['recording','paused'].includes(recordingPhase))return;
-  const paused=recordingPhase==='paused',button=document.querySelector<HTMLButtonElement>('#pause-recording');if(button)button.disabled=true;
+  if(!['recording','paused'].includes(recordingPhase)||recordingControlPending)return;
+  const paused=recordingPhase==='paused';nativeCaptureGeneration++;recordingControlPending=true;render();
   try{
-    if(externalRecording)await call('recording_quick_control',{action:paused?'resume':'pause'});
+    if(externalRecording)await call('recording_quick_control',{action:paused?'resume':'pause',path:nativeRecordingPath||undefined});
     else if(paused)await resumeAudioRecording();else await pauseAudioRecording();
-    if(paused){if(recordingPausedAt)recordingPausedMillis+=Date.now()-recordingPausedAt;recordingPausedAt=0;}else recordingPausedAt=Date.now();
-    recordingPhase=paused?'recording':'paused';nativeInputLevel=0;render();
-  }catch(error){notice(errorText(error),true);if(button)button.disabled=false;}
+    if(platform.os==='android'&&!preview){await syncNativeRecording(true);}
+    else{if(paused){if(recordingPausedAt)recordingPausedMillis+=Date.now()-recordingPausedAt;recordingPausedAt=0;}else recordingPausedAt=Date.now();recordingPhase=paused?'recording':'paused';}
+  }catch(error){notice(errorText(error),true);}
+  finally{recordingControlPending=false;render();}
 }
 async function stopRecording(){
-  if(!['recording','paused'].includes(recordingPhase))return;
-  clearRecordingTimer();recordingPhase='stopping';render();
-  if(externalRecording){try{await call('recording_quick_control',{action:'stop'});await finishQuickRecording();}catch(e){notice(errorText(e),true);await syncNativeRecording();}return;}
+  if(!['recording','paused'].includes(recordingPhase)||recordingControlPending)return;
+  nativeCaptureGeneration++;recordingControlPending=true;clearRecordingTimer();recordingPhase='stopping';render();
   try{
+    if(externalRecording){
+      try{await call('recording_quick_control',{action:'stop',path:nativeRecordingPath||undefined});await finishQuickRecording();}
+      catch(error){notice(errorText(error),true);await syncNativeRecording(true);}
+      return;
+    }
     pendingRecording=await stopAudioRecording();recordingPhase='idle';
     if(!pendingRecording)throw new Error('errors.recordingEmpty');
     pendingRecording={...pendingRecording,name:recordingName(pendingRecording)};
     await importSelection(pendingRecording);
-  }catch(error){await cancelAudioRecording().catch(()=>{});recordingPhase='idle';busy=false;render();notice(errorText(error),true);}
+  }catch(error){
+    if(platform.os==='android'&&!preview){await syncNativeRecording(true);render();notice(errorText(error),true);}
+    else{await cancelAudioRecording().catch(()=>{});recordingPhase='idle';busy=false;render();notice(errorText(error),true);}
+  }finally{recordingControlPending=false;render();}
 }
 async function cancelRecording(){
-  if(!['recording','paused'].includes(recordingPhase))return;
-  clearRecordingTimer();recordingPhase='cancelling';render();
-  try{if(externalRecording)await call('recording_quick_control',{action:'cancel'});else await cancelAudioRecording();}catch(error){notice(errorText(error),true);}
+  if(!['recording','paused'].includes(recordingPhase)||recordingControlPending)return;
+  nativeCaptureGeneration++;clearRecordingTimer();recordingPhase='cancelling';render();
+  try{if(externalRecording)await call('recording_quick_control',{action:'cancel',path:nativeRecordingPath||undefined});else await cancelAudioRecording();}catch(error){notice(errorText(error),true);}
   finally{externalRecording=false;recordingPhase='idle';recordingStarted=0;busy=false;render();}
 }
 async function importSelection(selected:AudioSelection):Promise<boolean>{
@@ -674,7 +714,9 @@ async function initialize() {
   if(initial[1].status==='fulfilled'){settings=initial[1].value;applyLanguagePreference();}else notice(`${tr('Не удалось загрузить настройки: ')}${errorText(initial[1].reason)}`,true);
   if(initial[2].status==='fulfilled')applicationVersion=initial[2].value;
   if(['macos','linux','windows'].includes(platform.os))subscribeAudioDrop(paths=>{if(paths.length){if(paths.length>1)notice(tr("Добавляем первый файл. Остальные можно добавить по одному."));choose(paths[0]);}}).catch(error=>notice(errorText(error),true));
+  cloudModels=readAudioCatalog(localStorage,settings.openrouterUrl);
   restoreConfiguration(active);render();
+  if(configuration.provider==='openrouter'&&cloudModels.length)void loadCloudModels();
   await Promise.allSettled([refreshHistory(),refreshRuntime()]);ensureRules();
   if(platform.os==='android'){await syncNativeOperation();await syncNativeRecording();await importQuickRecordings();}
   if(!preview)void checkUpdates();
@@ -689,8 +731,8 @@ subscribe<{text:string}>('partial-text',payload=>{
   if(!busy||progress?.kind!=='transcribe'||!payload.text)return;
   if(!receivedPartial)void call<Settings>('get_settings').then(saved=>{settings=saved;}).catch(()=>{});receivedPartial=true;text=payload.text;resultSaved=false;
   const result=document.querySelector('#result');if(result){const follow=result.scrollHeight-result.scrollTop-result.clientHeight<90;result.innerHTML=outputHtml();if(follow)result.scrollTop=result.scrollHeight;}
-  document.querySelectorAll<HTMLButtonElement>('#copy,#export').forEach(element=>element.disabled=!text);
-  const meta=document.querySelector('#text-meta');if(meta)meta.textContent=resultMeta();
+
+  const meta=document.querySelector('#text-meta');if(meta)meta.textContent=`${active?dateLabel(active.createdAt)+' · ':''}${resultMeta()}`;
 }).catch(error=>notice(errorText(error),true));
 if(preview&&!previewCapabilities.mobile){
   document.addEventListener('dragover',event=>{event.preventDefault();if(!busy)document.querySelector('.main-surface')?.classList.add('drop-hover');});
@@ -713,31 +755,35 @@ window.addEventListener('beforeunload',event=>{if(settingsDraft||settingsSaving|
 function updateCatalogViewport(){const viewport=window.visualViewport;document.documentElement.style.setProperty('--catalog-height',`${viewport?.height||window.innerHeight}px`);document.documentElement.style.setProperty('--catalog-top',`${viewport?.offsetTop||0}px`);}
 updateCatalogViewport();window.visualViewport?.addEventListener('resize',updateCatalogViewport);window.visualViewport?.addEventListener('scroll',updateCatalogViewport);window.addEventListener('resize',updateCatalogViewport);
 
-subscribe<{state:string;elapsedSeconds?:number}>('recording-native-state',p=>{if(!['recording','paused'].includes(recordingPhase))return;if(p.elapsedSeconds!==undefined)nativeRecordingSeconds=p.elapsedSeconds;if(p.state==='finished'){clearRecordingTimer();recordingPhase='stopping';render();return;}const next=p.state==='paused'?'paused':p.state==='recording'?'recording':null;if(next&&next!==recordingPhase){recordingPhase=next;render();}}).catch(()=>{});
-type NativeRecordingResult={entry?:Entry;selection?:AudioSelection;error?:string};
+subscribe<NativeCapture>('recording-native-state',p=>{if(!['recording','paused','stopping'].includes(recordingPhase)||recordingControlPending)return;if(p.path&&nativeRecordingPath&&p.path!==nativeRecordingPath)return;if(!applyNativeCapture(p))return;if(p.state==='finished'){clearRecordingTimer();recordingPhase='stopping';render();void syncNativeRecording(true);return;}const next=p.state==='paused'?'paused':p.state==='recording'?'recording':p.state==='stopping'?'stopping':null;if(next&&next!==recordingPhase){if(next==='stopping')clearRecordingTimer();recordingPhase=next;render();}}).catch(()=>{});
+type NativeRecordingResult={entry?:Entry;selection?:AudioSelection;error?:string;path?:string;stateRevision?:number};
 let lastNativeRecordingResult='';
 async function finishNativeRecording(p:NativeRecordingResult){const key=JSON.stringify(p),receipt=p.entry?`recording:${p.entry.id}`:'';if(key===lastNativeRecordingResult||(receipt&&operationHandled(receipt)))return;lastNativeRecordingResult=key;if(receipt)markOperationHandled(receipt);clearRecordingTimer();recordingPhase='idle';recordingStarted=0;busy=false;pendingRecording=p.selection||null;if(p.entry){resetPlayback();active=p.entry;restoreConfiguration(p.entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;view='work';await refreshHistory();}render();if(p.error)notice(errorText(p.error),true);else notice(tr('Запись сохранена'));}
-subscribe<NativeRecordingResult>('recording-native-finished',p=>{void finishNativeRecording(p);}).catch(()=>{});
+subscribe<NativeRecordingResult>('recording-native-finished',p=>{if(nativeRecordingOrder.acceptResult(p))void finishNativeRecording(p);}).catch(()=>{});
 let snapshotPolling=false,quickFinishing=false;
 async function finishQuickRecording(){if(quickFinishing)return;quickFinishing=true;try{const entries=await call<Entry[]>('import_quick_recordings');externalRecording=false;recordingPhase='idle';busy=false;clearRecordingTimer();if(entries.length){const entry=entries[entries.length-1];if(!active||resultSaved||!text){resetPlayback();active=entry;restoreConfiguration(entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;}await refreshHistory();notice(tr('Запись сохранена'));}render();}catch(e){if(!String(e).includes('operationBusy')){externalRecording=false;recordingPhase='idle';busy=false;render();notice(errorText(e),true);}}finally{quickFinishing=false;}}
-async function syncNativeRecording(){
-  if(snapshotPolling||document.hidden||platform.os!=='android')return;snapshotPolling=true;
+async function syncNativeRecording(afterControl=false){
+  if(snapshotPolling||document.hidden||platform.os!=='android'||recordingPhase==='starting'||recordingPhase==='cancelling'||(recordingControlPending&&!afterControl))return;snapshotPolling=true;
+  const generation=nativeCaptureGeneration;
   try{
-    const p=await call<{state:string;quick?:boolean;elapsedSeconds?:number;level?:number;error?:string;interrupted?:boolean;result?:NativeRecordingResult}>('recording_activity_snapshot');
-    nativeInputLevel=p.level??0;nativeLevelAt=performance.now();
+    const p=await call<NativeCapture&{quick?:boolean;error?:string;interrupted?:boolean;result?:NativeRecordingResult}>('recording_activity_snapshot');
+    if(generation!==nativeCaptureGeneration||!applyNativeCapture(p))return;
     const live=p.state==='recording'||p.state==='paused';
     restoreNativeRecordingFlag(live&&!p.quick);
-    if(live){
+    if(p.state==='stopping'){
+      externalRecording=Boolean(p.quick);busy=true;view='work';
+      if(recordingPhase!=='stopping'){clearRecordingTimer();recordingPhase='stopping';render();}
+    }else if(live){
       if(busy&&recordingPhase==='idle')return;
       externalRecording=Boolean(p.quick);busy=true;view='work';
-      const changed=recordingPhase!==p.state;recordingPhase=p.state as 'recording'|'paused';nativeRecordingSeconds=p.elapsedSeconds??0;
+      const changed=recordingPhase!==p.state;recordingPhase=p.state as 'recording'|'paused';
       const timer=document.querySelector('#recording-duration');if(timer)timer.textContent=recordingDuration();
       if(changed)render();
     }else if(busy&&recordingPhase==='idle')return;
     else if(externalRecording){
       if(p.state==='finished'){recordingPhase='stopping';await finishQuickRecording();if(p.error)notice(errorText(p.error),true);}
       else{externalRecording=false;recordingPhase='idle';busy=false;render();if(p.error)notice(errorText(p.error),true);}
-    }else if(p.result&&recordingPhase!=='starting')await finishNativeRecording(p.result);
+    }else if(p.result){if(nativeRecordingOrder.acceptResult(p.result))await finishNativeRecording(p.result);}
     else if(p.state==='error'&&recordingPhase!=='idle')await finishNativeRecording({error:p.error||'errors.recordingEmpty'});
   }catch{/* Poll again on the next foreground tick. */}finally{snapshotPolling=false;}
 }

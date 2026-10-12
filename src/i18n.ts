@@ -8,6 +8,14 @@ export function setLanguage(value: LanguagePreference,system?:'ru'|'en') { prefe
 export function locale() { return currentLanguage()==='ru'?'ru-RU':'en-US'; }
 // Only translate static UI fragments. User names, transcripts, model IDs and paths never pass through this table.
 const messages: Record<string,string> = {
+  'Записанный звук':'Recorded audio',
+  'Сейчас':'Now',
+  'Аудио готово':'Audio ready',
+  'Выберите модель и нажмите «Распознать».':'Choose a model and select Transcribe.',
+  'На другое устройство':'Send to another device',
+  'Сохранить текст':'Save text',
+  'Поделиться записью':'Share recording',
+  'Поделиться':'Share',
   'Диктофон':'Recorder',
   'Формат аудио':'Audio format',
   'Сохранить запись':'Save recording',

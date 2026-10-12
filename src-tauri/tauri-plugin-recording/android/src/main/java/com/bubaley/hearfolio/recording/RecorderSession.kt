@@ -5,119 +5,94 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.AudioEffect
 import android.media.audiofx.AutomaticGainControl
+import android.os.Process
 import android.util.Log
 import java.io.File
-import java.io.RandomAccessFile
-import kotlin.math.log10
-import kotlin.math.sqrt
 
-// The foreground service owns the processed capture path from main. Paused
-// samples are discarded, so WAV duration counts audio rather than wall time.
-internal class RecorderSession(private val onFailure: () -> Unit) {
-    private var recorder: AudioRecord? = null
-    private var gainControl: RecorderGainControl? = null
+// The foreground service owns capture. Activity and WebView lifetimes never
+// close the input. The worker owns every read/replacement/release after startup.
+internal class RecorderSession(private val onFailure: (Exception) -> Unit) {
     private var worker: Thread? = null
-    @Volatile private var capturing = false
-    @Volatile private var paused = false
-    @Volatile private var failed = false
-    @Volatile var level = 0f
-        private set
-    @Suppress("DEPRECATION")
+    private var loop: RecorderCaptureLoop? = null
+    val level: Float get() = loop?.envelope?.level ?: 0f
+    val elapsedMillis: Long get() = loop?.envelope?.elapsedMillis ?: 0L
+    fun envelope(): RecorderEnvelope = loop?.envelope?.snapshot() ?: RecorderEnvelope(emptyList(), 0, 0)
+    val isClosed: Boolean get() = worker?.isAlive != true
+
     fun start(file: File) {
         require(file.createNewFile())
-        var rate = 0
-        var source = MediaRecorder.AudioSource.MIC
-        for (configuration in RecorderCapturePolicy.configurations) {
-            var candidate: AudioRecord? = null
-            var candidateGain: RecorderGainControl? = null
+        var configuration: RecorderCaptureConfiguration? = null
+        var initial: RecorderInput? = null
+        for (candidate in RecorderCapturePolicy.configurations) {
             try {
-                val minimum = AudioRecord.getMinBufferSize(configuration.sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-                require(minimum > 0)
-                candidate = AudioRecord(configuration.source, configuration.sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minimum * 4, configuration.sampleRate / 5 * 2))
-                require(candidate.state == AudioRecord.STATE_INITIALIZED)
-                candidateGain = createGainControl()
-                candidateGain.attach(candidate.audioSessionId)
-                candidate.startRecording()
-                require(candidate.recordingState == AudioRecord.RECORDSTATE_RECORDING)
-                recorder = candidate; gainControl = candidateGain
-                rate = configuration.sampleRate; source = configuration.source
-                break
+                initial = open(candidate); configuration = candidate; break
             } catch (error: Exception) {
-                candidateGain?.release(); candidate?.release()
                 if (error is SecurityException) throw error
             }
         }
-        val active = requireNotNull(recorder)
-        val agc = gainControl?.diagnostics ?: RecorderGainDiagnostics()
-        val sourceName = if (source == MediaRecorder.AudioSource.MIC) "MIC" else "DEFAULT"
-        Log.i("HearfolioRecording", "source=$sourceName; sampleRate=$rate; agcAvailable=${agc.available}; agcAttached=${agc.attached}; agcEnabled=${agc.enabled}; agcStatus=${agc.status}")
-        capturing = true
-        worker = Thread({ capture(active, file, rate) }, "HearfolioAudioCapture").also { it.start() }
+        val selected = requireNotNull(configuration)
+        val input = requireNotNull(initial)
+        val capture = RecorderCaptureLoop(file, selected.sampleRate, input, { open(selected) }, onFailure,
+            { code -> Log.w("HearfolioRecording", "Audio input recreated; readCode=$code; sampleRate=${selected.sampleRate}") })
+        loop = capture
+        val thread = Thread({
+            try { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO) } catch(_: Exception) { }
+            capture.run()
+        }, "HearfolioAudioCapture")
+        worker=thread
+        try { thread.start() } catch(error:Exception) { capture.stop();input.close();loop=null;throw error }
     }
-    private fun createGainControl(): RecorderGainControl = RecorderGainControl(
-        isAvailable = { AutomaticGainControl.isAvailable() },
-        create = { session ->
-            AutomaticGainControl.create(session)?.let { effect ->
+
+    @Suppress("DEPRECATION")
+    private fun open(configuration: RecorderCaptureConfiguration): RecorderInput {
+        var record: AudioRecord? = null
+        val gain = RecorderGainControl(
+            isAvailable = { AutomaticGainControl.isAvailable() },
+            create = { session -> AutomaticGainControl.create(session)?.let { effect ->
                 object : RecorderGainEffect {
                     override fun isEnabled(): Boolean = effect.enabled
                     override fun enable(): Boolean = effect.setEnabled(true) == AudioEffect.SUCCESS
                     override fun release() { effect.release() }
                 }
-            }
-        }
-    )
-    private fun releaseGainControl() {
-        gainControl?.release()
-        gainControl = null
-    }
-
-
-    private fun capture(active: AudioRecord, file: File, sampleRate: Int) {
+            } }
+        )
         try {
-            RandomAccessFile(file, "rw").use { wav ->
-                WavRecovery.header(wav, 0, sampleRate)
-                wav.fd.sync()
-                val samples = ShortArray(2048)
-                val bytes = ByteArray(samples.size * 2)
-                var count = 0L
-                var checkpoint = 0L
-                while (capturing) {
-                    val read = active.read(samples, 0, samples.size, AudioRecord.READ_BLOCKING)
-                    if (read < 0) { if (capturing) throw IllegalStateException("Capture failed"); break }
-                    if (read == 0) continue
-                    if (paused) { level = 0f; continue }
-                    require(count + read * 2L <= 0xffffffffL - 36)
-                    var energy = 0.0
-                    for (index in 0 until read) {
-                        val value = samples[index].toInt()
-                        bytes[index * 2] = value.toByte()
-                        bytes[index * 2 + 1] = (value shr 8).toByte()
-                        val normalized = value / 32768.0
-                        energy += normalized * normalized
-                    }
-                    val rms = sqrt(energy / read)
-                    level = if (rms <= .001) 0f else ((20 * log10(rms) + 60) / 60).coerceIn(0.0, 1.0).toFloat()
-                    wav.write(bytes, 0, read * 2)
-                    count += read * 2L
-                    if (count - checkpoint >= sampleRate * 4L) {
-                        WavRecovery.header(wav, count, sampleRate); wav.fd.sync(); checkpoint = count
-                    }
+            val minimum = AudioRecord.getMinBufferSize(configuration.sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            require(minimum > 0)
+            val active = AudioRecord(configuration.source, configuration.sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minimum * 4, configuration.sampleRate / 5 * 2))
+            record = active
+            require(active.state == AudioRecord.STATE_INITIALIZED)
+            gain.attach(active.audioSessionId)
+            active.startRecording()
+            require(active.recordingState == AudioRecord.RECORDSTATE_RECORDING)
+            val agc = gain.diagnostics
+            val source = if(configuration.source == MediaRecorder.AudioSource.MIC) "MIC" else "DEFAULT"
+            Log.i("HearfolioRecording", "source=$source; sampleRate=${configuration.sampleRate}; agcAvailable=${agc.available}; agcAttached=${agc.attached}; agcEnabled=${agc.enabled}; agcStatus=${agc.status}")
+            return object : RecorderInput {
+                private var closed = false
+                override fun read(samples: ShortArray) = active.read(samples, 0, samples.size, AudioRecord.READ_NON_BLOCKING)
+                override fun close() {
+                    if(closed) return
+                    closed = true
+                    try { active.stop() } catch(_: Exception) { }
+                    gain.release()
+                    try { active.release() } catch(error:Exception) { Log.w("HearfolioRecording","Audio input release failed",error) }
                 }
-                WavRecovery.header(wav, count, sampleRate); wav.fd.sync()
             }
-        } catch (_: Exception) { failed = true; capturing = false; level = 0f; onFailure() }
+        } catch(error: Exception) {
+            gain.release();try { record?.release() } catch(_:Exception) { }; throw error
+        }
     }
-    fun pause() { paused = true; level = 0f }
-    fun resume() { paused = false }
+
+    fun pause() { requireNotNull(loop).pause(true) }
+    fun resume() { requireNotNull(loop).pause(false) }
     fun stop(): Boolean {
-        capturing = false
-        val active = recorder; recorder = null
-        try { active?.stop() } catch (_: Exception) { failed = true }
-        worker?.join(250)
-        releaseGainControl(); active?.release(); worker?.join(2000)
-        if (worker?.isAlive == true) failed = true else worker = null
-        level = 0f
-        return !failed
+        val capture = loop ?: return true
+        capture.stop()
+        try { worker?.join(2000) } catch(_:InterruptedException) { Thread.currentThread().interrupt();return false }
+        // Never release an input while another thread is inside read or writing
+        // its WAV. A delayed IO close remains owned by that worker.
+        return worker?.isAlive != true && !capture.failed
     }
     fun release() { stop() }
 }

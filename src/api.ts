@@ -198,8 +198,17 @@ export function registerPreviewFile(file: File) { const path=`preview:${crypto.r
 type BrowserRecording={stream:MediaStream;context:AudioContext;source:MediaStreamAudioSourceNode;processor:ScriptProcessorNode;mute:GainNode;queue:Promise<void>;pending:number;error:Error|null;chunks:Int16Array[];level:number;paused:boolean};
 let browserRecording:BrowserRecording|null=null;
 let browserInputLevel=0;
-export function recordingInputLevel(){return fixtureRecording?browserInputLevel:browserRecording&&!browserRecording.error?browserInputLevel:0;}
+export function recordingInputLevel(){
+  if(fixtureRecording){
+    if(fixturePaused)return 0;
+    const bucket=Math.floor((fixtureElapsed+performance.now()-fixtureStartedAt)/125);
+    const amplitudes=[.004,.008,.03,.09,.16,.07,.022,.045];
+    return pcmLevel(Float32Array.from({length:1600},(_,i)=>Math.sin(i*2*Math.PI*440/16000)*amplitudes[bucket%amplitudes.length]));
+  }
+  return browserRecording&&!browserRecording.error?browserInputLevel:0;
+}
 let recordingGeneration=0, recordingStarting=false, fixtureRecording=false;
+let fixtureStartedAt=0,fixtureElapsed=0,fixturePaused=false;
 let nativeRecordingActive=false;
 export function restoreNativeRecordingFlag(active:boolean){if(!preview&&nativePlatform?.os==='android')nativeRecordingActive=active;}
 function microphoneError(error:unknown):Error {
@@ -222,7 +231,7 @@ function recordingWav(chunks:Int16Array[],rate:number):File {
 export async function startAudioRecording():Promise<void> {
   if(recordingStarting||browserRecording||fixtureRecording||nativeRecordingActive)throw new Error('errors.operationBusy');
   if(!preview&&nativePlatform?.os==='android'){recordingStarting=true;const generation=++recordingGeneration;try{await call('start_audio_recording');if(generation!==recordingGeneration){await call('cancel_audio_recording');throw new Error('errors.recordingUnavailable');}nativeRecordingActive=true;}finally{recordingStarting=false;}return;}
-  if(preview&&new URLSearchParams(location.search).get('recording')==='fixture'){fixtureRecording=true;browserInputLevel=pcmLevel(Float32Array.from({length:1600},(_,i)=>Math.sin(i*2*Math.PI*440/16000)*1000/32767));return;}
+  if(preview&&new URLSearchParams(location.search).get('recording')==='fixture'){fixtureRecording=true;fixtureStartedAt=performance.now();fixtureElapsed=0;fixturePaused=false;return;}
   if(!navigator.mediaDevices?.getUserMedia||typeof AudioContext==='undefined')throw new Error('errors.recordingUnavailable');
   recordingStarting=true;const generation=++recordingGeneration;
   let stream:MediaStream|null=null,context:AudioContext|null=null;
@@ -258,12 +267,12 @@ export async function startAudioRecording():Promise<void> {
 }
 export async function pauseAudioRecording():Promise<void>{
   if(!preview&&nativePlatform?.os==='android'){await call('pause_audio_recording');return;}
-  if(fixtureRecording){browserInputLevel=0;return;}
+  if(fixtureRecording){if(!fixturePaused)fixtureElapsed+=performance.now()-fixtureStartedAt;fixturePaused=true;browserInputLevel=0;return;}
   if(!browserRecording)throw new Error('errors.recordingUnavailable');browserRecording.paused=true;browserInputLevel=0;
 }
 export async function resumeAudioRecording():Promise<void>{
   if(!preview&&nativePlatform?.os==='android'){await call('resume_audio_recording');return;}
-  if(fixtureRecording){browserInputLevel=pcmLevel(Float32Array.from({length:1600},(_,i)=>Math.sin(i*2*Math.PI*440/16000)*1000/32767));return;}
+  if(fixtureRecording){if(fixturePaused)fixtureStartedAt=performance.now();fixturePaused=false;return;}
   if(!browserRecording)throw new Error('errors.recordingUnavailable');browserRecording.paused=false;
 }
 export async function stopAudioRecording():Promise<AudioSelection|null> {
@@ -289,7 +298,7 @@ export async function discardAudioRecording(selection:AudioSelection):Promise<vo
 }
 export async function getAudioRecordingLevel():Promise<number> {
   if(!preview&&nativePlatform?.os==='android')return nativeRecordingActive?call<number>('audio_recording_level'):0;
-  return browserRecording?.level||0;
+  return fixtureRecording?recordingInputLevel():browserRecording?.level||0;
 }
 export function audioSource(entry: Entry) { return preview ? previewFiles.get(entry.inputPath)?.url || '' : convertFileSrc(entry.inputPath); }
 export async function resolveAudioSource(entry:Entry):Promise<string> {
