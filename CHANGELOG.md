@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.3 (2026-10-12)
+
+### Fixes and performance
+
+- **android:** keep recorder startup identity and foreground lifecycle consistent ([95f2bf5](https://github.com/bubaley/hearfolio/commit/95f2bf5c07f407c19aafc156988412208dd0c4e2))
+
+### Maintenance
+
+- **android:** cover screen lock and background recorder recovery ([1434199](https://github.com/bubaley/hearfolio/commit/1434199763c2ef292b189822225d279e7d85f9e7))
+- **android:** verify recorder lifecycle in an installed APK ([b3698ea](https://github.com/bubaley/hearfolio/commit/b3698ea01bfe5aebb3ff0af99eddb40265fe0024))
+
 ## 0.6.2 (2026-10-12)
 
 ### Fixes and performance
