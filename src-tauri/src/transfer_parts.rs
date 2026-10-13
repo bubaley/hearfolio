@@ -1,5 +1,5 @@
 //! Receiver-owned multipart checkpoints; the relay never stores audio on disk.
-use super::{client, error, hash_file, network_error, rpc, Connection};
+use super::{client, error, hash_file, network_error, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -272,6 +272,43 @@ impl Checkpoint {
 fn retryable(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
+/// Retry only network/rate-limit/server errors, never authorization or cancellation.
+pub(super) fn control(
+    c: &Connection,
+    action: &str,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let started = Instant::now();
+    loop {
+        crate::background::check_transfer_cancelled()?;
+        let result = client()?
+            .post(format!("{}/rpc", c.server))
+            .bearer_auth(&c.token)
+            .json(&json!({"action":action,"payload":payload}))
+            .send();
+        let last = match result {
+            Ok(res) if res.status().is_success() => match super::response(res) {
+                Ok(value) => return Ok(value),
+                Err(e) => e,
+            },
+            Ok(res) => {
+                let status = res.status();
+                let detail = super::response(res)
+                    .err()
+                    .unwrap_or_else(|| format!("HTTP {status}"));
+                if !retryable(status) {
+                    return Err(detail);
+                }
+                detail
+            }
+            Err(e) => network_error(e),
+        };
+        if started.elapsed() >= Duration::from_secs(120) {
+            return Err(last);
+        }
+        std::thread::sleep(Duration::from_millis(1000));
+    }
+}
 fn put(
     c: &Connection,
     id: &str,
@@ -289,7 +326,10 @@ fn put(
         return Err("Source audio changed".into());
     }
     let mut last = String::new();
-    for attempt in 0..4 {
+    let started = Instant::now();
+    let mut attempt = 0;
+    while started.elapsed() < Duration::from_secs(120) {
+        crate::background::check_transfer_cancelled()?;
         match client()?
             .put(format!("{}/transfers/{id}/parts/{index}", c.server))
             .bearer_auth(&c.token)
@@ -297,8 +337,41 @@ fn put(
             .body(bytes.clone())
             .send()
         {
+            Ok(res) if res.status() == reqwest::StatusCode::ACCEPTED => {
+                // The on-device endpoint retains a bounded buffer until durable ACK.
+                if let Err(e) = super::response(res) {
+                    last = e;
+                    std::thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+                loop {
+                    let status = control(c, "status", json!({"id":id}))?;
+                    if status["status"] == "cancelled" {
+                        return Err("Transfer cancelled".into());
+                    }
+                    if !status["parts"]["missing"]
+                        .as_array()
+                        .ok_or("Invalid resume state")?
+                        .iter()
+                        .any(|v| v.as_u64() == Some(index as u64))
+                    {
+                        return Ok(());
+                    }
+                    if started.elapsed() >= Duration::from_secs(120) {
+                        return Err("Recipient timed out; received parts retained".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
             Ok(res) if res.status().is_success() => {
-                let receipt = super::response(res)?;
+                let receipt = match super::response(res) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        last = e;
+                        std::thread::sleep(Duration::from_millis(250));
+                        continue;
+                    }
+                };
                 if receipt["index"].as_u64() != Some(index as u64) {
                     return Err("Invalid part receipt".into());
                 }
@@ -306,14 +379,16 @@ fn put(
             }
             Ok(res) => {
                 let status = res.status();
-                last = format!("Part upload HTTP {status}");
+                let detail = super::response(res).err().unwrap_or_default();
+                last = format!("Part upload HTTP {status}: {detail}");
                 if !retryable(status) {
                     return Err(last);
                 }
             }
             Err(e) => last = network_error(e),
         }
-        std::thread::sleep(Duration::from_millis(250 * (attempt + 1)));
+        std::thread::sleep(Duration::from_millis((250 * (attempt + 1)).min(2000)));
+        attempt += 1;
     }
     Err(last)
 }
@@ -325,9 +400,10 @@ fn get(
     size: u64,
 ) -> Result<Vec<u8>, String> {
     let deadline = Instant::now();
-    let mut failures = 0;
+
     loop {
-        if deadline.elapsed() > Duration::from_secs(45) {
+        crate::background::check_transfer_cancelled()?;
+        if deadline.elapsed() > Duration::from_secs(120) {
             return Err("Sender timed out; received parts retained".into());
         }
         let result = (|| {
@@ -340,7 +416,9 @@ fn get(
                 return Ok(None);
             }
             if !res.status().is_success() {
-                return Err(format!("Part download HTTP {}", res.status()));
+                let status = res.status();
+                let detail = super::response(res).err().unwrap_or_default();
+                return Err(format!("Part download HTTP {status}: {detail}"));
             }
             let length = description.length(size, index);
             let mut bytes = Vec::with_capacity(length);
@@ -356,8 +434,7 @@ fn get(
             Ok(Some(bytes)) => return Ok(bytes),
             Ok(None) => {}
             Err(e) => {
-                failures += 1;
-                if failures >= 4 || e.starts_with("Part download HTTP") {
+                if e.starts_with("Part download HTTP") {
                     return Err(e);
                 }
             }
@@ -373,7 +450,7 @@ pub fn send(
     description: &Description,
     mut progress: impl FnMut(u64) -> Result<(), String>,
 ) -> Result<(), String> {
-    let status = rpc(c, "status", json!({"id":id}))?;
+    let status = control(c, "status", json!({"id":id}))?;
     let missing: Vec<usize> =
         serde_json::from_value(status["parts"]["missing"].clone()).map_err(error)?;
     if missing.iter().any(|&i| i >= description.hashes.len()) {
@@ -382,7 +459,7 @@ pub fn send(
     progress(status["offset"].as_u64().unwrap_or(0))?;
     for batch in missing.chunks(WINDOW) {
         progress(
-            rpc(c, "status", json!({"id":id}))?["offset"]
+            control(c, "status", json!({"id":id}))?["offset"]
                 .as_u64()
                 .unwrap_or(0),
         )?;
@@ -436,19 +513,11 @@ pub fn receive(
                         .map_err(|_| "Multipart worker failed".to_string())??;
                     checkpoint.write(index, &bytes)?;
                     // Retry is safe: the relay's acknowledgement is idempotent.
-                    let mut ack = Err("Part acknowledgement failed".into());
-                    for _ in 0..3 {
-                        ack = rpc(
-                            c,
-                            "ackPart",
-                            json!({"id":id,"index":index,"sha256":description.hashes[index]}),
-                        );
-                        if ack.is_ok() {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(250));
-                    }
-                    ack?;
+                    control(
+                        c,
+                        "ackPart",
+                        json!({"id":id,"index":index,"sha256":description.hashes[index]}),
+                    )?;
                     progress(checkpoint.received())?;
                     Ok(())
                 })();
@@ -467,6 +536,7 @@ pub fn receive(
 
 #[cfg(test)]
 mod tests {
+    use super::super::rpc;
     use super::*;
     #[test]
     fn resume_rechecks_disk_and_keeps_only_good_parts() {
@@ -486,7 +556,7 @@ mod tests {
         cp.write(0, &bytes[..SIZE]).unwrap();
         cp.write(1, &bytes[SIZE..]).unwrap();
         let path = cp.path.clone();
-        let journal_path = cp.journal_path.clone();
+        let _journal_path = cp.journal_path.clone();
         drop(cp);
         let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.seek(SeekFrom::Start(SIZE as u64)).unwrap();
@@ -579,6 +649,7 @@ mod tests {
                 server: url.clone(),
                 id: value["id"].as_str().unwrap().into(),
                 token: value["token"].as_str().unwrap().into(),
+                local_host: false,
             }
         };
         let sender = register("Sender");

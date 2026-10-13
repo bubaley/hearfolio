@@ -18,12 +18,14 @@ test('failed or in-flight automatic actions are not retried every poll; other fi
  assert.equal(automaticActions(inbox,{autoPair:true,autoReceive:false},false,attempted).receive,null);
 });
 
-test('fresh transfer setup has no implicit server; explicit domains remain configured',async()=>{
+test('local transfers reject external endpoints, including old saved server settings',async()=>{
  const {configuredServer}=await import('../src/transfer-policy.ts');
  assert.equal(configuredServer(null),'');
  assert.equal(configuredServer('   '),'');
- assert.equal(configuredServer(' https://my-relay.example/ '),'https://my-relay.example');
- assert.equal(configuredServer('https://hearfolio.corextech.ru'),'https://hearfolio.corextech.ru');
+ assert.equal(configuredServer(' https://my-relay.example/ '),'');
+ assert.equal(configuredServer(' http://192.168.1.10:47831/ '),'http://192.168.1.10:47831');
+ assert.equal(configuredServer('http://8.8.8.8:47831'),'');
+ assert.equal(configuredServer('https://hearfolio.corextech.ru'),'');
 });
 test('invitation expiry reflects the actual server deadline and never goes negative',async()=>{
  const {invitationSeconds}=await import('../src/transfer-policy.ts');

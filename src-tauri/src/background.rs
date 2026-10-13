@@ -46,6 +46,24 @@ fn inbox_active() -> bool {
 static ACTIVE_TRANSFER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 #[cfg(target_os = "android")]
 static CANCELLED_TRANSFER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+pub(crate) fn check_transfer_cancelled() -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    if let Some(id) = ACTIVE_TRANSFER
+        .lock()
+        .map_err(|_| "errors.transferBackgroundUnavailable")?
+        .clone()
+    {
+        if CANCELLED_TRANSFER
+            .lock()
+            .is_ok_and(|c| c.as_deref() == Some(&id))
+            || read_journal(&journal_path(&format!("transfer-control-{id}"))?)
+                .is_some_and(|v| v["id"] == id && v["cancelled"] == true)
+        {
+            return Err("errors.transferCancelled".into());
+        }
+    }
+    Ok(())
+}
 pub(crate) struct TransferGuard {
     #[cfg(target_os = "android")]
     id: String,
