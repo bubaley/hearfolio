@@ -48,3 +48,13 @@ curl --fail https://hearfolio.corextech.ru/health
 This retains the existing `hearfolio_relay_state` volume, runtime `.env`, loopback binding and container restrictions. Use a version tag for controlled upgrades and rollbacks; restarting interrupts active transfers. For a private Docker Hub repository, log in on the server first using a separate read-only token. Local builds continue to use `compose.yaml` without the registry overlay.
 
 Invitation codes are single-use and valid for three minutes. A pending registration grants no device token. The join ticket remains native-only, can retrieve its approved token again if a response is lost, and expires after three minutes. Nginx limits `/join` with the registration rate limit. Rejecting a request grants no credentials. Address, device name and administrator key are configured in Settings; Devices contains invitations and paired devices.
+
+## Multipart relay
+
+Deploy both `relay.mjs` and `multipart.mjs` (the Dockerfile copies both). Health reports `multipart: 1`; manifest protocol 1 remains compatible with legacy clients. Updated sender and receiver negotiate 1 MiB parts, four in flight, checked by SHA-256. Audio remains only in bounded RAM on the relay, never in its state volume. Nginx must retain `proxy_request_buffering off` and `proxy_buffering off`; the existing 5 MiB body and 45-second proxy timeout support 1 MiB part requests.
+
+Per-device limits: two active transfers, four pending multipart slots across its transfers. Global limits: 16 active transfers and 32 pending slots, including slots reserved before reading request bodies. Full windows return 429 for bounded client retries. Device quotas do not represent account-wide limits: the protocol has no user accounts.
+
+Restarting the relay drops sessions, but a new send attempt reuses verified parts held on the recipient for seven days. Both devices must reconnect. The server still cannot deliver audio while the original sender is offline.
+
+Authenticated HTTP requests are limited to eight active responses per device and 128 globally, including held multipart PUT responses. Each device retains headroom for control requests beside its four-part window. Nginx connection/rate limits continue to apply.

@@ -1,3 +1,4 @@
+import {createParts,describeParts,acceptParts,acknowledgePart,stopParts,handlePart} from './multipart.mjs';
 import http from 'node:http';
 import {randomBytes, randomInt, randomUUID, createHash, timingSafeEqual} from 'node:crypto';
 import {readFileSync, writeFileSync, renameSync, mkdirSync} from 'node:fs';
@@ -10,13 +11,14 @@ export function createRelay({stateFile, ttl=120000, codeTtl=180000, registration
   if(stateFile){mkdirSync(path.dirname(stateFile),{recursive:true});try{devices=JSON.parse(readFileSync(stateFile,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}}
   const online=new Map(), codes=new Map(), attempts=new Map(), pairs=new Map(), joins=new Map(), transfers=new Map();
   let joinAttempts=0, joinWindow=Date.now();
+  const activeRequests=new Map();let requestCount=0;
   const persist=()=>{if(stateFile){writeFileSync(stateFile+'.tmp',JSON.stringify(devices),{mode:0o600});renameSync(stateFile+'.tmp',stateFile);}};
   const fail=(message,status=400)=>{throw Object.assign(new Error(message),{status});};
   const text=(value,max=200)=>typeof value==='string'&&value.length>0&&value.length<=max&&!/[\x00-\x1f]/.test(value);
   const isOnline=id=>Date.now()-(online.get(id)||0)<10000;
-  const json=(res,body,status=200)=>{if(!res.destroyed){res.writeHead(status,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify(body));}};
+  const json=(res,body,status=200)=>{if(!res.destroyed&&!res.writableEnded){res.writeHead(status,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify(body));}};
   const read=async(req,max)=>{const parts=[];let size=0;for await(const part of req){size+=part.length;if(size>max)fail('Request too large',413);parts.push(part);}return Buffer.concat(parts);};
-  const stop=t=>{if(t.pending){json(t.pending.res,{error:'Transfer cancelled'},409);t.pending=null;}t.status='cancelled';t.updated=Date.now();};
+  const stop=t=>{stopParts(t,json);if(t.pending){json(t.pending.res,{error:'Transfer cancelled'},409);t.pending=null;}t.status='cancelled';t.updated=Date.now();};
   const timer=setInterval(()=>{
     const now=Date.now();for(const [id,t] of transfers)if(now-t.updated>ttl){stop(t);transfers.delete(id);}
     for(const [code,c] of codes)if(c.until<now)codes.delete(code);
@@ -27,7 +29,7 @@ export function createRelay({stateFile, ttl=120000, codeTtl=180000, registration
   const server=http.createServer(async(req,res)=>{
     try {
       const url=new URL(req.url,'http://relay');
-      if(req.method==='GET'&&url.pathname==='/health')return json(res,{ok:true,protocol:1});
+      if(req.method==='GET'&&url.pathname==='/health')return json(res,{ok:true,protocol:1,multipart:1});
       if(req.method==='POST'&&url.pathname==='/join'){
         if(Date.now()-joinWindow>60000){joinWindow=Date.now();joinAttempts=0;}
         if(++joinAttempts>60)fail('Too many invitations; wait one minute',429);
@@ -52,7 +54,13 @@ export function createRelay({stateFile, ttl=120000, codeTtl=180000, registration
         const device={id:randomUUID(),token:randomBytes(32).toString('hex'),name:data.name,peers:[]};devices.push(device);persist();online.set(device.id,Date.now());return json(res,{id:device.id,token:device.token});
       }
       const token=req.headers.authorization?.replace(/^Bearer /,'');const device=devices.find(d=>d.token===token);
-      if(!device)fail('Unauthorized',401);online.set(device.id,Date.now());
+      if(!device)fail('Unauthorized',401);
+      // Long-lived PUT responses count too. Leave room for other devices and
+      // for polling/acknowledgement beside a four-part transfer window.
+      if((activeRequests.get(device.id)||0)>=8||requestCount>=128){req.resume();fail('Device connection limit reached',429);}
+      activeRequests.set(device.id,(activeRequests.get(device.id)||0)+1);requestCount++;
+      res.once('close',()=>{const n=(activeRequests.get(device.id)||1)-1;if(n)activeRequests.set(device.id,n);else activeRequests.delete(device.id);requestCount--;});
+      online.set(device.id,Date.now());
       if(req.method==='POST'&&url.pathname==='/rpc'){
         const {action,payload={}}=JSON.parse((await read(req,5*1024*1024)).toString());
         if(action==='poll')return json(res,{device:{id:device.id,name:device.name},peers:devices.filter(d=>device.peers.includes(d.id)).map(d=>({id:d.id,name:d.name,online:isOnline(d.id)})),pairRequests:[...pairs.entries()].filter(([,p])=>p.to===device.id).map(([id,p])=>({id,name:p.join?joins.get(p.join)?.name:devices.find(d=>d.id===p.from)?.name})),offers:[...transfers.values()].filter(t=>t.to===device.id&&t.status==='offered').map(t=>({id:t.id,name:t.manifest.name,size:t.manifest.size,from:devices.find(d=>d.id===t.from)?.name})),transfers:[...transfers.values()].filter(t=>t.from===device.id||t.to===device.id).map(t=>({id:t.id,status:t.status,offset:t.offset,size:t.manifest.size}))});
@@ -85,29 +93,35 @@ export function createRelay({stateFile, ttl=120000, codeTtl=180000, registration
           if(!device.peers.includes(payload.to))fail('Device is not paired',403);if(!isOnline(payload.to))fail('Recipient is offline',409);
           const m=payload.manifest;
           if(!m||m.version!==1||!text(m.name)||!text(m.sourceId)||!['m4a','mp3','wav','mp4','aac','flac','ogg'].includes(m.extension)||!Number.isSafeInteger(m.size)||m.size<=0||m.size>MAX_SIZE||!/^[a-f0-9]{64}$/.test(m.sha256)||typeof m.transcript!=='string'||Buffer.byteLength(m.transcript)>4*1024*1024||!Number.isSafeInteger(m.createdAt)||m.createdAt<0)fail('Invalid recording manifest');
+          if([device.id,payload.to].some(id=>[...transfers.values()].filter(t=>[t.from,t.to].includes(id)&&!['delivered','cancelled'].includes(t.status)).length>=2))fail('Device transfer limit reached',429);
           if([...transfers.values()].filter(t=>!['delivered','cancelled'].includes(t.status)).length>=16)fail('Relay busy',429);
           if([...transfers.values()].some(t=>t.to===payload.to&&!['delivered','cancelled'].includes(t.status)))fail('Recipient has another transfer',409);
-          const id=randomUUID();transfers.set(id,{id,from:device.id,to:payload.to,manifest:m,status:'offered',offset:0,updated:Date.now(),pending:null,metadataOnlyCapable:payload.metadataOnly===true,audioRequired:true});return json(res,{id});
+          const parts=createParts(payload.parts,m.size);
+          const id=randomUUID();transfers.set(id,{id,parts,from:device.id,to:payload.to,manifest:m,status:'offered',offset:0,updated:Date.now(),pending:null,metadataOnlyCapable:payload.metadataOnly===true,audioRequired:true});return json(res,{id});
         }
         const t=transfers.get(payload.id);if(!t||![t.from,t.to].includes(device.id))fail('Unknown transfer',404);t.updated=Date.now();
-        if(action==='status')return json(res,{status:t.status,offset:t.offset,size:t.manifest.size,audioRequired:t.audioRequired});
-        if(action==='inspect'&&t.to===device.id&&t.status==='offered')return json(res,{manifest:t.manifest,metadataOnlyCapable:t.metadataOnlyCapable});
+        if(action==='status')return json(res,{status:t.status,offset:t.offset,size:t.manifest.size,audioRequired:t.audioRequired,parts:t.parts?.enabled?{...describeParts(t),missing:t.parts.hashes.map((_,i)=>i).filter(i=>!t.parts.acked.has(i))}:null});
+        if(action==='inspect'&&t.to===device.id&&t.status==='offered')return json(res,{manifest:t.manifest,metadataOnlyCapable:t.metadataOnlyCapable,...(t.parts?{from:t.from,parts:describeParts(t)}:{})});
         if(action==='accept'&&t.to===device.id&&t.status==='offered'){
           if(payload.audioRequired===false){
             if(!t.metadataOnlyCapable||payload.sha256!==t.manifest.sha256||payload.size!==t.manifest.size)fail('Invalid existing audio confirmation');
             t.audioRequired=false;t.offset=t.manifest.size;
           }
-          t.status='streaming';return json(res,{manifest:t.manifest,from:t.from,audioRequired:t.audioRequired});
+          if(payload.parts&&t.audioRequired)acceptParts(t,payload.parts);
+          t.status='streaming';return json(res,{manifest:t.manifest,from:t.from,audioRequired:t.audioRequired,parts:t.parts?.enabled?describeParts(t):null});
         }
         if(action==='cancel'){stop(t);return json(res,{ok:true});}
-        if(action==='ack'&&t.to===device.id&&t.status==='streaming'){
+        if(action==='ackPart'&&t.to===device.id&&t.status==='streaming'&&t.parts?.enabled){acknowledgePart(t,payload.index,payload.sha256,json);return json(res,{ok:true,offset:t.offset});}
+        if(action==='ack'&&!t.parts?.enabled&&t.to===device.id&&t.status==='streaming'){
           if(!t.pending||payload.offset!==t.offset+t.pending.buffer.length)fail('Invalid acknowledgement');const pending=t.pending;t.pending=null;t.offset=payload.offset;json(pending.res,{offset:t.offset});return json(res,{ok:true});
         }
-        if(action==='finish'&&t.to===device.id&&t.status==='streaming'&&t.offset===t.manifest.size){t.status='delivered';t.manifest.transcript='';return json(res,{ok:true});}
+        if(action==='finish'&&t.to===device.id&&t.status==='streaming'&&t.offset===t.manifest.size){t.status='delivered';t.manifest.transcript='';stopParts(t,json);return json(res,{ok:true});}
         fail('Invalid action');
       }
+      const partMatch=/^\/transfers\/([a-f0-9-]+)\/parts\/(\d+)$/.exec(url.pathname);
+      if(partMatch){const t=transfers.get(partMatch[1]);if(!t||![t.from,t.to].includes(device.id))fail('Unknown transfer',404);t.updated=Date.now();await handlePart(req,res,t,partMatch[2],device,read,json,transfers);return;}
       const match=/^\/transfers\/([a-f0-9-]+)\/chunk$/.exec(url.pathname);const t=match&&transfers.get(match[1]);
-      if(!t||![t.from,t.to].includes(device.id))fail('Unknown transfer',404);t.updated=Date.now();if(t.status!=='streaming'||!t.audioRequired)fail('Transfer is not active',409);
+      if(!t||![t.from,t.to].includes(device.id))fail('Unknown transfer',404);t.updated=Date.now();if(t.parts?.enabled||t.status!=='streaming'||!t.audioRequired)fail('Transfer is not active',409);
       if(req.method==='PUT'&&t.from===device.id){
         if(t.pending)fail('A block is already pending',409);if(Number(req.headers['x-offset'])!==t.offset)fail('Invalid offset',409);
         const buffer=await read(req,BLOCK);if(!buffer.length||t.offset+buffer.length>t.manifest.size)fail('Invalid block');
@@ -120,7 +134,7 @@ export function createRelay({stateFile, ttl=120000, codeTtl=180000, registration
     } catch(e){json(res,{error:e.status?e.message:'Invalid request'},e.status||400);}
   });
   server.requestTimeout=30000;server.headersTimeout=10000;server.on('close',()=>{clearInterval(timer);for(const t of transfers.values())stop(t);});
-  return {server,transfers};
+  return {server,transfers,activeRequests};
 }
 if(process.argv[1]===fileURLToPath(import.meta.url)){
   if(process.env.RELAY_REQUIRE_KEY==='true'&&!process.env.RELAY_REGISTRATION_KEY){console.error('RELAY_REGISTRATION_KEY is required');process.exit(1);}

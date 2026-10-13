@@ -1,4 +1,6 @@
-//! LAN relay protocol. Audio crosses HTTP as binary, with one acknowledged block in flight.
+//! Binary relay with negotiated, receiver-checkpointed multipart transfers.
+#[path = "transfer_parts.rs"]
+mod parts;
 use crate::{records::HistoryEntry, storage};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -41,6 +43,7 @@ fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 pub fn cleanup_partial_files(dir: &Path) {
+    parts::cleanup(dir);
     if let Ok(files) = fs::read_dir(dir.join("temp")) {
         for entry in files.flatten() {
             let name = entry.file_name();
@@ -358,10 +361,11 @@ pub async fn transfer_send(app: tauri::AppHandle, id: String, to: String) -> Res
                 model: entry.model,
                 configuration: entry.configuration,
             };
+            let part_description = parts::describe(path, &manifest.sha256, size)?;
             let offered = rpc(
                 &c,
                 "offer",
-                json!({"to":to,"manifest":manifest,"metadataOnly":true}),
+                json!({"to":to,"manifest":manifest,"metadataOnly":true,"parts":part_description}),
             )?;
             let session = offered["id"]
                 .as_str()
@@ -388,7 +392,16 @@ pub async fn transfer_send(app: tauri::AppHandle, id: String, to: String) -> Res
                     }
                     std::thread::sleep(Duration::from_millis(500));
                 };
-                if audio_required {
+                let multipart = audio_required
+                    && rpc(&c, "status", json!({"id":session}))?["parts"].is_object();
+                if multipart {
+                    parts::send(&c, &session, path, size, &part_description, |offset| {
+                        background.check()?;
+                        emit(&app, &session, "sending", offset, size);
+                        background.progress("sending", offset, size);
+                        Ok(())
+                    })?;
+                } else if audio_required {
                     let mut file = fs::File::open(path).map_err(error)?;
                     let mut offset = 0;
                     let mut buf = [0; BLOCK];
@@ -676,18 +689,26 @@ pub async fn transfer_receive(app: tauri::AppHandle, id: String) -> Result<Histo
         let dir = crate::base()?;
         // Older relays/senders default to a full transfer.
         let mut accept_payload=json!({"id":id});
+        let mut checkpoint=None;
+        let mut resume_identity=None;
         if let Ok(inspected)=rpc(&c,"inspect",json!({"id":id})) {
             let manifest:Manifest=serde_json::from_value(inspected["manifest"].clone()).map_err(error)?;
             validate_manifest(&manifest)?;
+            if inspected["parts"].is_object() {
+                let from=inspected["from"].as_str().ok_or("Sender identity missing")?;
+                resume_identity=Some(serde_json::to_string(&json!([c.server,from,manifest.source_id,manifest.sha256,manifest.size])).map_err(error)?);
+            }
             let _lock=crate::history_lock()?;
             if inspected["metadataOnlyCapable"]==true && has_verified_audio(&dir,&manifest)? {
                 accept_payload=json!({"id":id,"audioRequired":false,"sha256":manifest.sha256,"size":manifest.size});
+            } else if inspected["parts"].is_object() {
+                let description:parts::Description=serde_json::from_value(inspected["parts"].clone()).map_err(error)?;
+                let cp=parts::Checkpoint::open(&dir,resume_identity.as_deref().ok_or("Sender identity missing")?,manifest.size,description)?;
+                accept_payload=json!({"id":id,"parts":{"verified":cp.verified()}});checkpoint=Some(cp);
             }
         }
         let accepted=rpc(&c,"accept",accept_payload)?;
-        let staging = dir
-            .join("temp")
-            .join(format!("transfer-{}.part", uuid::Uuid::new_v4()));
+        let staging = checkpoint.as_ref().map(|cp|cp.path.clone()).unwrap_or_else(||dir.join("temp").join(format!("transfer-{}.part", uuid::Uuid::new_v4())));
         let result = (|| {
             let m: Manifest =
                 serde_json::from_value(accepted["manifest"].clone()).map_err(error)?;
@@ -705,6 +726,13 @@ pub async fn transfer_receive(app: tauri::AppHandle, id: String) -> Result<Histo
                 emit(&app,&id,"delivered",m.size,m.size);
                 return Ok(entry);
             }
+            if let Some(cp)=checkpoint.as_mut() {
+                if !accepted["parts"].is_object(){return Err("Relay did not accept multipart resume".into())}
+                parts::receive(&c,&id,cp,|offset|{
+                    background.check()?;emit(&app,&id,"receiving",offset,m.size);background.progress("receiving",offset,m.size);Ok(())
+                })?;
+                cp.finish(&m.sha256)?;
+            } else {
             let mut output = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -741,6 +769,7 @@ pub async fn transfer_receive(app: tauri::AppHandle, id: String) -> Result<Histo
             if format!("{:x}", hash.finalize()) != m.sha256 {
                 return Err("Audio checksum mismatch".into());
             }
+            }
             let _lock = crate::history_lock()?;
             let entry = commit_received(&dir, &staging, local_id, m.clone())?;
             app.asset_protocol_scope()
@@ -750,7 +779,8 @@ pub async fn transfer_receive(app: tauri::AppHandle, id: String) -> Result<Histo
             emit(&app, &id, "delivered", m.size, m.size);
             Ok(entry)
         })();
-        let _ = fs::remove_file(staging);
+        if result.is_ok(){if let Some(cp)=checkpoint.take(){cp.remove();} if let Some(identity)=resume_identity.as_deref(){parts::discard(&dir,identity);}}
+        if checkpoint.is_none(){let _=fs::remove_file(staging);}
         if result.is_err() {
             let _ = rpc(&c, "cancel", json!({"id":id}));
         }
