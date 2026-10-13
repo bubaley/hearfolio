@@ -104,7 +104,11 @@ pub fn address() -> Result<String, String> {
                 if ip.is_private()
                     && !a.name.starts_with("docker")
                     && !a.name.starts_with("veth")
-                    && !a.name.starts_with("tun") =>
+                    && !a.name.starts_with("tun")
+                    && !a.name.starts_with("wg")
+                    && !a.name.starts_with("br-")
+                    && !a.name.starts_with("virbr")
+                    && !a.name.starts_with("vmnet") =>
             {
                 Some((!a.name.starts_with('w'), ip))
             }
