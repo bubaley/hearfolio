@@ -77,6 +77,7 @@ class InboxService : Service() {
     }
     override fun onCreate() {
         super.onCreate(); instance = this
+        LanDiscovery.acquire(this,"inbox")
         if (Build.VERSION.SDK_INT >= 26) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel(CHANNEL,tr("Связь с устройствами","Device connection"),NotificationManager.IMPORTANCE_LOW))
             getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("hearfolio-incoming",tr("Входящие записи","Incoming recordings"),NotificationManager.IMPORTANCE_DEFAULT))
@@ -116,10 +117,11 @@ class InboxService : Service() {
         if (!running && success) getSystemService(NotificationManager::class.java).notify(ID + 2,NotificationCompat.Builder(this,"hearfolio-incoming").setSmallIcon(android.R.drawable.stat_sys_download).setContentTitle("Hearfolio").setContentText(tr("Запись сохранена","Recording saved")).setContentIntent(open()).setAutoCancel(true).build())
     }
     fun progress(stage: String, current: Long, total: Long) {
-        val text = if (total > 0) "${(100.0 * current / total).toInt().coerceIn(0,100)}%" else if (stage == "waiting") tr("Ожидание получателя…","Waiting for recipient…") else tr("Передача записи…","Transferring recording…")
+        val text = if (LanDiscovery.waiting(transferState)) tr("Ищем устройство в локальной сети…","Finding your device on the local network…") else if (total > 0) "${(100.0 * current / total).toInt().coerceIn(0,100)}%" else if (stage == "waiting") tr("Ожидание получателя…","Waiting for recipient…") else tr("Передача записи…","Transferring recording…")
         getSystemService(NotificationManager::class.java).notify(ID,notification(text))
     }
     override fun onDestroy() {
+        LanDiscovery.release("inbox")
         handler.removeCallbacks(poll);handler.removeCallbacks(deadline)
         active = false;status();transferStatus(true);instance = null
         if(wifi?.isHeld==true)wifi?.release();wifi=null

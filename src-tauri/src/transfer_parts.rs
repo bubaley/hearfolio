@@ -1,5 +1,7 @@
 //! Receiver-owned multipart checkpoints; the relay never stores audio on disk.
-use super::{client, error, hash_file, network_error, Connection};
+#[cfg(test)]
+use super::client;
+use super::{error, hash_file, wire, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -281,29 +283,29 @@ pub(super) fn control(
     let started = Instant::now();
     loop {
         crate::background::check_transfer_cancelled()?;
-        let result = client()?
-            .post(format!("{}/rpc", c.server))
-            .bearer_auth(&c.token)
-            .json(&json!({"action":action,"payload":payload}))
-            .send();
+        let result = wire::send(
+            c,
+            reqwest::Method::POST,
+            "/rpc",
+            serde_json::to_vec(&json!({"action":action,"payload":payload})).map_err(error)?,
+            None,
+        );
         let last = match result {
-            Ok(res) if res.status().is_success() => match super::response(res) {
-                Ok(value) => return Ok(value),
-                Err(e) => e,
-            },
+            Ok(res) if res.status.is_success() => return res.json(),
             Ok(res) => {
-                let status = res.status();
-                let detail = super::response(res)
-                    .err()
-                    .unwrap_or_else(|| format!("HTTP {status}"));
-                if !retryable(status) {
+                let status = res.status;
+                let detail = res.detail();
+                if !retryable(status) && !(action == "offer" && detail == "Recipient is offline") {
                     return Err(detail);
+                }
+                if detail == "Recipient is offline" {
+                    super::discovery::waiting(true);
                 }
                 detail
             }
-            Err(e) => network_error(e),
+            Err(e) => e,
         };
-        if started.elapsed() >= Duration::from_secs(120) {
+        if started.elapsed() >= Duration::from_secs(600) {
             return Err(last);
         }
         std::thread::sleep(Duration::from_millis(1000));
@@ -328,24 +330,27 @@ fn put(
     let mut last = String::new();
     let started = Instant::now();
     let mut attempt = 0;
-    while started.elapsed() < Duration::from_secs(120) {
+    while started.elapsed() < Duration::from_secs(600) {
         crate::background::check_transfer_cancelled()?;
-        match client()?
-            .put(format!("{}/transfers/{id}/parts/{index}", c.server))
-            .bearer_auth(&c.token)
-            .header("x-part-sha256", &description.hashes[index])
-            .body(bytes.clone())
-            .send()
-        {
-            Ok(res) if res.status() == reqwest::StatusCode::ACCEPTED => {
+        match wire::send(
+            c,
+            reqwest::Method::PUT,
+            &format!("/transfers/{id}/parts/{index}"),
+            bytes.clone(),
+            Some(&description.hashes[index]),
+        ) {
+            Ok(res) if res.status == reqwest::StatusCode::ACCEPTED => {
                 // The on-device endpoint retains a bounded buffer until durable ACK.
-                if let Err(e) = super::response(res) {
+                if let Err(e) = res.json() {
                     last = e;
                     std::thread::sleep(Duration::from_millis(250));
                     continue;
                 }
                 loop {
                     let status = control(c, "status", json!({"id":id}))?;
+                    if status["peerOnline"].as_bool() == Some(false) {
+                        super::discovery::waiting(true);
+                    }
                     if status["status"] == "cancelled" {
                         return Err("Transfer cancelled".into());
                     }
@@ -355,16 +360,17 @@ fn put(
                         .iter()
                         .any(|v| v.as_u64() == Some(index as u64))
                     {
+                        super::discovery::waiting(false);
                         return Ok(());
                     }
-                    if started.elapsed() >= Duration::from_secs(120) {
+                    if started.elapsed() >= Duration::from_secs(600) {
                         return Err("Recipient timed out; received parts retained".into());
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
-            Ok(res) if res.status().is_success() => {
-                let receipt = match super::response(res) {
+            Ok(res) if res.status.is_success() => {
+                let receipt = match res.json() {
                     Ok(value) => value,
                     Err(e) => {
                         last = e;
@@ -378,14 +384,14 @@ fn put(
                 return Ok(());
             }
             Ok(res) => {
-                let status = res.status();
-                let detail = super::response(res).err().unwrap_or_default();
+                let status = res.status;
+                let detail = res.detail();
                 last = format!("Part upload HTTP {status}: {detail}");
                 if !retryable(status) {
                     return Err(last);
                 }
             }
-            Err(e) => last = network_error(e),
+            Err(e) => last = e,
         }
         std::thread::sleep(Duration::from_millis((250 * (attempt + 1)).min(2000)));
         attempt += 1;
@@ -403,35 +409,44 @@ fn get(
 
     loop {
         crate::background::check_transfer_cancelled()?;
-        if deadline.elapsed() > Duration::from_secs(120) {
+        if deadline.elapsed() > Duration::from_secs(5)
+            && deadline.elapsed().as_millis() % 1000 < 150
+        {
+            if control(c, "status", json!({"id":id}))?["peerOnline"].as_bool() == Some(false) {
+                super::discovery::waiting(true);
+            }
+        }
+        if deadline.elapsed() > Duration::from_secs(600) {
             return Err("Sender timed out; received parts retained".into());
         }
         let result = (|| {
-            let res = client()?
-                .get(format!("{}/transfers/{id}/parts/{index}", c.server))
-                .bearer_auth(&c.token)
-                .send()
-                .map_err(network_error)?;
-            if res.status() == reqwest::StatusCode::NO_CONTENT || retryable(res.status()) {
+            let res = wire::send(
+                c,
+                reqwest::Method::GET,
+                &format!("/transfers/{id}/parts/{index}"),
+                vec![],
+                None,
+            )?;
+            if res.status == reqwest::StatusCode::NO_CONTENT || retryable(res.status) {
                 return Ok(None);
             }
-            if !res.status().is_success() {
-                let status = res.status();
-                let detail = super::response(res).err().unwrap_or_default();
+            if !res.status.is_success() {
+                let status = res.status;
+                let detail = res.detail();
                 return Err(format!("Part download HTTP {status}: {detail}"));
             }
             let length = description.length(size, index);
-            let mut bytes = Vec::with_capacity(length);
-            res.take((length + 1) as u64)
-                .read_to_end(&mut bytes)
-                .map_err(error)?;
+            let bytes = res.body;
             if bytes.len() != length || digest(&bytes) != description.hashes[index] {
                 return Err("Part checksum mismatch".into());
             }
             Ok(Some(bytes))
         })();
         match result {
-            Ok(Some(bytes)) => return Ok(bytes),
+            Ok(Some(bytes)) => {
+                super::discovery::waiting(false);
+                return Ok(bytes);
+            }
             Ok(None) => {}
             Err(e) => {
                 if e.starts_with("Part download HTTP") {
@@ -650,6 +665,7 @@ mod tests {
                 id: value["id"].as_str().unwrap().into(),
                 token: value["token"].as_str().unwrap().into(),
                 local_host: false,
+                host_id: String::new(),
             }
         };
         let sender = register("Sender");

@@ -46,6 +46,12 @@ fn inbox_active() -> bool {
 static ACTIVE_TRANSFER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 #[cfg(target_os = "android")]
 static CANCELLED_TRANSFER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+pub(crate) fn network_waiting(_waiting: bool) {
+    #[cfg(target_os = "android")]
+    if let Ok(path) = journal_path("lan-network-state") {
+        let _ = write_journal(&path, &serde_json::json!({"waiting":_waiting}));
+    }
+}
 pub(crate) fn check_transfer_cancelled() -> Result<(), String> {
     #[cfg(target_os = "android")]
     if let Some(id) = ACTIVE_TRANSFER
@@ -81,6 +87,7 @@ pub(crate) struct TransferGuard {
 }
 impl TransferGuard {
     pub fn start(_app: &AppHandle, _direction: &str) -> Result<Self, String> {
+        crate::transfer::network_restored();
         #[cfg(target_os = "android")]
         {
             let id = uuid::Uuid::new_v4().to_string();
@@ -150,6 +157,7 @@ impl TransferGuard {
         }
     }
     pub fn finish<T: serde::Serialize>(&mut self, _result: &Result<T, String>) {
+        crate::transfer::network_restored();
         self.success = _result.is_ok();
         #[cfg(target_os = "android")]
         {

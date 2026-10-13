@@ -12,7 +12,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+use tiny_http::{Header, Method, Request, Response, Server};
 const PORT: u16 = 47831;
 fn default_port() -> u16 {
     PORT
@@ -33,6 +33,8 @@ struct Saved {
     devices: Vec<Device>,
 }
 struct Transfer {
+    request_id: String,
+    request_digest: String,
     from: String,
     to: String,
     manifest: Value,
@@ -53,6 +55,7 @@ struct Join {
     updated: Instant,
 }
 struct State {
+    epoch: String,
     saved: Saved,
     path: PathBuf,
     online: HashMap<String, Instant>,
@@ -61,6 +64,7 @@ struct State {
     transfers: HashMap<String, Transfer>,
     attempts: HashMap<String, (u32, Instant)>,
     requests: HashMap<String, usize>,
+    nonces: HashMap<(String, String), Instant>,
 }
 type Reply = Result<(u16, Vec<u8>, &'static str), (u16, String)>;
 fn fail(message: &str, status: u16) -> (u16, String) {
@@ -101,14 +105,7 @@ pub fn address() -> Result<String, String> {
         .into_iter()
         .filter_map(|a| match a.ip() {
             std::net::IpAddr::V4(ip)
-                if ip.is_private()
-                    && !a.name.starts_with("docker")
-                    && !a.name.starts_with("veth")
-                    && !a.name.starts_with("tun")
-                    && !a.name.starts_with("wg")
-                    && !a.name.starts_with("br-")
-                    && !a.name.starts_with("virbr")
-                    && !a.name.starts_with("vmnet") =>
+                if ip.is_private() && super::discovery::lan_interface(&a.name) =>
             {
                 Some((!a.name.starts_with('w'), ip))
             }
@@ -144,6 +141,8 @@ impl State {
     }
     fn prune(&mut self) {
         self.transfers.retain(|_, t| t.updated.elapsed() < TTL);
+        self.nonces
+            .retain(|_, at| at.elapsed() < Duration::from_secs(120));
         self.codes
             .retain(|_, (_, at)| at.elapsed() < Duration::from_secs(180));
         self.joins
@@ -168,6 +167,23 @@ impl State {
         } else {
             Value::Null
         };
+        if url == "/identity" && method == &Method::Post {
+            let nonce = v["nonce"]
+                .as_str()
+                .filter(|s| uuid::Uuid::parse_str(s).is_ok())
+                .ok_or(fail("Invalid identity challenge", 400))?;
+            let d = self
+                .saved
+                .devices
+                .iter()
+                .find(|d| Some(d.id.as_str()) == v["id"].as_str())
+                .ok_or(fail("Unknown device", 404))?;
+            let host = &self.saved.host;
+            let time = super::wire::now();
+            return reply(
+                json!({"hostId":host,"epoch":self.epoch,"time":time,"proof":super::wire::sign(&d.token,&super::wire::identity(host,&d.id,nonce,&self.epoch,time))}),
+            );
+        }
         if url == "/join" && method == &Method::Post {
             if self.joins.len() >= 20 || self.saved.devices.len() >= 100 {
                 return Err(fail("Device limit reached", 429));
@@ -208,7 +224,7 @@ impl State {
                 .filter(|j| Some(j.secret.as_str()) == v["secret"].as_str())
                 .ok_or(fail("Invitation expired or invalid", 404))?;
             return reply(
-                json!({"status":if j.device.is_some(){"approved"}else if j.rejected{"rejected"}else{"waiting"},"device":j.device.as_ref().map(|d|json!({"id":d.id,"token":d.token}))}),
+                json!({"status":if j.device.is_some(){"approved"}else if j.rejected{"rejected"}else{"waiting"},"device":j.device.as_ref().map(|d|json!({"id":d.id,"token":d.token,"hostId":self.saved.host}))}),
             );
         }
         let d = self
@@ -347,6 +363,24 @@ impl State {
                     if d.id != self.saved.host && to != self.saved.host {
                         return Err(fail("Pair directly with the receiving device", 400));
                     }
+                    let request_id = p["requestId"].as_str().unwrap_or("");
+                    if !request_id.is_empty() && uuid::Uuid::parse_str(request_id).is_err() {
+                        return Err(fail("Invalid offer request ID", 400));
+                    }
+                    let request_digest=super::wire::digest(&serde_json::to_vec(&json!({"to":to,"manifest":p["manifest"],"parts":p["parts"],"metadataOnly":p["metadataOnly"]})).unwrap());
+                    if !request_id.is_empty() {
+                        if let Some((id, t)) = self.transfers.iter().find(|(_, t)| {
+                            t.from == d.id && t.to == to && t.request_id == request_id
+                        }) {
+                            if t.request_digest != request_digest {
+                                return Err(fail(
+                                    "Request ID already used for another transfer",
+                                    409,
+                                ));
+                            }
+                            return reply(json!({"id":id}));
+                        }
+                    }
                     if !self
                         .online
                         .get(to)
@@ -385,6 +419,8 @@ impl State {
                     self.transfers.insert(
                         key.clone(),
                         Transfer {
+                            request_id: request_id.into(),
+                            request_digest,
                             from: d.id,
                             to: to.into(),
                             manifest: p["manifest"].clone(),
@@ -408,7 +444,7 @@ impl State {
             t.updated = Instant::now();
             match action {
                 "status" => reply(
-                    json!({"status":t.status,"offset":t.offset(),"size":t.manifest["size"],"audioRequired":t.audio,"parts":t.description(true)}),
+                    json!({"status":t.status,"offset":t.offset(),"size":t.manifest["size"],"audioRequired":t.audio,"parts":t.description(true),"peerOnline":self.online.get(if t.from==d.id{&t.to}else{&t.from}).is_some_and(|at|at.elapsed()<Duration::from_secs(15))}),
                 ),
                 "inspect" if t.to == d.id && t.status == "offered" => reply(
                     json!({"manifest":t.manifest,"from":t.from,"metadataOnlyCapable":true,"parts":t.description(false)}),
@@ -551,6 +587,7 @@ impl Transfer {
     fn description(&self, missing: bool) -> Value {
         let mut v = json!({"size":parts::SIZE,"window":parts::WINDOW,"hashes":self.hashes});
         if missing {
+            v.as_object_mut().unwrap().remove("hashes");
             v["missing"] = json!((0..self.hashes.len())
                 .filter(|i| !self.acked.contains(i))
                 .collect::<Vec<_>>());
@@ -573,26 +610,139 @@ impl Drop for RequestSlot<'_> {
         }
     }
 }
+#[derive(Clone)]
+struct SignedRequest {
+    host: String,
+    device: String,
+    token: String,
+    nonce: String,
+    digest: String,
+}
+fn header(req: &Request, name: &'static str) -> String {
+    req.headers()
+        .iter()
+        .find(|h| h.field.equiv(name))
+        .map(|h| h.value.to_string())
+        .unwrap_or_default()
+}
+fn respond(req: Request, status: u16, body: Vec<u8>, kind: &str, signed: Option<&SignedRequest>) {
+    let mut response = Response::from_data(body.clone())
+        .with_status_code(status)
+        .with_header(Header::from_bytes("Content-Type", kind).unwrap())
+        .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
+    if let Some(auth) = signed {
+        let proof = super::wire::sign(
+            &auth.token,
+            &super::wire::receipt(
+                &auth.host,
+                &auth.device,
+                &auth.nonce,
+                req.method().as_str(),
+                req.url(),
+                status,
+                &super::wire::digest(&body),
+            ),
+        );
+        response = response.with_header(Header::from_bytes("x-hearfolio-proof", proof).unwrap());
+    }
+    let _ = req.respond(response);
+}
+fn reject(req: Request, status: u16, message: &str, signed: Option<&SignedRequest>) {
+    respond(
+        req,
+        status,
+        serde_json::to_vec(&json!({"error":message})).unwrap(),
+        "application/json",
+        signed,
+    );
+}
 fn serve(mut req: Request, state: &Mutex<State>) {
     let peer = req.remote_addr().map(|a| a.ip());
     if !peer.is_some_and(|ip| matches!(ip,std::net::IpAddr::V4(ip) if private(ip))) {
-        let _ = req.respond(Response::empty(StatusCode(403)));
+        reject(req, 403, "Local network required", None);
         return;
     }
-    let bearer = req
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Authorization"))
-        .map(|h| h.value.as_str().strip_prefix("Bearer ").unwrap_or(""))
+    let mut bearer = header(&req, "Authorization")
+        .strip_prefix("Bearer ")
         .unwrap_or("")
-        .to_string();
+        .to_owned();
+    let device = header(&req, "x-hearfolio-device");
+    let nonce = header(&req, "x-hearfolio-nonce");
+    let sha = header(&req, "x-hearfolio-digest");
+    let proof = header(&req, "x-hearfolio-proof");
+    let mut signed = None;
+    if !device.is_empty() {
+        let mut s = state.lock().unwrap();
+        s.prune();
+        if let Some(d) = s.saved.devices.iter().find(|d| d.id == device) {
+            signed = Some(SignedRequest {
+                host: s.saved.host.clone(),
+                device: device.clone(),
+                token: d.token.clone(),
+                nonce: nonce.clone(),
+                digest: sha.clone(),
+            });
+        }
+        let valid = signed.as_ref().is_some_and(|a| {
+            nonce.split(':').count() == 3
+                && sha.len() == 64
+                && sha.bytes().all(|c| c.is_ascii_hexdigit())
+                && super::wire::verify(
+                    &a.token,
+                    &super::wire::request(
+                        &a.host,
+                        &device,
+                        &nonce,
+                        req.method().as_str(),
+                        req.url(),
+                        &sha,
+                    ),
+                    &proof,
+                )
+        });
+        if !valid {
+            drop(s);
+            reject(req, 401, "Invalid device authentication", signed.as_ref());
+            return;
+        }
+        let fields: Vec<_> = nonce.split(':').collect();
+        let time = fields.get(1).and_then(|v| v.parse::<u64>().ok());
+        let fresh = fields.first() == Some(&s.epoch.as_str())
+            && fields
+                .get(2)
+                .is_some_and(|v| uuid::Uuid::parse_str(v).is_ok())
+            && time.is_some_and(|stamp| {
+                stamp <= super::wire::now().saturating_add(30000)
+                    && super::wire::now().saturating_sub(stamp) <= 90000
+            });
+        if !fresh {
+            drop(s);
+            reject(req, 409, "Expired request session", signed.as_ref());
+            return;
+        }
+        if s.nonces.contains_key(&(device.clone(), nonce.clone())) {
+            drop(s);
+            reject(req, 409, "Repeated request nonce", signed.as_ref());
+            return;
+        }
+        if s.nonces.len() >= 16000 {
+            drop(s);
+            reject(req, 429, "Authentication window full", signed.as_ref());
+            return;
+        }
+        s.nonces.insert((device, nonce), Instant::now());
+        bearer = signed.as_ref().unwrap().token.clone();
+    }
     let key = {
         let mut s = state.lock().unwrap();
-        let public = matches!(req.url(), "/join" | "/join/status" | "/health");
+        let public = matches!(
+            req.url(),
+            "/join" | "/join/status" | "/health" | "/identity"
+        );
         let authenticated = s.saved.devices.iter().any(|d| d.token == bearer);
         if !public && !authenticated {
             drop(s);
-            let _ = req.respond(Response::empty(StatusCode(401)));
+            reject(req, 401, "Unauthorized", signed.as_ref());
             return;
         }
         let key = if authenticated {
@@ -603,21 +753,19 @@ fn serve(mut req: Request, state: &Mutex<State>) {
         let n = s.requests.entry(key.clone()).or_default();
         if *n >= if authenticated { 4 } else { 2 } {
             drop(s);
-            let _ = req.respond(Response::empty(StatusCode(429)));
+            reject(req, 429, "Device connection limit reached", signed.as_ref());
             return;
         }
         *n += 1;
         key
     };
     let _slot = RequestSlot { state, key };
-    let hash = req
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("x-part-sha256"))
-        .map(|h| h.value.to_string())
-        .unwrap_or_default();
+    let hash = header(&req, "x-part-sha256");
     let mut body = vec![];
-    let max = if matches!(req.url(), "/join" | "/join/status") {
+    let max = if matches!(
+        req.url(),
+        "/join" | "/join/status" | "/identity" | "/health"
+    ) {
         1024
     } else if req.method() == &Method::Put {
         parts::SIZE
@@ -632,6 +780,11 @@ fn serve(mut req: Request, state: &Mutex<State>) {
         || body.len() > max
     {
         Err(fail("Invalid request body", 413))
+    } else if signed
+        .as_ref()
+        .is_some_and(|a| super::wire::digest(&body) != a.digest)
+    {
+        Err(fail("Request checksum mismatch", 422))
     } else {
         state
             .lock()
@@ -646,11 +799,11 @@ fn serve(mut req: Request, state: &Mutex<State>) {
             "application/json",
         ),
     };
-    let response = Response::from_data(body)
-        .with_status_code(status)
-        .with_header(Header::from_bytes("Content-Type", kind).unwrap())
-        .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
-    let _ = req.respond(response);
+    respond(req, status, body, kind, signed.as_ref());
+}
+pub(super) fn session_epoch() -> String {
+    static EPOCH: OnceLock<String> = OnceLock::new();
+    EPOCH.get_or_init(id).clone()
 }
 pub fn start() -> Result<(String, String, u16), String> {
     static LOCAL: OnceLock<Result<(String, String, u16), String>> = OnceLock::new();
@@ -690,6 +843,7 @@ pub fn start() -> Result<(String, String, u16), String> {
             let credentials = (host.id.clone(), host.token.clone(), port);
             saved.port = port;
             let state = Arc::new(Mutex::new(State {
+                epoch: session_epoch(),
                 saved,
                 path,
                 online: HashMap::new(),
@@ -698,8 +852,10 @@ pub fn start() -> Result<(String, String, u16), String> {
                 transfers: HashMap::new(),
                 attempts: HashMap::new(),
                 requests: HashMap::new(),
+                nonces: HashMap::new(),
             }));
             state.lock().unwrap().persist().map_err(|(_, e)| e)?;
+            let _ = super::discovery::advertise(&credentials.0, port);
 
             for _ in 0..8 {
                 let server = server.clone();
@@ -744,6 +900,7 @@ mod tests {
         host.peers.insert(phone.id.clone());
         phone.peers.insert(host.id.clone());
         let state = State {
+            epoch: id(),
             saved: Saved {
                 port: PORT,
                 host: host.id.clone(),
@@ -759,6 +916,7 @@ mod tests {
             transfers: HashMap::new(),
             attempts: HashMap::new(),
             requests: HashMap::new(),
+            nonces: HashMap::new(),
         };
         (state, host, phone, dir)
     }
@@ -933,12 +1091,14 @@ mod tests {
             id: host.id,
             token: host.token,
             local_host: false,
+            host_id: String::new(),
         };
         let receiver = Connection {
             server: url,
             id: phone.id,
             token: phone.token,
             local_host: false,
+            host_id: String::new(),
         };
         let manifest = json!({"version":1,"sourceId":"original","name":"Long recording","extension":"wav","size":size,"sha256":sha,"transcript":"Updated transcript","createdAt":now()});
         let offered = rpc(
@@ -1029,6 +1189,210 @@ mod tests {
             w.join().unwrap();
         }
         cp.remove();
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn signed_transfer_survives_endpoint_change_without_pairing_again() {
+        let (state, host, phone, dir) = fixture();
+        let state = Arc::new(Mutex::new(state));
+        fn listener(
+            addr: &str,
+            state: Arc<Mutex<State>>,
+        ) -> (String, Arc<AtomicBool>, Vec<std::thread::JoinHandle<()>>) {
+            let server = Arc::new(Server::http(addr).unwrap());
+            let url = format!("http://{}", server.server_addr());
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut threads = vec![];
+            for _ in 0..8 {
+                let server = server.clone();
+                let state = state.clone();
+                let stop = stop.clone();
+                threads.push(std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Some(req) = server.recv_timeout(Duration::from_millis(100)).unwrap()
+                        {
+                            serve(req, &state);
+                        }
+                    }
+                }));
+            }
+            (url, stop, threads)
+        }
+        let (old_url, old_stop, old_threads) = listener("127.0.0.1:0", state.clone());
+        let sender = Connection {
+            server: old_url.clone(),
+            id: host.id.clone(),
+            token: host.token.clone(),
+            local_host: false,
+            host_id: host.id.clone(),
+        };
+        let receiver = Connection {
+            server: old_url.clone(),
+            id: phone.id.clone(),
+            token: phone.token.clone(),
+            local_host: false,
+            host_id: host.id.clone(),
+        };
+        assert_eq!(
+            rpc(&sender, "poll", json!({})).unwrap()["device"]["id"],
+            host.id
+        );
+        assert_eq!(
+            rpc(&receiver, "poll", json!({})).unwrap()["device"]["id"],
+            phone.id
+        );
+        let bytes = vec![41; parts::SIZE * 8 + 13];
+        let source = dir.join("source.wav");
+        fs::write(&source, &bytes).unwrap();
+        let (sha, size) = super::super::hash_file(&source).unwrap();
+        let description = parts::describe(&source, &sha, size).unwrap();
+        let manifest = json!({"version":1,"sourceId":"stable-recording","name":"Network change","extension":"wav","size":size,"sha256":sha,"transcript":"Text","createdAt":now()});
+        let offer =
+            json!({"requestId":id(),"to":receiver.id,"manifest":manifest,"parts":description});
+        let session = rpc(&sender, "offer", offer.clone()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(rpc(&sender, "offer", offer).unwrap()["id"], session);
+        assert_eq!(state.lock().unwrap().transfers.len(), 1);
+        let mut cp =
+            parts::Checkpoint::open(&dir, "lan/stable-recording", size, description.clone())
+                .unwrap();
+        rpc(
+            &receiver,
+            "accept",
+            json!({"id":session,"parts":{"verified":[]}}),
+        )
+        .unwrap();
+        let moved = Arc::new(AtomicBool::new(false));
+        // Different IP and port, same host/device keys and active transfer session.
+        let (new_url, new_stop, new_threads) = listener("127.0.0.2:0", state.clone());
+        std::thread::scope(|scope| {
+            let sending = scope
+                .spawn(|| parts::send(&sender, &session, &source, size, &description, |_| Ok(())));
+            parts::receive(&receiver, &session, &mut cp, |offset| {
+                if offset >= parts::SIZE as u64 * 4 && !moved.swap(true, Ordering::Relaxed) {
+                    old_stop.store(true, Ordering::Relaxed);
+                    // Deterministic stand-in for the already separately tested DNS-SD update.
+                    super::super::discovery::remember(&host.id, &new_url);
+                    super::super::discovery::invalidate(&sender);
+                    super::super::discovery::invalidate(&receiver);
+                }
+                Ok(())
+            })
+            .unwrap();
+            cp.finish(&sha).unwrap();
+            parts::control(&receiver, "finish", json!({"id":session})).unwrap();
+            sending.join().unwrap().unwrap();
+        });
+        assert!(moved.load(Ordering::Relaxed));
+        assert_eq!(
+            super::super::discovery::endpoint(&receiver).unwrap(),
+            new_url
+        );
+        assert_eq!(
+            rpc(&sender, "status", json!({"id":session})).unwrap()["status"],
+            "delivered"
+        );
+        assert_eq!(
+            state.lock().unwrap().saved.devices.len(),
+            2,
+            "A network change must not register a duplicate device"
+        );
+        assert_eq!(
+            state.lock().unwrap().transfers.len(),
+            1,
+            "A network change keeps the logical transfer session"
+        );
+        // An exact replay and a modified signed body are rejected, with verifiable responses.
+        let nonce = super::super::discovery::nonce(&receiver).unwrap();
+        let body = serde_json::to_vec(&json!({"action":"poll","payload":{}})).unwrap();
+        let sha = super::super::wire::digest(&body);
+        let proof = super::super::wire::sign(
+            &receiver.token,
+            &super::super::wire::request(&host.id, &receiver.id, &nonce, "POST", "/rpc", &sha),
+        );
+        let signed = |payload: Vec<u8>| {
+            client()
+                .unwrap()
+                .post(format!("{new_url}/rpc"))
+                .header("x-hearfolio-device", &receiver.id)
+                .header("x-hearfolio-nonce", &nonce)
+                .header("x-hearfolio-digest", &sha)
+                .header("x-hearfolio-proof", &proof)
+                .body(payload)
+                .send()
+                .unwrap()
+        };
+        assert!(signed(body.clone()).status().is_success());
+        assert_eq!(signed(body.clone()).status(), reqwest::StatusCode::CONFLICT);
+        // Old request sessions must remain invalid even after replay-cache pruning.
+        state.lock().unwrap().nonces.clear();
+        let old_epoch = state.lock().unwrap().epoch.clone();
+        state.lock().unwrap().epoch = id();
+        assert_eq!(signed(body).status(), reqwest::StatusCode::CONFLICT);
+        state.lock().unwrap().epoch = old_epoch;
+        old_stop.store(true, Ordering::Relaxed);
+        new_stop.store(true, Ordering::Relaxed);
+        for t in old_threads.into_iter().chain(new_threads) {
+            t.join().unwrap();
+        }
+        cp.remove();
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn spoofed_mdns_identity_never_receives_credentials() {
+        let (state, host, phone, dir) = fixture();
+        let state = Arc::new(Mutex::new(state));
+        let real = Arc::new(Server::http("127.0.0.1:0").unwrap());
+        let real_url = format!("http://{}", real.server_addr());
+        let fake = Arc::new(Server::http("127.0.0.1:0").unwrap());
+        let fake_url = format!("http://{}", fake.server_addr());
+        let stop = Arc::new(AtomicBool::new(false));
+        let leaked = Arc::new(AtomicBool::new(false));
+        let fake_stop = stop.clone();
+        let fake_leaked = leaked.clone();
+        let fake_host = host.id.clone();
+        let f = std::thread::spawn(move || {
+            while !fake_stop.load(Ordering::Relaxed) {
+                if let Some(req) = fake.recv_timeout(Duration::from_millis(100)).unwrap() {
+                    if !header(&req, "Authorization").is_empty()
+                        || !header(&req, "x-hearfolio-proof").is_empty()
+                    {
+                        fake_leaked.store(true, Ordering::Relaxed);
+                    }
+                    let body = json!({"hostId":fake_host,"epoch":id(),"time":now(),"proof":"00".repeat(32)});
+                    respond(
+                        req,
+                        200,
+                        serde_json::to_vec(&body).unwrap(),
+                        "application/json",
+                        None,
+                    );
+                }
+            }
+        });
+        let real_stop = stop.clone();
+        let r = std::thread::spawn(move || {
+            while !real_stop.load(Ordering::Relaxed) {
+                if let Some(req) = real.recv_timeout(Duration::from_millis(100)).unwrap() {
+                    serve(req, &state);
+                }
+            }
+        });
+        let c = Connection {
+            server: fake_url,
+            id: phone.id,
+            token: phone.token,
+            local_host: false,
+            host_id: host.id.clone(),
+        };
+        super::super::discovery::remember(&host.id, &real_url);
+        assert_eq!(rpc(&c, "poll", json!({})).unwrap()["device"]["id"], c.id);
+        assert!(!leaked.load(Ordering::Relaxed));
+        stop.store(true, Ordering::Relaxed);
+        f.join().unwrap();
+        r.join().unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 }
