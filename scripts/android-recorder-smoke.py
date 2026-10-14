@@ -206,6 +206,9 @@ class Smoke:
         self.click('#stop-recording')
         identifier = 'hearing-recording-' + pathlib.Path(source).stem.removeprefix('hearfolio-recording-')
         entry = self.wait(lambda: self.history_entry(identifier), 'durable archived recording', timeout=60)
+        # The archive write precedes the UI's import completion. Do not start
+        # another capture while that foreground operation is still settling.
+        self.wait(lambda: self.evaluate(f'!!document.querySelector("[data-rename=\\"{identifier}\\"]") && !!document.querySelector("#mobile-new:not(:disabled):not([hidden])")'), 'saved recording UI')
         audio = self.adb('exec-out', 'run-as', self.args.package, 'cat', entry['inputPath'], binary=True)
         with wave.open(io.BytesIO(audio)) as wav:
             assert wav.getnchannels() == 1 and wav.getsampwidth() == 2 and wav.getnframes() > 0, 'Invalid recorded PCM WAV'
