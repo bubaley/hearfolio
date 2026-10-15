@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.0 (2026-10-15)
+
+### Features
+
+- **transfer:** add resumable LAN transfers and automatic peer discovery (#2) ([56a6164](https://github.com/bubaley/hearfolio/commit/56a616420614bfd44e21101e4886a7e3d464013c))
+
 ## 0.6.3 (2026-10-12)
 
 ### Fixes and performance
