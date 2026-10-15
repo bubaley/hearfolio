@@ -608,6 +608,9 @@ async function importSelection(selected:AudioSelection):Promise<boolean>{
   let imported=false;
   try{
     const entry=await call<Entry>('import_audio',{path:selected.path,...(selected.name?{name:selected.name}:{}),configuration:{...(configuration.model.trim()?configuration:settings.lastConfiguration)}});
+    // Native recovery can report this same archived recording after the user
+    // has opened a new capture. Share its receipt with the recovery handler.
+    if(platform.os==='android')markOperationHandled(`recording:${entry.id}`);
     imported=true;pendingRecording=null;resetPlayback();active=entry;restoreConfiguration(entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;
     const refreshed=await Promise.allSettled([call<Settings>('get_settings'),call<Entry[]>('list_history')]);
     if(refreshed[0].status==='fulfilled')settings=refreshed[0].value;

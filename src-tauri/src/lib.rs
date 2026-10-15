@@ -1209,6 +1209,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            transfer::transfer_discovery,
             transfer::transfer_api,
             transfer::transfer_send,
             transfer::transfer_receive,

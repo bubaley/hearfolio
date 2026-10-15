@@ -70,6 +70,11 @@ class TransferArgs {
 
 @TauriPlugin(permissions = [Permission(strings = [Manifest.permission.RECORD_AUDIO], alias = "microphone"), Permission(strings = [Manifest.permission.POST_NOTIFICATIONS], alias = "notifications")])
 class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
+    private var discoveryRequested = false
+    private val discoveryOwner = "activity:${System.identityHashCode(this)}"
+    @Command fun startLanDiscovery(invoke: Invoke) {discoveryRequested=true;LanDiscovery.acquire(activity,discoveryOwner);invoke.resolve()}
+    override fun onResume(activity: AppCompatActivity) {if(discoveryRequested) LanDiscovery.acquire(activity,discoveryOwner)}
+    override fun onStop(activity: AppCompatActivity) {LanDiscovery.release(discoveryOwner)}
     private var player: MediaPlayer? = null
     private var playbackGeneration = 0
     private var preparingPlayback: Invoke? = null
@@ -318,6 +323,7 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     override fun onDestroy(activity: AppCompatActivity) {
+        LanDiscovery.release(discoveryOwner);
         // Permission callbacks from this destroyed Activity must never start a
         // second capture after the replacement WebView has resumed.
         val claimed=startTicket?.claimed==true

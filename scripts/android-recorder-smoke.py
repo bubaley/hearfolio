@@ -42,9 +42,9 @@ class Smoke:
         self.pcm_readiness = []
         self.events = []
 
-    def adb(self, *command, binary=False, check=True):
+    def adb(self, *command, binary=False, check=True, timeout=30):
         serial = ['-s', self.args.serial] if self.args.serial else []
-        result = subprocess.run(['adb', *serial, *command], capture_output=True, timeout=30)
+        result = subprocess.run(['adb', *serial, *command], capture_output=True, timeout=timeout)
         if check and result.returncode:
             raise RuntimeError(f'adb {command}: {result.stderr.decode(errors="replace")}')
         return result.stdout if binary else result.stdout.decode(errors='replace').strip()
@@ -206,6 +206,9 @@ class Smoke:
         self.click('#stop-recording')
         identifier = 'hearing-recording-' + pathlib.Path(source).stem.removeprefix('hearfolio-recording-')
         entry = self.wait(lambda: self.history_entry(identifier), 'durable archived recording', timeout=60)
+        # The archive write precedes the UI's import completion. Do not start
+        # another capture while that foreground operation is still settling.
+        self.wait(lambda: self.evaluate(f'!!document.querySelector("[data-rename=\\"{identifier}\\"]") && !!document.querySelector("#mobile-new:not(:disabled):not([hidden])")'), 'saved recording UI')
         audio = self.adb('exec-out', 'run-as', self.args.package, 'cat', entry['inputPath'], binary=True)
         with wave.open(io.BytesIO(audio)) as wav:
             assert wav.getnchannels() == 1 and wav.getsampwidth() == 2 and wav.getnframes() > 0, 'Invalid recorded PCM WAV'
@@ -214,7 +217,9 @@ class Smoke:
         return identifier
 
     def run(self):
-        self.adb('install', '-r', self.args.apk)
+        # A newly booted hosted emulator can spend longer optimizing the APK.
+        # Keep the UI/capture deadlines unchanged; allow extra install time only.
+        self.adb('install', '-r', self.args.apk, timeout=120)
         self.adb('shell', 'pm', 'clear', self.args.package)
         for permission in ['android.permission.RECORD_AUDIO', 'android.permission.POST_NOTIFICATIONS']:
             self.adb('shell', 'pm', 'grant', self.args.package, permission)

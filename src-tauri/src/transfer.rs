@@ -1,4 +1,12 @@
-//! LAN relay protocol. Audio crosses HTTP as binary, with one acknowledged block in flight.
+//! LAN transfers with receiver-owned, verified multipart checkpoints.
+#[path = "transfer_discovery.rs"]
+mod discovery;
+#[path = "transfer_local.rs"]
+mod local;
+#[path = "transfer_parts.rs"]
+mod parts;
+#[path = "transfer_wire.rs"]
+mod wire;
 use crate::{records::HistoryEntry, storage};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -12,6 +20,10 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{Emitter, Manager};
+pub(crate) fn network_restored() {
+    discovery::waiting(false);
+    crate::background::network_waiting(false);
+}
 static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 const BLOCK: usize = 65536;
 const MAX_SIZE: u64 = 1024 * 1024 * 1024;
@@ -20,6 +32,10 @@ struct Connection {
     server: String,
     id: String,
     token: String,
+    #[serde(default)]
+    local_host: bool,
+    #[serde(default)]
+    host_id: String,
 }
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +57,7 @@ fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 pub fn cleanup_partial_files(dir: &Path) {
+    parts::cleanup(dir);
     if let Ok(files) = fs::read_dir(dir.join("temp")) {
         for entry in files.flatten() {
             let name = entry.file_name();
@@ -61,8 +78,45 @@ pub fn cleanup_partial_files(dir: &Path) {
 fn connection_path() -> Result<PathBuf, String> {
     Ok(storage::config_dir()?.join("transfer.json"))
 }
+fn save_connection(c: &Connection) -> Result<(), String> {
+    let path = connection_path()?;
+    let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut f = options.open(&temp).map_err(error)?;
+        f.write_all(&serde_json::to_vec(c).map_err(error)?)
+            .map_err(error)?;
+        f.sync_all().map_err(error)?;
+        drop(f);
+        fs::rename(&temp, &path).map_err(error)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp);
+    }
+    result
+}
 fn load() -> Result<Connection, String> {
-    serde_json::from_slice(&fs::read(connection_path()?).map_err(error)?).map_err(error)
+    let mut c: Connection =
+        serde_json::from_slice(&fs::read(connection_path()?).map_err(error)?).map_err(error)?;
+    if c.local_host {
+        let (_, _, port) = local::start()?;
+        c.server = format!("http://127.0.0.1:{port}");
+        c.host_id = c.id.clone();
+    } else {
+        server_url(&c.server)?;
+        if c.host_id.is_empty() {
+            let (host, url) = discovery::recover(&c)?;
+            c.host_id = host;
+            c.server = url;
+        }
+    }
+    Ok(c)
 }
 fn client() -> Result<Client, String> {
     // Clones share the connection pool, including across polling and transfer jobs.
@@ -70,6 +124,7 @@ fn client() -> Result<Client, String> {
     CLIENT
         .get_or_init(|| {
             Client::builder()
+                .no_proxy()
                 .timeout(Duration::from_secs(35))
                 .connect_timeout(Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::none())
@@ -144,14 +199,14 @@ fn server_url(server: &str) -> Result<String, String> {
         Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback(),
         Err(_) => url.host_str() == Some("localhost"),
     };
-    if !(url.scheme() == "https" || (url.scheme() == "http" && local))
+    if !(url.scheme() == "http" && local)
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
         || url.path() != "/"
     {
-        return Err("Use an HTTPS server or a local LAN HTTP address, without a path".into());
+        return Err("Use a local LAN HTTP address, without a path".into());
     }
     Ok(server.trim().trim_end_matches('/').into())
 }
@@ -172,14 +227,18 @@ fn response(mut res: reqwest::blocking::Response) -> Result<Value, String> {
     Ok(value)
 }
 fn rpc(c: &Connection, action: &str, payload: Value) -> Result<Value, String> {
-    response(
-        client()?
-            .post(format!("{}/rpc", c.server))
-            .bearer_auth(&c.token)
-            .json(&json!({"action":action,"payload":payload}))
-            .send()
-            .map_err(network_error)?,
-    )
+    let mut result = wire::send(
+        c,
+        reqwest::Method::POST,
+        "/rpc",
+        serde_json::to_vec(&json!({"action":action,"payload":payload})).map_err(error)?,
+        None,
+    )?
+    .json()?;
+    if action == "poll" {
+        result["connection"] = json!({"server":if c.local_host{local::address().unwrap_or_default()}else{discovery::endpoint(c)?}});
+    }
+    Ok(result)
 }
 fn join_relay(server: &str, name: &Value, code: &str) -> Result<Value, String> {
     let ticket = response(
@@ -222,6 +281,18 @@ fn join_relay(server: &str, name: &Value, code: &str) -> Result<Value, String> {
     Err("Invitation confirmation timed out".into())
 }
 #[tauri::command]
+pub async fn transfer_discovery(app: tauri::AppHandle) -> Result<Value, String> {
+    discovery::attach(app.clone());
+    #[cfg(target_os = "android")]
+    {
+        app.state::<tauri_plugin_recording::Recording<tauri::Wry>>()
+            .transfer::<()>("startLanDiscovery", json!({}))
+            .map_err(error)?;
+    }
+    discovery::start()?;
+    Ok(json!({"waiting":discovery::is_waiting()}))
+}
+#[tauri::command]
 pub async fn transfer_api(action: String, payload: Value) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         if action == "validateServer" {
@@ -230,8 +301,11 @@ pub async fn transfer_api(action: String, payload: Value) -> Result<Value, Strin
             );
         }
         if action == "connect" {
+            if payload["updateOnly"] == true {let c=load()?;rpc(&c,"rename",json!({"name":payload["name"]}))?;return rpc(&c,"poll",json!({}));}
             let _lock = CONFIG_LOCK.lock().map_err(error)?;
-            let server = server_url(payload["server"].as_str().ok_or("Server required")?)?;
+            let invite = payload["invitationCode"].as_str().unwrap_or("");
+            let hosting = invite.is_empty();
+            let server = if hosting { local::address()?; let (_,_,port)=local::start()?; format!("http://127.0.0.1:{port}") } else { server_url(payload["server"].as_str().ok_or("Local device address required")?)? };
             let existing = load().ok().filter(|c| c.server == server);
             let c = if let Some(c) = existing {
                 rpc(&c, "rename", json!({"name":payload["name"]}))?;
@@ -244,25 +318,24 @@ pub async fn transfer_api(action: String, payload: Value) -> Result<Value, Strin
                 let registered = if !invite.is_empty() {
                     join_relay(&server, &payload["name"], invite)?
                 } else {
-                    response(
-                        client()?
-                            .post(format!("{server}/register"))
-                            .header(
-                                "x-hearfolio-access-key",
-                                payload["accessKey"].as_str().unwrap_or(""),
-                            )
-                            .json(&json!({"name":payload["name"]}))
-                            .send()
-                            .map_err(network_error)?,
-                    )?
+                    let (id, token, _) = local::start()?;
+                    json!({"id":id,"token":token})
                 };
                 Connection {
                     server,
                     id: registered["id"].as_str().ok_or("Invalid device ID")?.into(),
                     token: registered["token"].as_str().ok_or("Invalid token")?.into(),
+                    local_host: hosting,
+                    host_id: if hosting {registered["id"].as_str().unwrap_or("")}else{registered["hostId"].as_str().unwrap_or("")}.into(),
                 }
             };
+            let mut c=c;
+            if !c.local_host&&c.host_id.is_empty(){let (host,url)=discovery::recover(&c)?;c.host_id=host;c.server=url;}
+            rpc(&c, "rename", json!({"name":payload["name"]}))?;
             let path = connection_path()?;
+            if path.exists() && !path.with_extension("relay-backup.json").exists() {
+                if let Ok(old)=serde_json::from_slice::<Connection>(&fs::read(&path).map_err(error)?) {if old.server.starts_with("https://"){fs::copy(&path,path.with_extension("relay-backup.json")).map_err(error)?;}}
+            }
             let mut opts = fs::OpenOptions::new();
             opts.write(true).create(true).truncate(true);
             #[cfg(unix)]
@@ -279,9 +352,14 @@ pub async fn transfer_api(action: String, payload: Value) -> Result<Value, Strin
             return rpc(&c, "poll", json!({}));
         }
         if action == "saved" {
+            let _lock=CONFIG_LOCK.lock().map_err(error)?;
             return Ok(load()
-                .map(|c| json!({"server":c.server}))
-                .unwrap_or(json!({})));
+                .map(|mut c| {
+                    if !c.local_host{if let Ok(url)=discovery::endpoint(&c){c.server=url;}}
+                    if !c.host_id.is_empty(){let _=save_connection(&c);}
+                    json!({"server":if c.local_host {local::address().unwrap_or_default()} else {discovery::endpoint(&c).unwrap_or(c.server)},"local":true,"configured":true})
+                })
+                .unwrap_or_else(|_|fs::read(connection_path().unwrap_or_default()).ok().and_then(|bytes|serde_json::from_slice::<Connection>(&bytes).ok()).filter(|c|server_url(&c.server).is_ok()).map(|c|json!({"server":c.server,"local":true,"configured":true})).unwrap_or(json!({}))));
         }
         if !["poll", "code", "pair", "confirmPair", "cancel", "unpair"].contains(&action.as_str()) {
             return Err("Unsupported relay action".into());
@@ -358,10 +436,11 @@ pub async fn transfer_send(app: tauri::AppHandle, id: String, to: String) -> Res
                 model: entry.model,
                 configuration: entry.configuration,
             };
-            let offered = rpc(
+            let part_description = parts::describe(path, &manifest.sha256, size)?;
+            let offered = parts::control(
                 &c,
                 "offer",
-                json!({"to":to,"manifest":manifest,"metadataOnly":true}),
+                json!({"requestId":uuid::Uuid::new_v4().to_string(),"to":to,"manifest":manifest,"metadataOnly":true,"parts":part_description}),
             )?;
             let session = offered["id"]
                 .as_str()
@@ -374,7 +453,7 @@ pub async fn transfer_send(app: tauri::AppHandle, id: String, to: String) -> Res
                 let audio_required = loop {
                     background.check()?;
                     background.progress("waiting", 0, 0);
-                    let status = rpc(&c, "status", json!({"id":session}))?;
+                    let status = parts::control(&c, "status", json!({"id":session}))?;
                     match status["status"].as_str() {
                         Some("streaming") => {
                             break status["audioRequired"].as_bool().unwrap_or(true)
@@ -388,7 +467,16 @@ pub async fn transfer_send(app: tauri::AppHandle, id: String, to: String) -> Res
                     }
                     std::thread::sleep(Duration::from_millis(500));
                 };
-                if audio_required {
+                let multipart = audio_required
+                    && parts::control(&c, "status", json!({"id":session}))?["parts"].is_object();
+                if multipart {
+                    parts::send(&c, &session, path, size, &part_description, |offset| {
+                        background.check()?;
+                        emit(&app, &session, "sending", offset, size);
+                        background.progress("sending", offset, size);
+                        Ok(())
+                    })?;
+                } else if audio_required {
                     let mut file = fs::File::open(path).map_err(error)?;
                     let mut offset = 0;
                     let mut buf = [0; BLOCK];
@@ -415,7 +503,7 @@ pub async fn transfer_send(app: tauri::AppHandle, id: String, to: String) -> Res
                 let finish = Instant::now();
                 loop {
                     background.check()?;
-                    let s = rpc(&c, "status", json!({"id":session}))?;
+                    let s = parts::control(&c, "status", json!({"id":session}))?;
                     if s["status"] == "delivered" {
                         break;
                     }
@@ -676,18 +764,26 @@ pub async fn transfer_receive(app: tauri::AppHandle, id: String) -> Result<Histo
         let dir = crate::base()?;
         // Older relays/senders default to a full transfer.
         let mut accept_payload=json!({"id":id});
-        if let Ok(inspected)=rpc(&c,"inspect",json!({"id":id})) {
+        let mut checkpoint=None;
+        let mut resume_identity=None;
+        { let inspected=parts::control(&c,"inspect",json!({"id":id}))?;
             let manifest:Manifest=serde_json::from_value(inspected["manifest"].clone()).map_err(error)?;
             validate_manifest(&manifest)?;
+            if inspected["parts"].is_object() {
+                let _from=inspected["from"].as_str().ok_or("Sender identity missing")?;
+                resume_identity=Some(serde_json::to_string(&json!(["lan",manifest.source_id,manifest.sha256,manifest.size])).map_err(error)?);
+            }
             let _lock=crate::history_lock()?;
             if inspected["metadataOnlyCapable"]==true && has_verified_audio(&dir,&manifest)? {
                 accept_payload=json!({"id":id,"audioRequired":false,"sha256":manifest.sha256,"size":manifest.size});
+            } else if inspected["parts"].is_object() {
+                let description:parts::Description=serde_json::from_value(inspected["parts"].clone()).map_err(error)?;
+                let cp=parts::Checkpoint::open(&dir,resume_identity.as_deref().ok_or("Sender identity missing")?,manifest.size,description)?;
+                accept_payload=json!({"id":id,"parts":{"verified":cp.verified()}});checkpoint=Some(cp);
             }
         }
-        let accepted=rpc(&c,"accept",accept_payload)?;
-        let staging = dir
-            .join("temp")
-            .join(format!("transfer-{}.part", uuid::Uuid::new_v4()));
+        let accepted=parts::control(&c,"accept",accept_payload)?;
+        let staging = checkpoint.as_ref().map(|cp|cp.path.clone()).unwrap_or_else(||dir.join("temp").join(format!("transfer-{}.part", uuid::Uuid::new_v4())));
         let result = (|| {
             let m: Manifest =
                 serde_json::from_value(accepted["manifest"].clone()).map_err(error)?;
@@ -705,6 +801,13 @@ pub async fn transfer_receive(app: tauri::AppHandle, id: String) -> Result<Histo
                 emit(&app,&id,"delivered",m.size,m.size);
                 return Ok(entry);
             }
+            if let Some(cp)=checkpoint.as_mut() {
+                if !accepted["parts"].is_object(){return Err("Relay did not accept multipart resume".into())}
+                parts::receive(&c,&id,cp,|offset|{
+                    background.check()?;emit(&app,&id,"receiving",offset,m.size);background.progress("receiving",offset,m.size);Ok(())
+                })?;
+                cp.finish(&m.sha256)?;
+            } else {
             let mut output = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -741,16 +844,18 @@ pub async fn transfer_receive(app: tauri::AppHandle, id: String) -> Result<Histo
             if format!("{:x}", hash.finalize()) != m.sha256 {
                 return Err("Audio checksum mismatch".into());
             }
+            }
             let _lock = crate::history_lock()?;
             let entry = commit_received(&dir, &staging, local_id, m.clone())?;
             app.asset_protocol_scope()
                 .allow_file(&entry.input_path)
                 .map_err(error)?;
-            rpc(&c, "finish", json!({"id":id}))?;
+            parts::control(&c, "finish", json!({"id":id}))?;
             emit(&app, &id, "delivered", m.size, m.size);
             Ok(entry)
         })();
-        let _ = fs::remove_file(staging);
+        if result.is_ok(){if let Some(cp)=checkpoint.take(){cp.remove();} if let Some(identity)=resume_identity.as_deref(){parts::discard(&dir,identity);}}
+        if checkpoint.is_none(){let _=fs::remove_file(staging);}
         if result.is_err() {
             let _ = rpc(&c, "cancel", json!({"id":id}));
         }
@@ -1029,6 +1134,8 @@ mod tests {
             server: format!("http://{}", listener.local_addr().unwrap()),
             id: "fixture".into(),
             token: "fixture".into(),
+            local_host: false,
+            host_id: String::new(),
         };
         let serving = std::thread::spawn(move || {
             for attempt in 0..2 {
@@ -1108,6 +1215,8 @@ mod tests {
                 server: url.clone(),
                 id: data["id"].as_str().unwrap().into(),
                 token: data["token"].as_str().unwrap().into(),
+                local_host: false,
+                host_id: String::new(),
             }
         };
         let sender = register("Rust Linux");
@@ -1132,6 +1241,8 @@ mod tests {
             server: url.clone(),
             id: credentials["id"].as_str().unwrap().into(),
             token: credentials["token"].as_str().unwrap().into(),
+            local_host: false,
+            host_id: String::new(),
         };
         let offered = rpc(&sender, "offer", json!({"to":receiver.id,"manifest":m})).unwrap();
         let id = offered["id"].as_str().unwrap().to_owned();
@@ -1221,6 +1332,7 @@ mod tests {
         );
         assert!(server_url("http://192.168.1.2:8787").is_ok());
         assert!(server_url("http://example.com").is_err());
+        assert!(server_url("https://hearfolio.corextech.ru").is_err());
         assert!(server_url("https://example.com/path").is_err());
     }
     #[test]

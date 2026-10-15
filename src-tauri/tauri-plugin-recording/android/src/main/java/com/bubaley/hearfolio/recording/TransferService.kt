@@ -66,6 +66,7 @@ class TransferService : Service() {
 
     override fun onCreate() {
         super.onCreate(); instance = this
+        LanDiscovery.acquire(this,"transfer")
         if (Build.VERSION.SDK_INT >= 26) {
             val channel = NotificationChannel(CHANNEL, tr("Передача записей", "Recording transfers"), NotificationManager.IMPORTANCE_LOW)
             channel.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
@@ -119,7 +120,8 @@ class TransferService : Service() {
     }
 
     fun update(stage: String, current: Long, total: Long) {
-        val text = when (if(cancelled) "cancelled" else stage) {
+        val text = when (if(LanDiscovery.waiting(stateFile) && !cancelled) "reconnecting" else if(cancelled) "cancelled" else stage) {
+            "reconnecting" -> tr("Ищем устройство в локальной сети…", "Finding your device on the local network…")
             "waiting" -> tr("Ожидание получателя…", "Waiting for recipient…")
             "cancelled" -> tr("Отменяем передачу…", "Cancelling transfer…")
             "metadata" -> tr("Обновление расшифровки…", "Updating transcription…")
@@ -136,6 +138,7 @@ class TransferService : Service() {
         wake=null;wifi=null
     }
     override fun onDestroy() {
+        LanDiscovery.release("transfer")
         releaseLocks()
         cancelled = true;control(); instance = null
         super.onDestroy()

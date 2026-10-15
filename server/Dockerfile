@@ -1,7 +1,7 @@
 FROM node:22-alpine
 RUN mkdir -p /app /var/lib/hearfolio && chown -R node:node /app /var/lib/hearfolio
 WORKDIR /app
-COPY --chown=node:node server/relay.mjs ./relay.mjs
+COPY --chown=node:node server/relay.mjs server/multipart.mjs ./
 USER node
 ENV HOST=0.0.0.0 PORT=8787 RELAY_STATE=/var/lib/hearfolio/devices.json
 EXPOSE 8787
