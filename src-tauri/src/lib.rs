@@ -1,11 +1,13 @@
 mod audio;
 mod background;
 mod cloud;
+mod compact;
 mod platform;
 mod postprocess;
 mod recording;
 mod records;
 mod restart;
+mod resume;
 mod storage;
 mod transfer;
 use cloud::RecognitionConfig;
@@ -284,7 +286,7 @@ fn monitored(
                             None
                         }
                     })
-                    .last()
+                    .next_back()
                     .unwrap_or(0)
             } else {
                 s.split("progress = ")
@@ -494,56 +496,80 @@ fn import_audio_with_id(
                 .find(|entry| entry.id == id)
         };
         if let Some(entry) = existing {
-            if transfer::hash_file(source)? != transfer::hash_file(Path::new(&entry.input_path))? {
+            if !compact::archived_matches(source, Path::new(&entry.input_path))? {
                 return Err("errors.audioRead".into());
             }
             recording::imported(source);
             return Ok(entry);
         }
     }
-    let staging = base()?.join("temp").join(format!("{id}-import.audio"));
-    let mut input = platform::open_audio(&app, &path)?;
-    let total = input.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-    let mut output =
-        fs::File::create(&staging).map_err(|e| format!("errors.operationFailed|{e}"))?;
-    let start = Instant::now();
-    let mut copied = 0u64;
-    let mut buffer = [0u8; 1024 * 1024];
-    let copy_result = (|| -> Result<(), String> {
-        loop {
-            background::check_current()?;
-            let n = input
-                .read(&mut buffer)
-                .map_err(|e| format!("errors.operationFailed|{e}"))?;
-            if n == 0 {
-                break;
+    // A finished recording is compacted once (AAC, or lossless FLAC) before it
+    // is archived. Any failure keeps the original PCM; user imports keep bytes.
+    let compacted = if !is_uri && recording::is_recording_source(source) {
+        background::check_current()?;
+        emit(app, "import", "progress.copyAudio", 0, 1, 0);
+        let stem = base()?.join("temp").join(format!(
+            "{id}-compact-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        compact::compact_recording(app, source, &stem)
+    } else {
+        None
+    };
+    let compacted_extension = compacted.as_ref().map(|(_, extension)| *extension);
+    let (staging, copied, extension) = if let Some((staging, compact_extension)) = compacted {
+        let size = fs::metadata(&staging).map(|m| m.len()).unwrap_or(0);
+        emit(app, "import", "progress.copyAudio", 1, 1, 0);
+        (staging, size, Some(compact_extension.to_owned()))
+    } else {
+        let staging = base()?.join("temp").join(format!("{id}-import.audio"));
+        let mut input = platform::open_audio(app, &path)?;
+        let total = input.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        let mut output =
+            fs::File::create(&staging).map_err(|e| format!("errors.operationFailed|{e}"))?;
+        let start = Instant::now();
+        let mut copied = 0u64;
+        let mut buffer = [0u8; 1024 * 1024];
+        let copy_result = (|| -> Result<(), String> {
+            loop {
+                background::check_current()?;
+                let n = input
+                    .read(&mut buffer)
+                    .map_err(|e| format!("errors.operationFailed|{e}"))?;
+                if n == 0 {
+                    break;
+                }
+                output
+                    .write_all(&buffer[..n])
+                    .map_err(|e| format!("errors.operationFailed|{e}"))?;
+                copied += n as u64;
+                emit(
+                    app,
+                    "import",
+                    "progress.copyAudio",
+                    copied,
+                    total,
+                    start.elapsed().as_secs(),
+                );
             }
-            output
-                .write_all(&buffer[..n])
-                .map_err(|e| format!("errors.operationFailed|{e}"))?;
-            copied += n as u64;
-            emit(
-                &app,
-                "import",
-                "progress.copyAudio",
-                copied,
-                total,
-                start.elapsed().as_secs(),
-            );
+            Ok(())
+        })();
+        if let Err(e) = copy_result {
+            drop(output);
+            let _ = fs::remove_file(&staging);
+            return Err(e);
         }
-        Ok(())
-    })();
-    if let Err(e) = copy_result {
+        if let Err(e) = output.sync_all() {
+            drop(output);
+            let _ = fs::remove_file(&staging);
+            return Err(format!("errors.audioRead|{e}"));
+        }
         drop(output);
-        let _ = fs::remove_file(&staging);
-        return Err(e);
-    }
-    if let Err(e) = output.sync_all() {
-        drop(output);
-        let _ = fs::remove_file(&staging);
-        return Err(format!("errors.audioRead|{e}"));
-    }
-    drop(output);
+        (staging, copied, extension)
+    };
     let extension = match extension {
         Some(extension)
             if ["m4a", "mp3", "wav", "mp4", "aac", "flac", "ogg"].contains(&extension.as_str()) =>
@@ -559,7 +585,14 @@ fn import_audio_with_id(
         },
     };
     let name = original_name
-        .map(str::to_owned)
+        .map(|name| match compacted_extension {
+            // The archive name's extension always matches the stored format.
+            Some(compact_extension) => Path::new(name)
+                .with_extension(compact_extension)
+                .to_string_lossy()
+                .into_owned(),
+            None => name.to_owned(),
+        })
         .unwrap_or_else(|| format!("Recording-{}.{extension}", clock()));
     let target = base()?.join("input").join(format!("{id}.{extension}"));
     if let Err(error) = fs::rename(&staging, &target) {
@@ -681,13 +714,25 @@ fn rename_history(id: String, name: String) -> Result<HistoryEntry, String> {
 fn delete_history(id: String) -> Result<(), String> {
     let _job = JobGuard::acquire()?;
     let _lock = history_lock()?;
-    delete_entries_at(&base()?, Some(&id))
+    let root = base()?;
+    delete_entries_at(&root, Some(&id))?;
+    resume::remove(&root, &id);
+    Ok(())
 }
 #[tauri::command]
 fn clear_history() -> Result<(), String> {
     let _job = JobGuard::acquire()?;
     let _lock = history_lock()?;
-    delete_entries_at(&base()?, None)
+    let root = base()?;
+    delete_entries_at(&root, None)?;
+    resume::remove_all(&root);
+    Ok(())
+}
+/// Committed cloud chunks of an unfinished attempt: `{done,total,configuration}`
+/// or null. Starting `transcribe` with that configuration skips them.
+#[tauri::command]
+fn cloud_resume_state(id: String) -> Result<Option<serde_json::Value>, String> {
+    Ok(resume::resumable(&base()?, &id))
 }
 #[tauri::command]
 async fn download_model(app: tauri::AppHandle, id: String) -> Result<(), String> {
@@ -757,14 +802,23 @@ async fn download_model(app: tauri::AppHandle, id: String) -> Result<(), String>
 }
 
 #[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct PartialText {
     text: String,
+    record_id: Option<String>,
+    operation_id: Option<String>,
 }
 fn partial(app: &tauri::AppHandle, text: &str) {
+    let (operation_id, record_id) = background::operation_partial("transcribe", text)
+        .map_or((None, None), |(operation, record)| {
+            (Some(operation), record)
+        });
     let _ = app.emit(
         "partial-text",
         PartialText {
             text: text.to_owned(),
+            record_id,
+            operation_id,
         },
     );
 }
@@ -1027,9 +1081,28 @@ async fn transcribe(
                     if chunks.is_empty() {
                         return Err("errors.audioEmpty".into());
                     }
-                    let mut parts = Vec::new();
+                    let root = base()?;
+                    let mut progress = resume::CloudProgress::begin(
+                        &root,
+                        &id,
+                        &configuration,
+                        &input,
+                        chunks.len() as u64,
+                    )?;
+                    let mut parts = progress.parts().to_vec();
+                    if !parts.is_empty() {
+                        partial(&app, &parts.join("\n"));
+                        emit(
+                            &app,
+                            "transcribe",
+                            "progress.recognizedChunks",
+                            parts.len() as u64,
+                            chunks.len() as u64,
+                            start.elapsed().as_secs(),
+                        );
+                    }
                     let mut promoted = false;
-                    for (index, chunk) in chunks.iter().enumerate() {
+                    for (index, chunk) in chunks.iter().enumerate().skip(parts.len()) {
                         background::check_current()?;
                         emit(
                             &app,
@@ -1062,6 +1135,8 @@ async fn transcribe(
                                 start.elapsed().as_secs(),
                             );
                         })?;
+                        // Paid work is durable before the next request starts.
+                        progress.commit(&root, text.clone())?;
                         parts.push(text);
                         emit(
                             &app,
@@ -1079,6 +1154,7 @@ async fn transcribe(
                 cloud::mark_working(&configuration)?;
                 background::check_current()?;
                 save_transcript(&id, format!("openrouter/{}", configuration.model), &text)?;
+                resume::remove(&base()?, &id);
                 emit(
                     &app,
                     "transcribe",
@@ -1217,6 +1293,7 @@ pub fn run() {
             recording::start_audio_recording,
             recording::append_audio_recording,
             recording::stop_audio_recording,
+            recording::recover_audio_recordings,
             recording::cancel_audio_recording,
             recording::discard_audio_recording,
             recording::audio_recording_level,
@@ -1256,6 +1333,8 @@ pub fn run() {
             recording::open_android_battery_settings,
             background::operation_activity_snapshot,
             background::cancel_background_operation,
+            background::acknowledge_operation,
+            cloud_resume_state,
             recording::import_quick_recordings,
             recording::recording_quick_control,
             update_record_configuration,

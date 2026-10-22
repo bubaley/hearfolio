@@ -75,6 +75,36 @@ fn duration_from_packets(
         .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
 }
 
+/// Decodes up to `packet_limit` packets of the default track and returns the
+/// decoded frame count. Any decode error fails verification.
+pub fn decoded_frames(path: &Path, packet_limit: Option<usize>) -> Result<u64, String> {
+    let mut probed = probe(path)?;
+    let track = probed.format.default_track().ok_or("errors.audioEmpty")?;
+    let track_id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|error| format!("errors.audioDecodeUnsupported|{error}"))?;
+    let (mut frames, mut packets) = (0u64, 0usize);
+    while packet_limit.is_none_or(|limit| packets < limit) {
+        let packet = match probed.format.next_packet() {
+            Ok(packet) => packet,
+            Err(Error::IoError(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break
+            }
+            Err(error) => return Err(format!("errors.audioDecode|{error}")),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = decoder
+            .decode(&packet)
+            .map_err(|error| format!("errors.audioDecode|{error}"))?;
+        frames += decoded.frames() as u64;
+        packets += 1;
+    }
+    Ok(frames)
+}
+
 // SAF providers may return an opaque URI with no extension. Inspect the copied
 // bytes, never use a URI suffix as a filesystem name.
 pub fn detect_extension(path: &Path) -> Result<&'static str, String> {
@@ -108,9 +138,197 @@ pub fn detect_extension(path: &Path) -> Result<&'static str, String> {
     Ok(extension)
 }
 
-// Each decoded packet is bounded by the codec. Mono PCM is written directly to
-// disk in 30-second pieces at the original sample rate; an hour-long recording
-// never becomes an hour-long memory buffer.
+/// Speech transcription gains nothing above 8 kHz of audio bandwidth. Cloud
+/// chunks and new recordings are stored at this rate to keep uploads small.
+pub const SPEECH_SAMPLE_RATE: u32 = 16000;
+
+/// Streaming windowed-sinc (Kaiser) decimator. Memory is bounded by the filter
+/// length regardless of input length; it never upsamples (higher output rates
+/// pass audio through unchanged).
+pub struct Resampler {
+    passthrough: bool,
+    input_rate: u64,
+    output_rate: u64,
+    half: i64,
+    table: Vec<f32>,
+    buffer: Vec<f32>,
+    // Absolute input index of buffer[0]; output n is centred exactly at
+    // n * input_rate / output_rate, so results never depend on chunking.
+    start: i64,
+    consumed: u64,
+    produced: u64,
+}
+const RESAMPLER_TABLE_RESOLUTION: f64 = 128.0;
+impl Resampler {
+    pub fn new(input_rate: u32, output_rate: u32) -> Self {
+        let passthrough = output_rate == 0 || output_rate >= input_rate;
+        let step = if passthrough {
+            1.0
+        } else {
+            input_rate as f64 / output_rate as f64
+        };
+        // Cut off just below the output Nyquist frequency. Kaiser beta 8.6 gives
+        // roughly 85 dB of stop-band attenuation with 16 zero crossings a side.
+        let cutoff = 0.9 / step;
+        let half = if passthrough {
+            0.0
+        } else {
+            (16.0 / cutoff).ceil()
+        };
+        let beta = 8.6;
+        let bessel = |x: f64| {
+            let (mut sum, mut term, mut k) = (1.0f64, 1.0f64, 1.0f64);
+            while term > 1e-12 * sum {
+                term *= (x / (2.0 * k)).powi(2);
+                sum += term;
+                k += 1.0;
+            }
+            sum
+        };
+        let size = (2.0 * half * RESAMPLER_TABLE_RESOLUTION) as usize + 2;
+        let table = (0..size)
+            .map(|index| {
+                let x = index as f64 / RESAMPLER_TABLE_RESOLUTION - half;
+                if passthrough || x.abs() > half {
+                    return 0.0;
+                }
+                let argument = std::f64::consts::PI * cutoff * x;
+                let sinc = if argument.abs() < 1e-9 {
+                    1.0
+                } else {
+                    argument.sin() / argument
+                };
+                let ratio = x / half;
+                let window = bessel(beta * (1.0 - ratio * ratio).max(0.0).sqrt()) / bessel(beta);
+                (cutoff * sinc * window) as f32
+            })
+            .collect();
+        Self {
+            passthrough,
+            input_rate: input_rate as u64,
+            output_rate: output_rate.max(1) as u64,
+            half: half as i64,
+            table,
+            // Zero history before input 0 (no filter delay in the output).
+            buffer: vec![0.0; half as usize],
+            start: -(half as i64),
+            consumed: 0,
+            produced: 0,
+        }
+    }
+    pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
+        if self.passthrough {
+            output.extend_from_slice(input);
+            return;
+        }
+        self.buffer.extend_from_slice(input);
+        self.consumed += input.len() as u64;
+        self.drain(output, u64::MAX);
+    }
+    /// Flushes the filter tail. The output then has ceil(input / step) samples.
+    pub fn finish(&mut self, output: &mut Vec<f32>) {
+        if self.passthrough {
+            return;
+        }
+        let expected = (self.consumed * self.output_rate).div_ceil(self.input_rate);
+        self.buffer
+            .extend(std::iter::repeat_n(0.0, self.half as usize + 2));
+        self.drain(output, expected);
+    }
+    fn drain(&mut self, output: &mut Vec<f32>, limit: u64) {
+        while self.produced < limit {
+            let numerator = self.produced * self.input_rate;
+            let whole = (numerator / self.output_rate) as i64;
+            let remainder = numerator % self.output_rate;
+            let last = whole + self.half;
+            if last - self.start >= self.buffer.len() as i64 {
+                break;
+            }
+            let first = whole - self.half + i64::from(remainder > 0);
+            let fraction = remainder as f64 / self.output_rate as f64;
+            let mut sum = 0.0f32;
+            for index in first..=last {
+                // Offset from the left kernel edge: index - centre + half.
+                let offset =
+                    ((index - whole + self.half) as f64 - fraction) * RESAMPLER_TABLE_RESOLUTION;
+                let base = offset as usize;
+                let weight_fraction = (offset - base as f64) as f32;
+                let weight =
+                    self.table[base] + (self.table[base + 1] - self.table[base]) * weight_fraction;
+                sum += self.buffer[(index - self.start) as usize] * weight;
+            }
+            output.push(sum);
+            self.produced += 1;
+        }
+        let next = (self.produced * self.input_rate / self.output_rate) as i64;
+        let keep = next - self.half - 1 - self.start;
+        if keep >= 8192 {
+            self.buffer.drain(..keep as usize);
+            self.start += keep;
+        }
+    }
+}
+
+struct ChunkWriter<'a> {
+    destination: &'a Path,
+    rate: u32,
+    writer: Option<hound::WavWriter<std::io::BufWriter<fs::File>>>,
+    in_chunk: u64,
+    chunks: Vec<PathBuf>,
+}
+impl ChunkWriter<'_> {
+    fn push(&mut self, value: f32) -> Result<(), String> {
+        if self.in_chunk == self.rate as u64 * 30 {
+            if let Some(writer) = self.writer.take() {
+                writer
+                    .finalize()
+                    .map_err(|error| format!("errors.audioPrepare|{error}"))?;
+            }
+            self.in_chunk = 0;
+        }
+        if self.writer.is_none() {
+            let path = self
+                .destination
+                .join(format!("chunk-{:06}.wav", self.chunks.len()));
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: self.rate,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            self.writer = Some(
+                hound::WavWriter::create(&path, spec)
+                    .map_err(|error| format!("errors.audioPrepare|{error}"))?,
+            );
+            self.chunks.push(path);
+        }
+        let sample = if value.is_finite() {
+            (value * 32767.0).round().clamp(-32768.0, 32767.0) as i16
+        } else {
+            0
+        };
+        self.writer
+            .as_mut()
+            .unwrap()
+            .write_sample(sample)
+            .map_err(|error| format!("errors.audioPrepare|{error}"))?;
+        self.in_chunk += 1;
+        Ok(())
+    }
+    fn finish(mut self) -> Result<Vec<PathBuf>, String> {
+        if let Some(writer) = self.writer.take() {
+            writer
+                .finalize()
+                .map_err(|error| format!("errors.audioPrepare|{error}"))?;
+        }
+        Ok(self.chunks)
+    }
+}
+
+// Each decoded packet is bounded by the codec. Mono PCM is resampled to at
+// most 16 kHz and written directly to disk in 30-second pieces; an hour-long
+// recording never becomes an hour-long memory buffer. A corrupt packet is
+// skipped (as players do) instead of discarding the whole recording.
 pub fn prepare_cloud_chunks(
     input: &Path,
     destination: &Path,
@@ -124,11 +342,13 @@ pub fn prepare_cloud_chunks(
     let mut decoder = symphonia::default::get_codecs()
         .make(&parameters, &DecoderOptions::default())
         .map_err(|error| format!("errors.audioDecodeUnsupported|{error}"))?;
-    let mut chunks = Vec::new();
-    let mut writer: Option<hound::WavWriter<std::io::BufWriter<fs::File>>> = None;
+    let mut output: Option<(ChunkWriter, Resampler)> = None;
     let mut sample_rate = 0u32;
-    let mut samples_in_chunk = 0u64;
     let mut decoded_frames = 0u64;
+    let mut skipped = 0u64;
+    let mut last_error = String::new();
+    let mut mono = Vec::new();
+    let mut resampled = Vec::new();
     loop {
         let packet = match probed.format.next_packet() {
             Ok(packet) => packet,
@@ -140,9 +360,15 @@ pub fn prepare_cloud_chunks(
         if packet.track_id() != track_id {
             continue;
         }
-        let decoded = decoder
-            .decode(&packet)
-            .map_err(|error| format!("errors.audioDecode|{error}"))?;
+        let decoded = match decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            Err(Error::DecodeError(error)) => {
+                skipped += 1;
+                last_error = error.to_string();
+                continue;
+            }
+            Err(error) => return Err(format!("errors.audioDecode|{error}")),
+        };
         let spec = *decoded.spec();
         let channels = spec.channels.count();
         if channels == 0 || spec.rate == 0 {
@@ -152,52 +378,49 @@ pub fn prepare_cloud_chunks(
             return Err("errors.audioSampleRateChanged".into());
         }
         sample_rate = spec.rate;
+        let (writer, resampler) = output.get_or_insert_with(|| {
+            let rate = sample_rate.min(SPEECH_SAMPLE_RATE);
+            (
+                ChunkWriter {
+                    destination,
+                    rate,
+                    writer: None,
+                    in_chunk: 0,
+                    chunks: Vec::new(),
+                },
+                Resampler::new(sample_rate, rate),
+            )
+        });
         let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
         buffer.copy_interleaved_ref(decoded);
-        for frame in buffer.samples().chunks_exact(channels) {
-            if samples_in_chunk == sample_rate as u64 * 30 {
-                writer
-                    .take()
-                    .unwrap()
-                    .finalize()
-                    .map_err(|error| format!("errors.audioPrepare|{error}"))?;
-                samples_in_chunk = 0;
-            }
-            if writer.is_none() {
-                let path = destination.join(format!("chunk-{:06}.wav", chunks.len()));
-                let spec = hound::WavSpec {
-                    channels: 1,
-                    sample_rate,
-                    bits_per_sample: 16,
-                    sample_format: hound::SampleFormat::Int,
-                };
-                writer = Some(
-                    hound::WavWriter::create(&path, spec)
-                        .map_err(|error| format!("errors.audioPrepare|{error}"))?,
-                );
-                chunks.push(path);
-            }
-            let mono = frame.iter().sum::<f32>() / channels as f32;
-            let sample = if mono.is_finite() {
-                (mono * 32767.0).round().clamp(-32768.0, 32767.0) as i16
-            } else {
-                0
-            };
-            writer
-                .as_mut()
-                .unwrap()
-                .write_sample(sample)
-                .map_err(|error| format!("errors.audioPrepare|{error}"))?;
-            samples_in_chunk += 1;
-            decoded_frames += 1;
+        mono.clear();
+        mono.extend(
+            buffer
+                .samples()
+                .chunks_exact(channels)
+                .map(|frame| frame.iter().sum::<f32>() / channels as f32),
+        );
+        decoded_frames += mono.len() as u64;
+        resampled.clear();
+        resampler.process(&mono, &mut resampled);
+        for value in &resampled {
+            writer.push(*value)?;
         }
         progress(decoded_frames, total.max(decoded_frames));
     }
-    if let Some(writer) = writer {
-        writer
-            .finalize()
-            .map_err(|error| format!("errors.audioPrepare|{error}"))?;
+    let Some((mut writer, mut resampler)) = output else {
+        return Err(if skipped > 0 {
+            format!("errors.audioDecode|{last_error}")
+        } else {
+            "errors.audioEmpty".into()
+        });
+    };
+    resampled.clear();
+    resampler.finish(&mut resampled);
+    for value in &resampled {
+        writer.push(*value)?;
     }
+    let chunks = writer.finish()?;
     if chunks.is_empty() {
         return Err("errors.audioEmpty".into());
     }
@@ -290,13 +513,59 @@ mod tests {
         assert_eq!(detect_extension(&input).unwrap(), "wav");
         let chunks = prepare_cloud_chunks(&input, &dir, |_, _| {}).unwrap();
         let mut decoded = hound::WavReader::open(&chunks[0]).unwrap();
-        assert_eq!(decoded.duration(), 24000);
+        // 48 kHz sources are uploaded at 16 kHz with the same duration.
+        assert_eq!(decoded.spec().sample_rate, 16000);
+        assert_eq!(decoded.duration(), 8000);
         let energy: f64 = decoded
             .samples::<i16>()
             .map(|sample| (sample.unwrap() as f64 / 32768.0).powi(2))
             .sum();
-        assert!((energy / 24000.0).sqrt() > 0.3);
+        assert!((energy / 8000.0).sqrt() > 0.3);
         fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn resampler_is_chunking_invariant_keeps_speech_band_and_rejects_aliases() {
+        let rate = 44100;
+        let tone = |frequency: f64, count: usize| -> Vec<f32> {
+            (0..count)
+                .map(|i| {
+                    (i as f64 * 2.0 * std::f64::consts::PI * frequency / rate as f64).sin() as f32
+                        * 0.5
+                })
+                .collect()
+        };
+        let rms = |samples: &[f32]| {
+            let body = &samples[400..samples.len() - 400];
+            (body.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / body.len() as f64).sqrt()
+        };
+        let input = tone(1000.0, rate as usize);
+        let mut whole = Vec::new();
+        let mut resampler = Resampler::new(rate, 16000);
+        resampler.process(&input, &mut whole);
+        resampler.finish(&mut whole);
+        assert_eq!(whole.len(), 16000);
+        let mut pieces = Vec::new();
+        let mut resampler = Resampler::new(rate, 16000);
+        for piece in input.chunks(4093) {
+            resampler.process(piece, &mut pieces);
+        }
+        resampler.finish(&mut pieces);
+        assert_eq!(whole, pieces);
+        assert_eq!(Resampler::new(48000, 16000).half, 54);
+        // 1 kHz passes at unity gain (0.5 peak = 0.354 RMS).
+        assert!((rms(&whole) - 0.3536).abs() < 0.01, "{}", rms(&whole));
+        // 12 kHz would alias to 4 kHz; it must be strongly attenuated (> 60 dB).
+        let mut aliased = Vec::new();
+        let mut resampler = Resampler::new(rate, 16000);
+        resampler.process(&tone(12000.0, rate as usize), &mut aliased);
+        resampler.finish(&mut aliased);
+        assert!(rms(&aliased) < 0.3536 / 1000.0, "{}", rms(&aliased));
+        // Equal or lower input rates pass through untouched.
+        let mut same = Vec::new();
+        let mut passthrough = Resampler::new(16000, 16000);
+        passthrough.process(&input[..100], &mut same);
+        passthrough.finish(&mut same);
+        assert_eq!(same, input[..100].to_vec());
     }
     #[test]
     fn decoder_rejects_non_audio_bytes() {

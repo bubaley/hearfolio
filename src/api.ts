@@ -60,12 +60,19 @@ export function markOperationHandled(id:string) {
   handledOperations.add(id);
   while(handledOperations.size>50)handledOperations.delete(handledOperations.values().next().value!);
   try {localStorage.setItem(handledOperationKey,JSON.stringify([...handledOperations]));} catch { /* Native result stays available even without a UI receipt. */ }
+  // Durable receipt in Rust: an acknowledged snapshot reads as idle, so cleared
+  // WebView storage cannot replay it. Other receipts (e.g. `recording:<id>`) are UI-only.
+  if(!preview&&!id.includes(':'))void invoke('acknowledge_operation',{id}).catch(()=>{});
 }
 export function observePendingOperation(snapshot:OperationSnapshot) {
   const result=operationMailbox.observe(snapshot);
   if(result.terminal&&snapshot.id)markOperationHandled(snapshot.id);
   return result;
 }
+/** Payload of the `partial-text` event: the full text so far, not a delta. */
+export type PartialTextEvent={text:string;recordId:string|null;operationId:string|null};
+/** Result of `cloud_resume_state`: committed cloud chunks of an unfinished attempt. */
+export type CloudResume={done:number;total:number;configuration:RecognitionConfig};
 export type TransferSnapshot={id?:string;direction?:'send'|'receive';state:'idle'|'running'|'finished'|'error'|'interrupted';stage?:string;current?:number;total?:number;error?:string|null;recordId?:string|null;result?:Entry|null};
 function transferOperation(snapshot:TransferSnapshot):OperationSnapshot{return {...snapshot,kind:snapshot.direction==='send'?'transfer_send':'transfer_receive',recordId:null};}
 export function observePendingTransfer(snapshot:TransferSnapshot){return observePendingOperation(transferOperation(snapshot));}
@@ -94,6 +101,8 @@ export async function call<T>(command: string, args: Record<string, unknown> = {
   let value: unknown;
   switch (command) {
     case 'recording_activity_snapshot':case 'operation_activity_snapshot':value={state:'idle'};break;
+    case 'acknowledge_operation':case 'cancel_background_operation':value=undefined;break;
+    case 'cloud_resume_state':value=null;break;
     case 'import_quick_recordings':value=[];break;
     case 'get_runtime_platform':value={...previewCapabilities};break;
     case 'get_latest_android_release':value=new URLSearchParams(window.location.search).get('update')==='available'?{version:'0.2.0',url:'https://github.com/bubaley/hearfolio/releases/latest'}:null;break;
@@ -184,7 +193,7 @@ export async function call<T>(command: string, args: Record<string, unknown> = {
       const result = currentLanguage()==='en'?'Today we discussed our plans for next week. We will start by updating the interface to make recordings easy to work with.\n\nThe transcript keeps all our decisions together so we can revisit them later. We will assign tasks after the meeting and review the results on Friday.':'Сегодня мы обсудили планы на следующую неделю. Начнём с обновления интерфейса: важно сделать работу с записями простой и понятной.\n\nВсе договорённости сохраняются в расшифровке, чтобы к ним можно было вернуться позже. Задачи распределим после встречи, а в пятницу проверим результат.';
       for (let current = 0; current <= result.length; current += 40) {
         emit('task-progress', {kind:'transcribe',stage:'progress.transcribe',current,total:result.length,elapsed:Math.floor(current / 80)});
-        if(current>0){previewSettings.lastConfiguration=configuration;localStorage.setItem('hearfolio-preview-settings',JSON.stringify(previewSettings));}emit('partial-text', {text:result.slice(0,current)}); await delay(180);
+        if(current>0){previewSettings.lastConfiguration=configuration;localStorage.setItem('hearfolio-preview-settings',JSON.stringify(previewSettings));}emit('partial-text', {text:result.slice(0,current),recordId:entry.id,operationId:null} satisfies PartialTextEvent); await delay(180);
       }
       previewTexts.set(entry.id,result); entry.outputPath='preview.txt'; entry.model=configuration.model; value=result; break;
     }
@@ -256,7 +265,8 @@ export async function startAudioRecording():Promise<void> {
       // Bound queued IPC chunks; a stalled disk must never buffer an hour in RAM.
       if(recording.pending>=8){recording.error=new Error('errors.recordingStop');recording.stream.getTracks().forEach(track=>track.stop());return;}
       recording.pending++;
-      recording.queue=recording.queue.then(()=>call<void>('append_audio_recording',{samples:Array.from(samples)})).catch(()=>{recording.error=new Error('errors.recordingStop');recording.stream.getTracks().forEach(track=>track.stop());}).finally(()=>{recording.pending--;});
+      // Raw little-endian PCM body; Rust decimates to 16 kHz and owns the WAV.
+      recording.queue=recording.queue.then(()=>invoke<void>('append_audio_recording',new Uint8Array(samples.buffer))).catch(()=>{recording.error=new Error('errors.recordingStop');recording.stream.getTracks().forEach(track=>track.stop());}).finally(()=>{recording.pending--;});
     };
     source.connect(processor);processor.connect(mute);mute.connect(context.destination);
   } catch(error) {

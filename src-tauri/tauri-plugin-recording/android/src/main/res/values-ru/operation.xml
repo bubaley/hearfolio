@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="hearfolio_operation_channel">Обработка записей</string>
+    <string name="hearfolio_operation_title_transcribe">Расшифровка записи</string>
+    <string name="hearfolio_operation_title_postprocess">Обработка текста</string>
+    <string name="hearfolio_operation_title_import">Сохранение записи</string>
+    <string name="hearfolio_operation_cancel">Отменить</string>
+    <string name="hearfolio_operation_cancelling">Отменяем…</string>
+    <string name="hearfolio_operation_cancelled">Отменено</string>
+    <string name="hearfolio_operation_finished">Готово</string>
+    <string name="hearfolio_operation_failed">Обработка прервана. Откройте приложение.</string>
+    <string name="hearfolio_operation_working">Идёт обработка…</string>
+    <string name="hearfolio_operation_prepare">Подготавливаем аудио</string>
+    <string name="hearfolio_operation_send">Отправляем аудио</string>
+    <string name="hearfolio_operation_recognize">Распознаём речь</string>
+    <string name="hearfolio_operation_save">Сохраняем результат</string>
+    <string name="hearfolio_operation_postprocess">Обрабатываем текст</string>
+    <string name="hearfolio_operation_copy">Копируем аудио</string>
+    <string name="hearfolio_operation_step_send">отправляем</string>
+    <string name="hearfolio_operation_step_recognize">распознаём</string>
+    <string name="hearfolio_operation_chunk">Часть %1$d из %2$d · %3$s</string>
+</resources>

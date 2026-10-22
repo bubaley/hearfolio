@@ -39,6 +39,9 @@ tiny_http = "0.12"
 if-addrs = "0.13"
 mdns-sd = "0.21"
 hmac = "0.12"
+# Pure-Rust lossless encoder for compacting recordings where no system AAC
+# encoder is available (Windows/Linux, and as a fallback elsewhere).
+flacenc = { version = "0.5.1", default-features = false }
 tauri-plugin-fs = "2.5.2"
 
 [target.'cfg(target_os = "android")'.dependencies]

@@ -11,9 +11,70 @@ use std::{
 use tauri::Manager;
 
 type Writer = hound::WavWriter<BufWriter<fs::File>>;
+// Desktop capture: WebView PCM at the device rate is decimated to 16 kHz in
+// Rust (independent of WebView AudioContext resampling support) and the WAV
+// header is committed every two seconds so a crash leaves a playable file.
+struct Capture {
+    writer: Writer,
+    resampler: crate::audio::Resampler,
+    input: Vec<f32>,
+    output: Vec<f32>,
+    unflushed: u32,
+}
+impl Capture {
+    fn open(path: &Path, input_rate: u32) -> Result<Self, String> {
+        if !(8000..=192000).contains(&input_rate) {
+            return Err("errors.recordingStart".into());
+        }
+        let rate = input_rate.min(crate::audio::SPEECH_SAMPLE_RATE);
+        Ok(Self {
+            writer: create_writer(path, rate)?,
+            resampler: crate::audio::Resampler::new(input_rate, rate),
+            input: Vec::new(),
+            output: Vec::new(),
+            unflushed: 0,
+        })
+    }
+    fn write_output(&mut self) -> Result<(), String> {
+        for value in &self.output {
+            let sample = (value * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
+            self.writer
+                .write_sample(sample)
+                .map_err(|_| "errors.recordingStop")?;
+        }
+        self.unflushed += self.output.len() as u32;
+        self.output.clear();
+        Ok(())
+    }
+    fn append(&mut self, samples: impl Iterator<Item = i16>) -> Result<(), String> {
+        self.input.clear();
+        self.input
+            .extend(samples.map(|sample| sample as f32 / 32768.0));
+        self.resampler.process(&self.input, &mut self.output);
+        self.write_output()?;
+        if self.unflushed >= self.writer.spec().sample_rate * 2 {
+            // Rewrites the RIFF/data sizes and flushes buffered PCM.
+            self.writer.flush().map_err(|_| "errors.recordingStop")?;
+            self.unflushed = 0;
+        }
+        Ok(())
+    }
+    fn frames(&self) -> u32 {
+        self.writer.duration()
+    }
+    fn finalize(mut self) -> Result<(), String> {
+        self.resampler.finish(&mut self.output);
+        let tail = self.write_output();
+        let finalized = self
+            .writer
+            .finalize()
+            .map_err(|_| "errors.recordingStop".to_owned());
+        tail.and(finalized)
+    }
+}
 struct Session {
     path: PathBuf,
-    writer: Option<Writer>,
+    writer: Option<Capture>,
     _job: JobGuard,
 }
 impl Drop for Session {
@@ -260,7 +321,7 @@ pub async fn start_audio_recording(
         let writer = if cfg!(target_os = "android") {
             None
         } else {
-            Some(create_writer(
+            Some(Capture::open(
                 &path,
                 sample_rate.ok_or("errors.recordingStart")?,
             )?)
@@ -295,22 +356,128 @@ pub async fn start_audio_recording(
     .map_err(|_| "errors.recordingStart")?
 }
 
+// The body is raw little-endian i16 PCM (no JSON number array). The frontend
+// serializes calls, so running off the main thread preserves sample order.
 #[tauri::command]
-pub fn append_audio_recording(samples: Vec<i16>) -> Result<(), String> {
-    if samples.len() > 65536 {
+pub async fn append_audio_recording(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("errors.recordingStop".into());
+    };
+    if bytes.len() % 2 != 0 || bytes.len() > 65536 * 2 {
         return Err("errors.recordingStop".into());
     }
+    let bytes = bytes.clone();
+    tauri::async_runtime::spawn_blocking(move || append_pcm(&bytes))
+        .await
+        .map_err(|_| "errors.recordingStop".to_owned())?
+}
+fn append_pcm(bytes: &[u8]) -> Result<(), String> {
     let mut state = SESSION.lock().map_err(|_| "errors.recordingStop")?;
-    let writer = state
+    let capture = state
         .as_mut()
         .and_then(|session| session.writer.as_mut())
         .ok_or("errors.recordingUnavailable")?;
-    for sample in samples {
-        writer
-            .write_sample(sample)
-            .map_err(|_| "errors.recordingStop")?;
+    capture.append(
+        bytes
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]])),
+    )
+}
+
+/// Rewrites the RIFF and data sizes of a 44-byte-header PCM WAV from its actual
+/// length. Returns the number of PCM bytes, or None when it is not our WAV.
+fn repair_wav(path: &Path) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .ok()?;
+    let mut header = [0u8; 44];
+    file.read_exact(&mut header).ok()?;
+    let le = |offset: usize, size: usize| {
+        (0..size).fold(0u64, |value, index| {
+            value | (header[offset + index] as u64) << (8 * index)
+        })
+    };
+    if &header[0..4] != b"RIFF"
+        || &header[8..16] != b"WAVEfmt "
+        || &header[36..40] != b"data"
+        || le(16, 4) != 16
+        || le(20, 2) != 1
+        || le(34, 2) != 16
+    {
+        return None;
     }
-    Ok(())
+    let block = le(32, 2).max(1);
+    let length = file.metadata().ok()?.len();
+    let data = (length.checked_sub(44)? / block * block).min(0xffff_ffff - 36);
+    if data == 0 {
+        return None;
+    }
+    file.set_len(44 + data).ok()?;
+    file.seek(SeekFrom::Start(4)).ok()?;
+    file.write_all(&((data + 36) as u32).to_le_bytes()).ok()?;
+    file.seek(SeekFrom::Start(40)).ok()?;
+    file.write_all(&(data as u32).to_le_bytes()).ok()?;
+    file.sync_all().ok()?;
+    Some(data)
+}
+
+fn recording_name(path: &Path) -> String {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("wav");
+    format!("Recording-{}.{extension}", crate::clock())
+}
+
+/// Desktop: WAVs left in temp by a crash or a failed stop. Their headers are
+/// repaired (periodic flushes keep at most ~2 s unaccounted) and they are
+/// registered as finished so they can be archived or discarded.
+#[tauri::command]
+pub async fn recover_audio_recordings() -> Result<Vec<AudioSelection>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        if cfg!(target_os = "android") {
+            return Ok(vec![]);
+        }
+        let directory = crate::base()?.join("temp");
+        let active = SESSION
+            .lock()
+            .map_err(|_| "errors.recordingUnavailable")?
+            .as_ref()
+            .map(|session| session.path.clone());
+        let mut found = Vec::new();
+        for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if Some(&path) == active.as_ref() || native_recording_id(&path).is_none() {
+                continue;
+            }
+            let registered = FINISHED
+                .lock()
+                .map_err(|_| "errors.recordingUnavailable")?
+                .contains(&path);
+            if !registered && repair_wav(&path).is_none() {
+                continue;
+            }
+            FINISHED
+                .lock()
+                .map_err(|_| "errors.recordingUnavailable")?
+                .insert(path.clone());
+            found.push(AudioSelection {
+                name: Some(recording_name(&path)),
+                path: path.to_string_lossy().into_owned(),
+            });
+        }
+        Ok(found)
+    })
+    .await
+    .map_err(|_| "errors.recordingUnavailable".to_owned())?
+}
+
+/// Recordings (not user imports) are compacted before archiving.
+pub(crate) fn is_recording_source(path: &Path) -> bool {
+    FINISHED.lock().is_ok_and(|paths| paths.contains(path)) || quick_recording_id(path).is_ok()
 }
 
 #[tauri::command]
@@ -336,26 +503,38 @@ pub async fn stop_audio_recording(app: tauri::AppHandle) -> Result<AudioSelectio
         drop(active);
         #[cfg(not(target_os = "android"))]
         let _ = app;
-        if let Some(writer) = session.writer.take() {
-            if writer.duration() == 0 {
+        let path = session.path.clone();
+        if let Some(capture) = session.writer.take() {
+            if capture.frames() == 0 {
+                // Dropping the unregistered session removes the empty file.
                 return Err("errors.recordingEmpty".into());
             }
-            writer.finalize().map_err(|_| "errors.recordingStop")?;
+            // Register before finalizing: a failed header write must never let
+            // Session::drop delete captured audio. Repair the header instead.
+            FINISHED
+                .lock()
+                .map_err(|_| "errors.recordingStop")?
+                .insert(path.clone());
+            if capture.finalize().is_err() && repair_wav(&path).is_none() {
+                return Err("errors.recordingStop".into());
+            }
         }
-        if fs::metadata(&session.path)
+        if fs::metadata(&path)
             .map_err(|_| "errors.recordingStop")?
             .len()
             <= 44
         {
+            if let Ok(mut paths) = FINISHED.lock() {
+                paths.remove(&path);
+            }
             return Err("errors.recordingEmpty".into());
         }
-        let path = session.path.clone();
         FINISHED
             .lock()
             .map_err(|_| "errors.recordingStop")?
             .insert(path.clone());
         Ok(AudioSelection {
-            name: Some(format!("Recording-{}.{}", crate::clock(), "wav")),
+            name: Some(recording_name(&path)),
             path: path.to_string_lossy().into_owned(),
         })
     })
@@ -456,7 +635,7 @@ mod tests {
         assert!(!path.exists());
         let cancelled = directory.join("cancelled.wav");
         let session = Session {
-            writer: Some(create_writer(&cancelled, 16000).unwrap()),
+            writer: Some(Capture::open(&cancelled, 16000).unwrap()),
             path: cancelled.clone(),
             _job: job,
         };
@@ -464,6 +643,50 @@ mod tests {
         assert!(!cancelled.exists());
         drop(JobGuard::acquire().unwrap());
         fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn desktop_capture_decimates_to_16_khz_and_stays_recoverable_between_flushes() {
+        let path = std::env::temp_dir().join(format!(
+            "hearfolio-capture-test-{}.wav",
+            uuid::Uuid::new_v4()
+        ));
+        let mut capture = Capture::open(&path, 48000).unwrap();
+        let tone = |index: usize| {
+            (f64::sin(index as f64 * 2.0 * std::f64::consts::PI * 440.0 / 48000.0) * 12000.0) as i16
+        };
+        // 3 s of 48 kHz input in 4096-sample WebView chunks.
+        let mut sent = 0;
+        while sent < 48000 * 3 {
+            let count = 4096.min(48000 * 3 - sent);
+            capture.append((sent..sent + count).map(tone)).unwrap();
+            sent += count;
+        }
+        // Simulated crash: the periodic flush already committed a valid header.
+        let crashed = hound::WavReader::open(&path).unwrap();
+        assert_eq!(crashed.spec().sample_rate, 16000);
+        assert!(crashed.duration() >= 16000 * 2);
+        drop(crashed);
+        capture.finalize().unwrap();
+        let mut reader = hound::WavReader::open(&path).unwrap();
+        assert_eq!(reader.spec().sample_rate, 16000);
+        assert_eq!(reader.duration(), 16000 * 3);
+        let energy: f64 = reader
+            .samples::<i16>()
+            .map(|sample| (sample.unwrap() as f64 / 32768.0).powi(2))
+            .sum::<f64>()
+            / (16000.0 * 3.0);
+        let expected = (12000.0f64 / 32768.0).powi(2) / 2.0;
+        assert!((energy / expected - 1.0).abs() < 0.05, "energy {energy}");
+        // A stale header (e.g. failed finalize) is repaired from file length.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(40)).unwrap();
+            file.write_all(&0u32.to_le_bytes()).unwrap();
+        }
+        assert_eq!(repair_wav(&path), Some(16000 * 3 * 2));
+        assert_eq!(hound::WavReader::open(&path).unwrap().duration(), 16000 * 3);
+        fs::remove_file(path).unwrap();
     }
     #[test]
     fn native_permission_contract_never_treats_denied_or_unknown_as_granted() {
@@ -704,7 +927,6 @@ pub async fn recording_activity_snapshot(
 
 // A stable private filename makes import idempotent if the process exits after
 // committing history but before deleting the quick-recording source.
-#[cfg(any(target_os = "android", test))]
 fn quick_recording_id(path: &Path) -> Result<String, String> {
     if path
         .parent()
@@ -752,9 +974,7 @@ pub async fn import_quick_recordings(
                 };
                 let entry = if let Some(entry) = existing {
                     // Never discard the source if the archived copy is missing or damaged.
-                    if crate::transfer::hash_file(source)?
-                        != crate::transfer::hash_file(Path::new(&entry.input_path))?
-                    {
+                    if !crate::compact::archived_matches(source, Path::new(&entry.input_path))? {
                         return Err("Archived quick recording differs; source preserved".into());
                     }
                     entry
@@ -895,8 +1115,7 @@ fn archive_native_recording(
         if let Some(entry) = existing {
             if !Path::new(&entry.input_path).is_file()
                 || (path.exists()
-                    && crate::transfer::hash_file(path)?
-                        != crate::transfer::hash_file(Path::new(&entry.input_path))?)
+                    && !crate::compact::archived_matches(path, Path::new(&entry.input_path))?)
             {
                 return Err("errors.recordingStop".into());
             }

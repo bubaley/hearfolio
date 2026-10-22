@@ -42,6 +42,8 @@ class AudioArgs { lateinit var path: String; lateinit var name: String }
 class TextArgs { lateinit var name: String; lateinit var text: String }
 @InvokeArg
 class SeekArgs { var seconds: Double = 0.0 }
+@InvokeArg
+class CompactArgs { lateinit var input: String; lateinit var output: String; var bitrate: Int = 48000 }
 
 @InvokeArg
 class OperationArgs {
@@ -246,12 +248,30 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun beginOperation(invoke: Invoke) {
+        // The progress notification needs this on Android 13+; the service still
+        // runs (without a visible notification) if the user declines.
+        try {
+            if (Build.VERSION.SDK_INT >= 33 && getPermissionState("notifications") != PermissionState.GRANTED) {
+                requestPermissionForAlias("notifications", invoke, "operationNotificationResult")
+            } else { startOperation(invoke) }
+        } catch(_: Exception) { startOperation(invoke) }
+    }
+    @PermissionCallback
+    fun operationNotificationResult(invoke: Invoke) { startOperation(invoke) }
+    private fun startOperation(invoke: Invoke) {
+        var registered: String? = null
         try {
             val args = invoke.parseArgs(OperationArgs::class.java)
-            OperationService.ready = { error -> if(error == null) invoke.resolve() else invoke.reject(error) }
+            // The readiness timeout starts only after any permission prompt.
+            OperationService.expectReady(args.id) { error -> if(error == null) invoke.resolve() else invoke.reject(error) }
+            registered = args.id
             ContextCompat.startForegroundService(activity.applicationContext, Intent(activity.applicationContext, OperationService::class.java)
                 .setAction(OperationService.BEGIN).putExtra("id",args.id).putExtra("kind",args.kind).putExtra("network",args.network).putExtra("snapshotPath",args.snapshotPath).putExtra("controlPath",args.controlPath))
-        } catch(_: Exception) { OperationService.ready = null; invoke.reject("errors.operationBackgroundUnavailable") }
+        } catch(_: Exception) {
+            val id = registered
+            if(id != null) OperationService.resolveReady(id, "errors.operationBackgroundUnavailable")
+            else invoke.reject("errors.operationBackgroundUnavailable")
+        }
     }
     @Command
     fun checkOperation(invoke: Invoke) {
@@ -275,7 +295,7 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
         val args = invoke.parseArgs(OperationArgs::class.java)
         if(OperationService.job == args.id) {
             OperationService.cancelled = true; OperationService.error = "errors.operationCancelled"
-            OperationService.instance?.update("cancelled",0,0)
+            OperationService.instance?.update("cancelling",0,0)
         }
         invoke.resolve()
     }
@@ -441,6 +461,28 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
                 }
             } catch (_: Exception) { invoke.reject("errors.audioShare") }
         }, "HearfolioAudioShare").start()
+    }
+
+    // Rust archives a finished recording through this encoder and keeps the
+    // WAV on rejection. Both paths stay inside private app storage.
+    @Command
+    fun compactAudio(invoke: Invoke) {
+        Thread({
+            var output: File? = null
+            try {
+                val args = invoke.parseArgs(CompactArgs::class.java)
+                val input = privateFile(args.input)
+                val target = File(args.output).canonicalFile
+                require(target.path.startsWith(activity.dataDir.canonicalPath + File.separator) && target.name.endsWith(".m4a") && !target.exists())
+                output = target
+                val duration = AudioCompactor.encodeAac(input, target, args.bitrate)
+                invoke.resolve(JSObject().put("durationMillis", duration))
+            } catch (error: Exception) {
+                Log.w("HearfolioRecording", "AAC compaction failed; keeping PCM", error)
+                output?.delete()
+                invoke.reject("errors.recordingStop")
+            }
+        }, "HearfolioAudioCompact").start()
     }
 
     @Command

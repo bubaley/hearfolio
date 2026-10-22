@@ -7,9 +7,13 @@ internal data class RecorderCaptureConfiguration(val source: Int, val sampleRate
 internal object RecorderCapturePolicy {
     // A voice recorder needs the OEM microphone processing path. Raw and ASR
     // sources intentionally bypass gain processing needed for speech at a desk.
+    // 16 kHz carries the full speech band at a third of the 48 kHz PCM size;
+    // the platform resamples from the hardware rate. 48/44.1 kHz remain
+    // fallbacks for devices that reject it (44.1 kHz is the only guaranteed rate).
+    val rates = listOf(16000, 48000, 44100)
     val configurations: List<RecorderCaptureConfiguration> =
         listOf(MediaRecorder.AudioSource.MIC, MediaRecorder.AudioSource.DEFAULT).flatMap { source ->
-            listOf(48000, 44100).map { rate -> RecorderCaptureConfiguration(source, rate) }
+            rates.map { rate -> RecorderCaptureConfiguration(source, rate) }
         }
 }
 

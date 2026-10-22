@@ -3,6 +3,10 @@ export type OperationSnapshot = {
   state: 'idle' | 'running' | 'finished' | 'error' | 'cancelled' | 'interrupted';
   progress?: {kind: string; stage: string; current: number; total: number; elapsed: number} | null;
   error?: string | null; result?: unknown;
+  /** Text received so far; present only while the producing process is alive. */
+  partial?: string;
+  /** Committed cloud chunks of an unfinished transcription (terminal, not finished). */
+  resumable?: {done: number; total: number; configuration: {provider: string; model: string; mode: string}};
 };
 type Pending = {
   kind: string; recordId: string | null; excludedId: string; id?: string;

@@ -27,10 +27,12 @@ class RecorderCapturePolicyTest {
 
     @Test fun microphoneProcessingRemainsPreferredAcrossRateFallback() {
         val configurations = RecorderCapturePolicy.configurations
-        assertEquals(listOf(MediaRecorder.AudioSource.MIC, MediaRecorder.AudioSource.MIC,
-            MediaRecorder.AudioSource.DEFAULT, MediaRecorder.AudioSource.DEFAULT), configurations.map { it.source })
-        assertEquals(listOf(48000, 44100, 48000, 44100), configurations.map { it.sampleRate })
-        // On a device rejecting 48 kHz, stay on MIC instead of switching source.
+        assertEquals(listOf(MediaRecorder.AudioSource.MIC, MediaRecorder.AudioSource.MIC, MediaRecorder.AudioSource.MIC,
+            MediaRecorder.AudioSource.DEFAULT, MediaRecorder.AudioSource.DEFAULT, MediaRecorder.AudioSource.DEFAULT), configurations.map { it.source })
+        // Speech-rate capture first; full-band rates only as device fallbacks.
+        assertEquals(listOf(16000, 48000, 44100, 16000, 48000, 44100), configurations.map { it.sampleRate })
+        // On a device rejecting 16/48 kHz, stay on MIC instead of switching source.
+        assertEquals(MediaRecorder.AudioSource.MIC, configurations.first { it.sampleRate == 48000 }.source)
         assertEquals(MediaRecorder.AudioSource.MIC, configurations.first { it.sampleRate == 44100 }.source)
     }
 

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="hearfolio_operation_channel">Recording processing</string>
+    <string name="hearfolio_operation_title_transcribe">Transcribing recording</string>
+    <string name="hearfolio_operation_title_postprocess">Processing text</string>
+    <string name="hearfolio_operation_title_import">Saving recording</string>
+    <string name="hearfolio_operation_cancel">Cancel</string>
+    <string name="hearfolio_operation_cancelling">Cancelling…</string>
+    <string name="hearfolio_operation_cancelled">Cancelled</string>
+    <string name="hearfolio_operation_finished">Completed</string>
+    <string name="hearfolio_operation_failed">Processing interrupted. Open the app.</string>
+    <string name="hearfolio_operation_working">Processing…</string>
+    <string name="hearfolio_operation_prepare">Preparing audio</string>
+    <string name="hearfolio_operation_send">Sending audio</string>
+    <string name="hearfolio_operation_recognize">Recognizing speech</string>
+    <string name="hearfolio_operation_save">Saving result</string>
+    <string name="hearfolio_operation_postprocess">Processing text</string>
+    <string name="hearfolio_operation_copy">Copying audio</string>
+    <string name="hearfolio_operation_step_send">sending</string>
+    <string name="hearfolio_operation_step_recognize">recognizing</string>
+    <string name="hearfolio_operation_chunk">Part %1$d of %2$d · %3$s</string>
+</resources>

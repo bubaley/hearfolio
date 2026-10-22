@@ -138,7 +138,7 @@ impl TransferGuard {
         if CANCELLED_TRANSFER
             .lock()
             .is_ok_and(|cancelled| cancelled.as_deref() == Some(self.id.as_str()))
-            || self.started.elapsed() >= MAX_OPERATION
+            || self.started.elapsed() >= MAX_TRANSFER
             || read_journal(&self.control_path)
                 .is_some_and(|value| value["id"] == self.id && value["cancelled"] == true)
         {
@@ -495,16 +495,31 @@ pub struct OperationSnapshot {
     progress: Option<serde_json::Value>,
     error: Option<String>,
     result: Option<serde_json::Value>,
+    // Live text is held in memory only; committed cloud chunks are durable in
+    // the per-record resume file instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    partial: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resumable: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    acknowledged: bool,
 }
 struct ActiveOperation {
     snapshot: OperationSnapshot,
     app: AppHandle,
     started: std::time::Instant,
     persisted: std::time::Instant,
+    last_activity: std::time::Instant,
+    dirty: bool,
     cancelled: bool,
 }
 static OPERATION: std::sync::Mutex<Option<ActiveOperation>> = std::sync::Mutex::new(None);
-const MAX_OPERATION: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+// The watchdog is re-armed by every progress report. The absolute cap only
+// bounds a job that keeps reporting forever.
+const STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const MAX_OPERATION: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+#[cfg(target_os = "android")]
+const MAX_TRANSFER: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 #[cfg(target_os = "android")]
 fn operation_control_path(id: &str) -> Result<std::path::PathBuf, String> {
     Ok(crate::base()?
@@ -517,7 +532,11 @@ fn operation_path() -> Result<std::path::PathBuf, String> {
 fn persist_operation_at(path: &std::path::Path, state: &OperationSnapshot) -> Result<(), String> {
     use std::io::Write;
     let temp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec(state).map_err(|_| "errors.operationFailed")?;
+    let durable = OperationSnapshot {
+        partial: None,
+        ..state.clone()
+    };
+    let bytes = serde_json::to_vec(&durable).map_err(|_| "errors.operationFailed")?;
     let mut options = std::fs::OpenOptions::new();
     options.create(true).truncate(true).write(true);
     #[cfg(unix)]
@@ -552,6 +571,36 @@ fn read_operation_at(path: &std::path::Path) -> Result<Option<OperationSnapshot>
     }
     Ok(Some(state))
 }
+// Unfinished paid work is reported, never resumed automatically.
+fn with_resume(mut snapshot: OperationSnapshot) -> OperationSnapshot {
+    if snapshot.kind == "transcribe" && snapshot.state != "running" && snapshot.state != "finished"
+    {
+        if let (Some(record), Ok(root)) = (snapshot.record_id.as_deref(), crate::base()) {
+            snapshot.resumable = crate::resume::resumable(&root, record);
+        }
+    }
+    snapshot
+}
+// The bridge call waits for OperationService readiness. It runs without the
+// operation lock, and a lost callback cannot block snapshot or cancel calls.
+#[cfg(target_os = "android")]
+fn begin_native(app: &AppHandle, payload: serde_json::Value) -> Result<(), String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let result = app
+            .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
+            .transfer::<()>("beginOperation", payload)
+            .is_ok();
+        let _ = sender.send(result);
+    });
+    // Kotlin answers within ~10 s of dispatch; the extra time covers a
+    // notification permission prompt the user is still reading.
+    match receiver.recv_timeout(std::time::Duration::from_secs(120)) {
+        Ok(true) => Ok(()),
+        _ => Err("errors.operationBackgroundUnavailable".into()),
+    }
+}
 pub(crate) struct OperationGuard {
     id: String,
     completed: bool,
@@ -572,41 +621,43 @@ impl OperationGuard {
             progress: None,
             error: None,
             result: None,
+            partial: None,
+            resumable: None,
+            acknowledged: false,
         };
-        let mut state = OPERATION.lock().map_err(|_| "errors.operationFailed")?;
-        if state.is_some() {
-            return Err("errors.operationBusy".into());
-        }
-        persist_operation(&snapshot)?;
-        #[cfg(target_os = "android")]
-        if let Err(error) = app
-            .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
-            .transfer::<()>(
-                "beginOperation",
-                serde_json::json!({"id":id,"kind":kind,"network":_network,"snapshotPath":operation_path()?,"controlPath":operation_control_path(&id)?}),
-            )
         {
-            let failed = OperationSnapshot {
-                state: "error".into(),
-                error: Some("errors.operationBackgroundUnavailable".into()),
-                ..snapshot
-            };
-            let _ = persist_operation(&failed);
-            let _ = error;
-            return Err("errors.operationBackgroundUnavailable".into());
+            // Reserve and commit ownership under the lock; native startup below
+            // happens without it.
+            let mut state = OPERATION.lock().map_err(|_| "errors.operationFailed")?;
+            if state.is_some() {
+                return Err("errors.operationBusy".into());
+            }
+            persist_operation(&snapshot)?;
+            let now = std::time::Instant::now();
+            *state = Some(ActiveOperation {
+                snapshot,
+                app: app.clone(),
+                started: now,
+                persisted: now,
+                last_activity: now,
+                dirty: false,
+                cancelled: false,
+            });
         }
-        let now = std::time::Instant::now();
-        *state = Some(ActiveOperation {
-            snapshot,
-            app: app.clone(),
-            started: now,
-            persisted: now,
-            cancelled: false,
-        });
-        Ok(Self {
-            id,
+        #[allow(unused_mut)]
+        let mut guard = Self {
+            id: id.clone(),
             completed: false,
-        })
+        };
+        #[cfg(target_os = "android")]
+        {
+            let payload = serde_json::json!({"id":id,"kind":kind,"network":_network,"snapshotPath":operation_path()?,"controlPath":operation_control_path(&id)?});
+            if let Err(error) = begin_native(app, payload) {
+                guard.finish::<()>(&Err(error.clone()));
+                return Err(error);
+            }
+        }
+        Ok(guard)
     }
     pub fn finish<T: serde::Serialize>(&mut self, result: &Result<T, String>) {
         use tauri::Emitter;
@@ -632,12 +683,15 @@ impl OperationGuard {
             .as_ref()
             .ok()
             .and_then(|value| serde_json::to_value(value).ok());
+        if result.is_ok() {
+            active.snapshot.partial = None;
+        }
         if persist_operation(&active.snapshot).is_err() {
             active.snapshot.error = Some("errors.operationFailed".into());
         }
-        let _ = active
-            .app
-            .emit("operation-native-finished", &active.snapshot);
+        drop(state);
+        let snapshot = with_resume(active.snapshot);
+        let _ = active.app.emit("operation-native-finished", &snapshot);
         self.completed = true;
     }
 }
@@ -660,10 +714,17 @@ pub(crate) fn check_current() -> Result<(), String> {
             .clone()
             .unwrap_or_else(|| "errors.operationCancelled".into()));
     }
-    if active.started.elapsed() >= MAX_OPERATION {
+    if active.started.elapsed() >= MAX_OPERATION || active.last_activity.elapsed() >= STALL_LIMIT {
         active.cancelled = true;
         active.snapshot.error = Some("errors.operationTimeout".into());
         return Err("errors.operationTimeout".into());
+    }
+    // Trailing flush for throttled progress, so the last state before a quiet
+    // period (one long request) is what a recreated UI or the service sees.
+    if active.dirty && active.persisted.elapsed() >= std::time::Duration::from_secs(1) {
+        let _ = persist_operation(&active.snapshot);
+        active.persisted = std::time::Instant::now();
+        active.dirty = false;
     }
     #[cfg(target_os = "android")]
     if let Ok(bytes) = std::fs::read(operation_control_path(&active.snapshot.id)?) {
@@ -682,6 +743,17 @@ pub(crate) fn check_current() -> Result<(), String> {
     }
     Ok(())
 }
+// Stage and step changes are durable immediately; byte-level deltas are
+// throttled and flushed by `check_current`.
+fn progress_milestone(previous: Option<&serde_json::Value>, next: &serde_json::Value) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    previous["stage"] != next["stage"]
+        || previous["total"] != next["total"]
+        || (previous["current"] != next["current"]
+            && next["total"].as_u64().is_some_and(|total| total <= 1000))
+}
 pub(crate) fn operation_progress(kind: &str, progress: serde_json::Value) {
     let Ok(mut state) = OPERATION.lock() else {
         return;
@@ -690,11 +762,29 @@ pub(crate) fn operation_progress(kind: &str, progress: serde_json::Value) {
     if active.snapshot.kind != kind {
         return;
     }
-    active.snapshot.progress = Some(progress.clone());
-    if active.persisted.elapsed() >= std::time::Duration::from_secs(2) {
+    let milestone = progress_milestone(active.snapshot.progress.as_ref(), &progress);
+    active.snapshot.progress = Some(progress);
+    active.last_activity = std::time::Instant::now();
+    active.dirty = true;
+    if milestone || active.persisted.elapsed() >= std::time::Duration::from_secs(2) {
         let _ = persist_operation(&active.snapshot);
         active.persisted = std::time::Instant::now();
+        active.dirty = false;
     }
+}
+/// Records live text for snapshot readers and returns `(operationId, recordId)`.
+pub(crate) fn operation_partial(kind: &str, text: &str) -> Option<(String, Option<String>)> {
+    let mut state = OPERATION.lock().ok()?;
+    let active = state.as_mut()?;
+    if active.snapshot.kind != kind {
+        return None;
+    }
+    active.snapshot.partial = Some(text.to_owned());
+    active.last_activity = std::time::Instant::now();
+    Some((
+        active.snapshot.id.clone(),
+        active.snapshot.record_id.clone(),
+    ))
 }
 #[tauri::command]
 pub async fn operation_activity_snapshot() -> Result<serde_json::Value, String> {
@@ -708,8 +798,10 @@ pub async fn operation_activity_snapshot() -> Result<serde_json::Value, String> 
                 .map_err(|_| "errors.operationFailed".into());
         }
         Ok(match read_operation_at(&operation_path()?)? {
-            Some(state) => serde_json::to_value(state).map_err(|_| "errors.operationFailed")?,
-            None => serde_json::json!({"state":"idle"}),
+            Some(state) if !state.acknowledged => {
+                serde_json::to_value(with_resume(state)).map_err(|_| "errors.operationFailed")?
+            }
+            _ => serde_json::json!({"state":"idle"}),
         })
     })
     .await
@@ -734,6 +826,31 @@ pub async fn cancel_background_operation(app: AppHandle, id: String) -> Result<(
     .await
     .map_err(|_| "errors.operationFailed".to_owned())?
 }
+fn acknowledge_operation_at(path: &std::path::Path, id: &str) -> Result<(), String> {
+    let Some(mut snapshot) = read_operation_at(path)? else {
+        return Ok(());
+    };
+    if snapshot.id != id || snapshot.acknowledged {
+        return Ok(());
+    }
+    snapshot.acknowledged = true;
+    persist_operation_at(path, &snapshot)
+}
+/// The UI has shown this terminal result; later snapshots report idle, so a
+/// cleared WebView storage cannot replay it.
+#[tauri::command]
+pub async fn acknowledge_operation(id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // Holding the lock orders this against a new operation replacing the file.
+        let state = OPERATION.lock().map_err(|_| "errors.operationFailed")?;
+        if state.is_some() {
+            return Ok(());
+        }
+        acknowledge_operation_at(&operation_path()?, &id)
+    })
+    .await
+    .map_err(|_| "errors.operationFailed".to_owned())?
+}
 
 #[cfg(test)]
 mod operation_tests {
@@ -750,6 +867,9 @@ mod operation_tests {
             progress: Some(serde_json::json!({"stage":"progress.recognizeCloud"})),
             error: None,
             result: Some(serde_json::json!("never replay")),
+            partial: Some("live text".into()),
+            resumable: None,
+            acknowledged: false,
         };
         persist_operation_at(&path, &snapshot).unwrap();
         let recovered = read_operation_at(&path).unwrap().unwrap();
@@ -760,6 +880,8 @@ mod operation_tests {
         );
         assert!(recovered.result.is_none());
         assert_eq!(recovered.record_id.as_deref(), Some("record"));
+        // Live text is never written to disk.
+        assert!(recovered.partial.is_none());
         snapshot.state = "finished".into();
         snapshot.result = Some(serde_json::json!("saved"));
         persist_operation_at(&path, &snapshot).unwrap();
@@ -774,7 +896,24 @@ mod operation_tests {
                 0o600
             );
         }
+        acknowledge_operation_at(&path, "other").unwrap();
+        assert!(!read_operation_at(&path).unwrap().unwrap().acknowledged);
+        acknowledge_operation_at(&path, "job").unwrap();
+        let recovered = read_operation_at(&path).unwrap().unwrap();
+        assert!(recovered.acknowledged);
+        assert_eq!(recovered.state, "finished");
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn stage_and_step_changes_persist_immediately_but_byte_deltas_are_throttled() {
+        let chunk = |stage: &str, current: u64| serde_json::json!({"stage":stage,"current":current,"total":5,"elapsed":1});
+        assert!(progress_milestone(None, &chunk("a", 0)));
+        assert!(progress_milestone(Some(&chunk("a", 0)), &chunk("b", 0)));
+        assert!(progress_milestone(Some(&chunk("a", 0)), &chunk("a", 1)));
+        assert!(!progress_milestone(Some(&chunk("a", 1)), &chunk("a", 1)));
+        let bytes =
+            |current: u64| serde_json::json!({"stage":"a","current":current,"total":1_000_000});
+        assert!(!progress_milestone(Some(&bytes(1)), &bytes(2)));
     }
 }
 

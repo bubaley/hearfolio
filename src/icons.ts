@@ -21,6 +21,7 @@ const paths: Record<string, string> = {
   panel: 'M3 4h18v16H3zM9 4v16',
   close: 'm6 6 12 12M6 18 18 6',
   chevron: 'm9 5 7 7-7 7',
+  back: 'm15 5-7 7 7 7',
   alert: 'm12 3 10 18H2L12 3zm0 6v5m0 3h.01',
   headphones: 'M4 14v-3a8 8 0 0 1 16 0v3M4 12h3v8H4v-8zm13 0h3v8h-3v-8',
   cloud: 'M6 18a5 5 0 0 1-1-10 7 7 0 0 1 13-1 5.5 5.5 0 0 1 0 11H6',
