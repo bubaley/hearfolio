@@ -1,5 +1,10 @@
 name: Set up Android build
 description: Install Node, Rust, Java, SDK 36, and a fixed Android NDK
+inputs:
+  cache-profile:
+    description: Build flavour, so debug checks and release packages keep separate Rust caches
+    required: false
+    default: debug
 runs:
   using: composite
   steps:
@@ -15,7 +20,7 @@ runs:
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         workspaces: src-tauri -> target
-        shared-key: android-aarch64-ndk27.2.12479018
+        shared-key: android-ndk27.2.12479018-${{ inputs.cache-profile }}
         cache-workspace-crates: false
         cache-on-failure: true
         save-if: ${{ github.ref == 'refs/heads/main' }}

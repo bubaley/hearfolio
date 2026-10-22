@@ -5,6 +5,10 @@ inputs:
     description: Rust target or target group shared by CI and release builds
     required: false
     default: native
+  cache-profile:
+    description: Cargo profile the job compiles, so CI and release builds keep separate Rust caches
+    required: false
+    default: dev
 runs:
   using: composite
   steps:
@@ -20,15 +24,27 @@ runs:
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         workspaces: src-tauri -> target
-        shared-key: desktop-${{ inputs.cache-target }}
+        shared-key: desktop-${{ inputs.cache-target }}-${{ inputs.cache-profile }}
         cache-workspace-crates: false
         cache-on-failure: true
         save-if: ${{ github.ref == 'refs/heads/main' }}
+    # The hosted runner's Ubuntu mirror is sometimes extremely slow. Keep the
+    # downloaded packages between runs so only the package index is fetched.
+    - if: runner.os == 'Linux'
+      id: apt-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/hearfolio-apt
+        key: apt-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup-desktop/action.yml') }}
+        restore-keys: apt-v1-${{ runner.os }}-${{ runner.arch }}-
     - if: runner.os == 'Linux'
       shell: bash
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
+        archives="$HOME/.cache/hearfolio-apt"
+        mkdir -p "$archives/partial"
+        apt_options=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Dir::Cache::Archives="$archives")
+        sudo apt-get "${apt_options[@]}" update
+        sudo apt-get "${apt_options[@]}" install -y --no-install-recommends libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
         # Tauri's GStreamer plugin copies every file in its source directory.
         # Use an explicit directory containing only the selected plugin packages,
         # even if the hosted runner has other GStreamer plugins preinstalled.
@@ -42,9 +58,16 @@ runs:
           done < <(dpkg -L "$plugin_package")
         done
         echo "GSTREAMER_PLUGINS_DIR=$media_plugins" >> "$GITHUB_ENV"
+        sudo rm -rf "$archives/partial" "$archives/lock"
+        sudo chown -R "$(id -u):$(id -g)" "$archives"
         for media_element in qtdemux aacparse mpegaudioparse avdec_aac avdec_mp3 audioconvert audioresample decodebin; do
           env GST_PLUGIN_SYSTEM_PATH_1_0="$media_plugins" GST_PLUGIN_PATH_1_0="$media_plugins" \
             GST_REGISTRY_1_0="$RUNNER_TEMP/hearfolio-gst-registry.bin" gst-inspect-1.0 "$media_element" > /dev/null
         done
+    - if: runner.os == 'Linux' && github.ref == 'refs/heads/main' && steps.apt-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/hearfolio-apt
+        key: apt-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup-desktop/action.yml') }}
     - shell: bash
       run: npm ci

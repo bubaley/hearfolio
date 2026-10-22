@@ -87,6 +87,7 @@ jobs:
             platform: windows_x86_64
             bundles: nsis
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
@@ -98,6 +99,7 @@ jobs:
       - uses: ./.github/actions/setup-desktop
         with:
           cache-target: ${{ matrix.target }}
+          cache-profile: release
       - if: runner.os == 'macOS'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Build signed desktop updater and installers
@@ -141,12 +143,15 @@ jobs:
     needs: prepare
     if: needs.prepare.outputs.released == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-android
+        with:
+          cache-profile: release
       - name: Build arm64 APK and AAB
         run: |
           node scripts/release.mjs check

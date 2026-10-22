@@ -15,9 +15,20 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request makes the older check run obsolete.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  # Checks never need debugger symbols; skipping them shortens linking and keeps caches small.
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+
 jobs:
   conventions:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -56,6 +67,7 @@ jobs:
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
     defaults:
       run:
         shell: bash
@@ -71,17 +83,21 @@ jobs:
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: npm run build
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --target '${{ matrix.target }}'
-      - run: npm run tauri -- build --ci --target '${{ matrix.target }}' --no-bundle -- --locked
+      # A debug build reuses the dependencies cargo test just compiled. The
+      # optimised, LTO release build runs only in the release workflow.
+      - run: npm run tauri -- build --ci --debug --target '${{ matrix.target }}' --no-bundle -- --locked
   android:
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-android
-      - name: Build Android arm64 and emulator APKs without release secrets
-        run: npm run tauri -- android build --ci --debug --apk --split-per-abi --target aarch64 x86_64
+      # The emulator smoke test needs only x86_64; the release workflow builds arm64.
+      - name: Build Android emulator APK without release secrets
+        run: npm run tauri -- android build --ci --debug --apk --split-per-abi --target x86_64
       - name: Test Android recorder source and gain control lifecycle
         working-directory: src-tauri/gen/android
         run: ./gradlew --no-daemon :tauri-plugin-recording:testDebugUnitTest

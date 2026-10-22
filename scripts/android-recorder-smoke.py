@@ -170,7 +170,8 @@ class Smoke:
             self.event(mode + '-foreground-restored', restored)
 
     def recording(self, pause=False):
-        self.click('#start-recording')
+        # The home screen's record button starts a capture from the record list.
+        self.click('#quick-record')
         status = self.wait(lambda: self.state('recording'), 'native recording state')
         source = status['path']
         self.wait(lambda: self.state('recording') and self.status().get('elapsedMillis', 0) >= 1500, 'measured PCM duration')
@@ -208,11 +209,18 @@ class Smoke:
         entry = self.wait(lambda: self.history_entry(identifier), 'durable archived recording', timeout=60)
         # The archive write precedes the UI's import completion. Do not start
         # another capture while that foreground operation is still settling.
-        self.wait(lambda: self.evaluate(f'!!document.querySelector("[data-rename=\\"{identifier}\\"]") && !!document.querySelector("#mobile-new:not(:disabled):not([hidden])")'), 'saved recording UI')
+        self.wait(lambda: self.evaluate(f'!!document.querySelector("[data-rename=\\"{identifier}\\"]") && !!document.querySelector("[data-back]:not(:disabled):not([hidden])")'), 'saved recording UI')
         audio = self.adb('exec-out', 'run-as', self.args.package, 'cat', entry['inputPath'], binary=True)
-        with wave.open(io.BytesIO(audio)) as wav:
-            assert wav.getnchannels() == 1 and wav.getsampwidth() == 2 and wav.getnframes() > 0, 'Invalid recorded PCM WAV'
-        (self.output / f'{identifier}.wav').write_bytes(audio)
+        # Finished recordings are compacted to AAC in MP4; the WAV is kept only when compaction fails.
+        if entry['inputPath'].endswith('.m4a'):
+            assert len(audio) > 1024 and audio[4:8] == b'ftyp', 'Invalid compacted AAC recording'
+            extension = 'm4a'
+        else:
+            with wave.open(io.BytesIO(audio)) as wav:
+                assert wav.getnchannels() == 1 and wav.getsampwidth() == 2 and wav.getnframes() > 0, 'Invalid recorded PCM WAV'
+            extension = 'wav'
+        self.event('archived-audio', {'path': entry['inputPath'], 'bytes': len(audio)})
+        (self.output / f'{identifier}.{extension}').write_bytes(audio)
         self.foreground()
         return identifier
 
@@ -228,7 +236,7 @@ class Smoke:
         self.wait(self.connect, 'debug WebView CDP', timeout=60)
         self.wait(lambda: self.evaluate('!!window.__TAURI_INTERNALS__'), 'Tauri bridge')
         first = self.recording(pause=True)
-        self.click('#mobile-new')
+        self.click('[data-back]')
         second = self.recording()
         assert first != second, 'Second capture reused the previous session'
         print('PASS: real UI start/screen-off/home/pause/resume/stop/restart; native journal, PCM WAV, foreground and crash checks')
