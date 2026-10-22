@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.0 (2026-10-22)
+
+### Features
+
+- smooth recorder, paced text and progress, configurable segment length ([a116bae](https://github.com/bubaley/hearfolio/commit/a116bae5507bd0249c790bd419bbba981f711a48))
+
 ## 0.8.0 (2026-10-22)
 
 ### Features
