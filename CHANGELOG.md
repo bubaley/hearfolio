@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.0 (2026-10-22)
+
+### Features
+
+- simplify recording flow, keep Android transcription alive, shrink recordings ([ce6539a](https://github.com/bubaley/hearfolio/commit/ce6539ae1731e7f856726bf4d49376ca83129a39))
+
+### Maintenance
+
+- fetch Ubuntu packages from the main archive with mirror fallback ([bcfd011](https://github.com/bubaley/hearfolio/commit/bcfd0110789c388ea442cf357efe927098077c1a))
+- speed up checks and fix the Android recorder smoke test ([76fbfef](https://github.com/bubaley/hearfolio/commit/76fbfef5d4201a4394fa5be3d50c814d48cb03ba))
+
 ## 0.7.0 (2026-10-15)
 
 ### Features
