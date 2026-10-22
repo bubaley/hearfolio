@@ -42,6 +42,14 @@ runs:
       run: |
         archives="$HOME/.cache/hearfolio-apt"
         mkdir -p "$archives/partial"
+        # Prefer the main archive and fall back to other mirrors instead of
+        # depending on the runner's default Azure mirror alone.
+        printf '%s\n' http://archive.ubuntu.com/ubuntu http://mirrors.edge.kernel.org/ubuntu http://azure.archive.ubuntu.com/ubuntu | sudo tee /etc/apt/hearfolio-mirrors.txt > /dev/null
+        for apt_sources in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+          if [[ -f "$apt_sources" ]]; then
+            sudo sed -E -i 's#http://azure[.]archive[.]ubuntu[.]com/ubuntu/?#mirror+file:/etc/apt/hearfolio-mirrors.txt#' "$apt_sources"
+          fi
+        done
         apt_options=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Dir::Cache::Archives="$archives")
         sudo apt-get "${apt_options[@]}" update
         sudo apt-get "${apt_options[@]}" install -y --no-install-recommends libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
