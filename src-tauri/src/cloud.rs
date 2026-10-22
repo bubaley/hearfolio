@@ -76,6 +76,13 @@ fn default_language() -> String {
 fn default_url() -> String {
     "https://openrouter.ai/api/v1".into()
 }
+/// Seconds of audio sent to OpenRouter per request. Longer pieces give the
+/// model more context and fewer seams; shorter ones show text sooner.
+pub const DEFAULT_CHUNK_SECONDS: u32 = 120;
+pub const CHUNK_SECONDS: std::ops::RangeInclusive<u32> = 30..=300;
+fn default_chunk_seconds() -> u32 {
+    DEFAULT_CHUNK_SECONDS
+}
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -85,6 +92,8 @@ pub struct Settings {
     pub openrouter_url: String,
     #[serde(default)]
     pub last_configuration: RecognitionConfig,
+    #[serde(default = "default_chunk_seconds")]
+    pub chunk_seconds: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_working_at: Option<u64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -96,6 +105,7 @@ impl Default for Settings {
             language: default_language(),
             openrouter_url: default_url(),
             last_configuration: RecognitionConfig::default(),
+            chunk_seconds: DEFAULT_CHUNK_SECONDS,
             last_working_at: None,
             token: String::new(),
         }
@@ -106,6 +116,8 @@ impl Default for Settings {
 pub struct SettingsUpdate {
     pub language: String,
     pub openrouter_url: String,
+    #[serde(default)]
+    pub chunk_seconds: Option<u32>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -117,6 +129,7 @@ pub struct PublicSettings {
     storage_parent: String,
     storage_path: String,
     last_configuration: RecognitionConfig,
+    chunk_seconds: u32,
 }
 fn system_language() -> String {
     #[cfg(target_os = "macos")]
@@ -164,6 +177,7 @@ impl Settings {
             storage_parent: root.parent().unwrap_or(root).to_string_lossy().into_owned(),
             storage_path: root.to_string_lossy().into_owned(),
             last_configuration: self.last_configuration.clone(),
+            chunk_seconds: self.chunk_seconds,
         }
     }
     fn validate(&mut self) -> Result<(), String> {
@@ -171,6 +185,9 @@ impl Settings {
             return Err("errors.languageUnknown".into());
         }
         self.last_configuration.validate()?;
+        if !CHUNK_SECONDS.contains(&self.chunk_seconds) {
+            return Err("errors.chunkSecondsInvalid".into());
+        }
         self.openrouter_url = self.openrouter_url.trim().trim_end_matches('/').into();
         let url = reqwest::Url::parse(&self.openrouter_url).map_err(|_| "errors.apiUrlInvalid")?;
         let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
@@ -370,6 +387,9 @@ fn apply_update(
 ) -> Result<Settings, String> {
     current.language = update.language;
     current.openrouter_url = update.openrouter_url;
+    if let Some(seconds) = update.chunk_seconds {
+        current.chunk_seconds = seconds;
+    }
     if let Some(token) = token {
         current.token = token.trim().into();
     }
@@ -833,7 +853,7 @@ pub fn transcribe(
         .encode(fs::read(audio).map_err(|_| "errors.audioRead")?);
     let format = audio.extension().and_then(|e| e.to_str()).unwrap_or("wav");
     if configuration.mode == "transcription" {
-        let request=client()?.post(format!("{}/audio/transcriptions",s.openrouter_url)).bearer_auth(&s.token).timeout(Duration::from_secs(75)).json(&serde_json::json!({"model":configuration.model,"input_audio":{"data":data,"format":format}}));
+        let request=client()?.post(format!("{}/audio/transcriptions",s.openrouter_url)).bearer_auth(&s.token).timeout(Duration::from_secs(60 + u64::from(s.chunk_seconds))).json(&serde_json::json!({"model":configuration.model,"input_audio":{"data":data,"format":format}}));
         let (status, body) = cancellable(move || {
             let response = request.send().map_err(|_| "errors.cloudConnect")?;
             let status = response.status();
@@ -1236,6 +1256,7 @@ mod tests {
             SettingsUpdate {
                 language: "en".into(),
                 openrouter_url: default_url(),
+                chunk_seconds: None,
             },
             None,
         )
@@ -1266,6 +1287,7 @@ mod tests {
             SettingsUpdate {
                 language: "system".into(),
                 openrouter_url: default_url(),
+                chunk_seconds: None,
             },
             Some("".into()),
         )

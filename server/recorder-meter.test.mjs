@@ -7,13 +7,26 @@ test('native timer is smooth between measured samples, bounded on stalled captur
  clock.synchronize(1000,'recording',100);
  assert.equal(clock.milliseconds(150),1050);
  clock.synchronize(1030,'recording',151);
- assert.equal(clock.milliseconds(151),1050); // Delivery never makes a live timer run backwards.
+ const late=clock.milliseconds(151);
+ assert.ok(late>=1050,'a late delivery never makes a live timer run backwards');
+ let previous=late;
+ for(let now=167;now<=455;now+=16){const value=clock.milliseconds(now);assert.ok(value>=previous,'monotonic');assert.ok(value-previous<16*1.6,'no jumps between frames');previous=value;}
+ assert.ok(Math.abs(previous-(1030+(455-151)))<60,`converges on measured time, got ${previous}`);
  assert.equal(clock.milliseconds(10000),1380); // A hidden or stalled UI cannot invent minutes of audio.
  clock.synchronize(1100,'paused',10001);
  assert.equal(clock.milliseconds(20000),1100);
  clock.synchronize(1100,'recording',20000);
  assert.equal(clock.milliseconds(20050),1150);
  clock.reset();assert.equal(clock.milliseconds(30000),0);
+});
+
+test('envelope places native buckets on the recording timeline',()=>{
+ const envelope=new RecorderEnvelope(4,125);
+ envelope.synchronize([.1,.2,.3],24,'a.wav');
+ assert.equal(envelope.newestMillis(),3000);
+ assert.deepEqual(envelope.levels(),[0,.1,.2,.3]);
+ envelope.sample(.5,10000,true,3200);
+ assert.equal(envelope.newestMillis(),3200);
 });
 
 test('state after a control waits for an old poll and then reads fresh without overlap',async()=>{

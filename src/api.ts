@@ -18,7 +18,7 @@ export type Entry = {
   configuration?: RecognitionConfig | null; model: string | null; createdAt: number; sizeBytes?: number | null; durationSeconds?: number | null; results?:PostprocessResult[];
 };
 export type Progress = { kind: 'download' | 'transcribe' | 'postprocess' | 'import' | 'storage' | 'update'; stage: string; current: number; total: number; elapsed: number };
-export type Settings = {language:LanguagePreference;systemLanguage:'ru'|'en';openrouterUrl:string;hasToken:boolean;storageParent:string;storagePath:string;lastConfiguration:RecognitionConfig};
+export type Settings = {language:LanguagePreference;systemLanguage:'ru'|'en';openrouterUrl:string;hasToken:boolean;storageParent:string;storagePath:string;lastConfiguration:RecognitionConfig;chunkSeconds?:number};
 export type CloudModel = {id:string;name:string;modes:('streaming'|'transcription')[];preferredMode:'streaming'|'transcription'};
 export type RuntimePlatform = 'android'|'macos'|'linux'|'windows'|'ios'|'unknown';
 export type RuntimeCapabilities={transferMvp?:boolean;os:RuntimePlatform;mobile:boolean;localRecognition:boolean;customStorage:boolean;nativeAudio:boolean;audioRecording:boolean};
@@ -38,7 +38,7 @@ let previewRules:PostprocessRule[]=[];
 let previewPlayer:HTMLAudioElement|null=null;
 function previewPlayerState():NativePlayerState{return {duration:previewPlayer&&Number.isFinite(previewPlayer.duration)?previewPlayer.duration:0,currentTime:previewPlayer?.currentTime||0,playing:Boolean(previewPlayer&&!previewPlayer.paused&&!previewPlayer.ended)};}
 if(preview){try{const rules=JSON.parse(localStorage.getItem('hearfolio-preview-rules')||'[]');if(Array.isArray(rules))previewRules=rules;}catch{/* Ignore malformed preview rules. */}}
-let previewSettings:Settings={language:'system',systemLanguage:currentLanguage(),openrouterUrl:'https://openrouter.ai/api/v1',hasToken:false,storageParent:'/Users/you',storagePath:'/Users/you/.hearfolio',lastConfiguration:{provider:'local',model:'whisper-base',mode:'local'}};
+let previewSettings:Settings={language:'system',systemLanguage:currentLanguage(),openrouterUrl:'https://openrouter.ai/api/v1',chunkSeconds:120,hasToken:false,storageParent:'/Users/you',storagePath:'/Users/you/.hearfolio',lastConfiguration:{provider:'local',model:'whisper-base',mode:'local'}};
 if(previewPlatform==='android')previewSettings={...previewSettings,storageParent:'',storagePath:'/data/user/0/app.hearfolio/files/.hearfolio',lastConfiguration:{provider:'openrouter',model:'google/gemini-2.5-flash',mode:'streaming'}};
 if (preview) {
   try {
@@ -191,9 +191,14 @@ export async function call<T>(command: string, args: Record<string, unknown> = {
       const configuration={...(args.configuration as RecognitionConfig || entry.configuration || previewSettings.lastConfiguration)};
       entry.configuration=configuration;
       const result = currentLanguage()==='en'?'Today we discussed our plans for next week. We will start by updating the interface to make recordings easy to work with.\n\nThe transcript keeps all our decisions together so we can revisit them later. We will assign tasks after the meeting and review the results on Friday.':'Сегодня мы обсудили планы на следующую неделю. Начнём с обновления интерфейса: важно сделать работу с записями простой и понятной.\n\nВсе договорённости сохраняются в расшифровке, чтобы к ним можно было вернуться позже. Задачи распределим после встречи, а в пятницу проверим результат.';
-      for (let current = 0; current <= result.length; current += 40) {
-        emit('task-progress', {kind:'transcribe',stage:'progress.transcribe',current,total:result.length,elapsed:Math.floor(current / 80)});
-        if(current>0){previewSettings.lastConfiguration=configuration;localStorage.setItem('hearfolio-preview-settings',JSON.stringify(previewSettings));}emit('partial-text', {text:result.slice(0,current),recordId:entry.id,operationId:null} satisfies PartialTextEvent); await delay(180);
+      // Like a real cloud run: whole segments arrive every few seconds.
+      const segments=result.match(/[^.!?]+[.!?]+\s*/g)||[result],started=Date.now();
+      for (let index = 0; index < segments.length; index++) {
+        emit('task-progress', {kind:'transcribe',stage:'progress.sendCloudChunk',current:index,total:segments.length,elapsed:Math.floor((Date.now()-started)/1000)});
+        await delay(2200+Math.random()*1200);
+        if(index===0){previewSettings.lastConfiguration=configuration;localStorage.setItem('hearfolio-preview-settings',JSON.stringify(previewSettings));}
+        emit('partial-text', {text:segments.slice(0,index+1).join(''),recordId:entry.id,operationId:null} satisfies PartialTextEvent);
+        emit('task-progress', {kind:'transcribe',stage:'progress.recognizedChunks',current:index+1,total:segments.length,elapsed:Math.floor((Date.now()-started)/1000)});
       }
       previewTexts.set(entry.id,result); entry.outputPath='preview.txt'; entry.model=configuration.model; value=result; break;
     }

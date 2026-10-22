@@ -352,6 +352,7 @@ const errorMessages:Record<string,[string,string]>={
   invalid_record_name:['Введите название длиной от 1 до 200 символов','Enter a name between 1 and 200 characters'],
   storage_migration_failed:['Не удалось перенести архив. Ваш текущий архив сохранён.','Could not move the archive. Your current archive is preserved.'],
   token_required:['Добавьте API token OpenRouter.','Add your OpenRouter API token.'],
+  chunkSecondsInvalid:['Выберите длину фрагмента от 30 секунд до 5 минут.','Choose a segment length between 30 seconds and 5 minutes.'],
 };
 export function errorText(error:unknown):string {
   const value=error instanceof Error?error.message:String(error);

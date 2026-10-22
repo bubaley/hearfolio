@@ -1067,8 +1067,11 @@ async fn transcribe(
                 fs::create_dir_all(&chunk_dir).map_err(|_| "errors.audioPrepare")?;
                 let result = (|| {
                     emit(&app, "transcribe", "progress.prepareAudio", 0, 0, 0);
-                    let chunks =
-                        audio::prepare_cloud_chunks(&input, &chunk_dir, |current, total| {
+                    let chunks = audio::prepare_cloud_chunks(
+                        &input,
+                        &chunk_dir,
+                        settings.chunk_seconds,
+                        |current, total| {
                             emit(
                                 &app,
                                 "transcribe",
@@ -1077,7 +1080,8 @@ async fn transcribe(
                                 total,
                                 start.elapsed().as_secs(),
                             )
-                        })?;
+                        },
+                    )?;
                     if chunks.is_empty() {
                         return Err("errors.audioEmpty".into());
                     }
@@ -1087,6 +1091,7 @@ async fn transcribe(
                         &id,
                         &configuration,
                         &input,
+                        settings.chunk_seconds,
                         chunks.len() as u64,
                     )?;
                     let mut parts = progress.parts().to_vec();

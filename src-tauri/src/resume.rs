@@ -26,6 +26,8 @@ pub struct CloudProgress {
     record_id: String,
     configuration: RecognitionConfig,
     source: Source,
+    #[serde(default)]
+    chunk_seconds: u32,
     total: u64,
     parts: Vec<String>,
 }
@@ -68,12 +70,14 @@ impl CloudProgress {
         record_id: &str,
         configuration: &RecognitionConfig,
         input: &Path,
+        chunk_seconds: u32,
         total: u64,
     ) -> Result<Self, String> {
         let source = source(input).ok_or("errors.audioMissing")?;
         if let Some(previous) = read(root, record_id) {
             if previous.configuration == *configuration
                 && previous.source == source
+                && previous.chunk_seconds == chunk_seconds
                 && previous.total == total
                 && still_valid(&previous)
             {
@@ -86,6 +90,7 @@ impl CloudProgress {
             record_id: record_id.into(),
             configuration: configuration.clone(),
             source,
+            chunk_seconds,
             total,
             parts: Vec::new(),
         })
@@ -163,7 +168,7 @@ mod tests {
         let root = root();
         let input = root.join("audio.wav");
         fs::write(&input, b"audio").unwrap();
-        let mut progress = CloudProgress::begin(&root, "rec", &config("a"), &input, 3).unwrap();
+        let mut progress = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3).unwrap();
         assert!(progress.parts().is_empty());
         progress.commit(&root, "one".into()).unwrap();
         progress.commit(&root, "two".into()).unwrap();
@@ -171,29 +176,35 @@ mod tests {
             resumable(&root, "rec").unwrap(),
             serde_json::json!({"done":2,"total":3,"configuration":config("a")})
         );
-        let again = CloudProgress::begin(&root, "rec", &config("a"), &input, 3).unwrap();
+        let again = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3).unwrap();
         assert_eq!(again.parts(), ["one", "two"]);
         // A different chunk count means different boundaries.
-        assert!(CloudProgress::begin(&root, "rec", &config("a"), &input, 4)
-            .unwrap()
-            .parts()
-            .is_empty());
+        assert!(
+            CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 4)
+                .unwrap()
+                .parts()
+                .is_empty()
+        );
         assert!(resumable(&root, "rec").is_none());
-        let mut progress = CloudProgress::begin(&root, "rec", &config("a"), &input, 3).unwrap();
+        let mut progress = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3).unwrap();
         progress.commit(&root, "one".into()).unwrap();
-        assert!(CloudProgress::begin(&root, "rec", &config("b"), &input, 3)
-            .unwrap()
-            .parts()
-            .is_empty());
-        let mut progress = CloudProgress::begin(&root, "rec", &config("a"), &input, 3).unwrap();
+        assert!(
+            CloudProgress::begin(&root, "rec", &config("b"), &input, 30, 3)
+                .unwrap()
+                .parts()
+                .is_empty()
+        );
+        let mut progress = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3).unwrap();
         progress.commit(&root, "one".into()).unwrap();
         fs::write(&input, b"changed audio").unwrap();
         assert!(resumable(&root, "rec").is_none());
-        assert!(CloudProgress::begin(&root, "rec", &config("a"), &input, 3)
-            .unwrap()
-            .parts()
-            .is_empty());
-        let mut progress = CloudProgress::begin(&root, "rec", &config("a"), &input, 3).unwrap();
+        assert!(
+            CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3)
+                .unwrap()
+                .parts()
+                .is_empty()
+        );
+        let mut progress = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3).unwrap();
         progress.commit(&root, "one".into()).unwrap();
         remove_all(&root);
         assert!(!path(&root, "rec").exists());

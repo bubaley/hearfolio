@@ -272,13 +272,14 @@ impl Resampler {
 struct ChunkWriter<'a> {
     destination: &'a Path,
     rate: u32,
+    seconds: u32,
     writer: Option<hound::WavWriter<std::io::BufWriter<fs::File>>>,
     in_chunk: u64,
     chunks: Vec<PathBuf>,
 }
 impl ChunkWriter<'_> {
     fn push(&mut self, value: f32) -> Result<(), String> {
-        if self.in_chunk == self.rate as u64 * 30 {
+        if self.in_chunk == self.rate as u64 * u64::from(self.seconds) {
             if let Some(writer) = self.writer.take() {
                 writer
                     .finalize()
@@ -326,12 +327,13 @@ impl ChunkWriter<'_> {
 }
 
 // Each decoded packet is bounded by the codec. Mono PCM is resampled to at
-// most 16 kHz and written directly to disk in 30-second pieces; an hour-long
+// most 16 kHz and written directly to disk in `seconds`-long pieces; an hour-long
 // recording never becomes an hour-long memory buffer. A corrupt packet is
 // skipped (as players do) instead of discarding the whole recording.
 pub fn prepare_cloud_chunks(
     input: &Path,
     destination: &Path,
+    seconds: u32,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<Vec<PathBuf>, String> {
     let mut probed = probe(input)?;
@@ -384,6 +386,7 @@ pub fn prepare_cloud_chunks(
                 ChunkWriter {
                     destination,
                     rate,
+                    seconds: seconds.max(1),
                     writer: None,
                     in_chunk: 0,
                     chunks: Vec::new(),
@@ -455,7 +458,7 @@ mod tests {
             writer.write_sample::<i16>(3000).unwrap();
         }
         writer.finalize().unwrap();
-        let chunks = prepare_cloud_chunks(&input, &dir, |_, _| {}).unwrap();
+        let chunks = prepare_cloud_chunks(&input, &dir, 30, |_, _| {}).unwrap();
         assert_eq!(chunks.len(), 2);
         let mut first = hound::WavReader::open(&chunks[0]).unwrap();
         assert_eq!(first.spec().channels, 1);
@@ -464,6 +467,15 @@ mod tests {
         assert_eq!(
             hound::WavReader::open(&chunks[1]).unwrap().duration(),
             16000
+        );
+        // The configured length decides the boundaries: 31 s fits one 60 s piece.
+        let longer = dir.join("longer");
+        fs::create_dir_all(&longer).unwrap();
+        let single = prepare_cloud_chunks(&input, &longer, 60, |_, _| {}).unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(
+            hound::WavReader::open(&single[0]).unwrap().duration(),
+            16000 * 31
         );
         assert_eq!(detect_extension(&input).unwrap(), "wav");
         fs::remove_dir_all(dir).unwrap();
@@ -511,7 +523,7 @@ mod tests {
         writer.finalize().unwrap();
         assert_eq!(duration(&input), Some(0.5));
         assert_eq!(detect_extension(&input).unwrap(), "wav");
-        let chunks = prepare_cloud_chunks(&input, &dir, |_, _| {}).unwrap();
+        let chunks = prepare_cloud_chunks(&input, &dir, 30, |_, _| {}).unwrap();
         let mut decoded = hound::WavReader::open(&chunks[0]).unwrap();
         // 48 kHz sources are uploaded at 16 kHz with the same duration.
         assert_eq!(decoded.spec().sample_rate, 16000);
@@ -572,7 +584,7 @@ mod tests {
         let dir = fixture();
         let input = dir.join("not-audio.m4a");
         fs::write(&input, "not audio").unwrap();
-        assert!(prepare_cloud_chunks(&input, &dir, |_, _| {})
+        assert!(prepare_cloud_chunks(&input, &dir, 30, |_, _| {})
             .unwrap_err()
             .starts_with("errors.audioDecodeUnsupported"));
         fs::remove_dir_all(dir).unwrap();
@@ -587,7 +599,7 @@ mod tests {
             .unwrap_or(input);
         assert_eq!(detect_extension(&input).unwrap(), "m4a");
         assert!(duration(&input).unwrap() > 0.0);
-        let chunks = prepare_cloud_chunks(&input, &dir, |_, _| {}).unwrap();
+        let chunks = prepare_cloud_chunks(&input, &dir, 30, |_, _| {}).unwrap();
         let mut decoded = hound::WavReader::open(&chunks[0]).unwrap();
         assert_eq!(decoded.spec().channels, 1);
         assert!(decoded.duration() > 0);

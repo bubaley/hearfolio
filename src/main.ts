@@ -1,6 +1,8 @@
 import {recordNameParts, renamedRecordTitle} from './record-name';
 import {normalizeAudioCatalog, readAudioCatalog, saveAudioCatalog} from './cloud-catalog';
 import {RecorderEnvelope,NativeRecordingOrder,NativeRecorderClock,RecordingSnapshotPoll} from './recorder-meter';
+import {drawRecorder,readPalette,type RecorderPalette} from './recorder-canvas';
+import {Pacer} from './pacer';
 import {pauseAudioRecording, resumeAudioRecording, restoreNativeRecordingFlag, observePendingOperation, operationHandled, markOperationHandled} from './api';
 import type {OperationSnapshot} from './operation-recovery';
 import {transferSettingsHtml, devicesHtml, transferBarHtml, shareRecordingToDevice, bindTransfers, initializeTransfers, hasTransferDraft, discardTransferDraft, transferActivityLabel} from './transfers';
@@ -24,7 +26,7 @@ const models = [
 const app = document.querySelector<HTMLDivElement>('#app')!;
 let view:View='work', history:Entry[]=[], active:Entry|null=null, text='', busy=false, loading=true;
 let status='', isError=false, progress:Progress|null=null, resultSaved=false, search='', cloudLoading=false;
-let settings:Settings={language:'system',systemLanguage:currentLanguage(),openrouterUrl:'https://openrouter.ai/api/v1',hasToken:false,storageParent:'',storagePath:'',lastConfiguration:{provider:'local',model:'whisper-base',mode:'local'}};
+let settings:Settings={language:'system',systemLanguage:currentLanguage(),openrouterUrl:'https://openrouter.ai/api/v1',chunkSeconds:120,hasToken:false,storageParent:'',storagePath:'',lastConfiguration:{provider:'local',model:'whisper-base',mode:'local'}};
 let platform:RuntimeCapabilities=preview?{...previewCapabilities}:{os:'unknown',mobile:false,localRecognition:false,customStorage:false,nativeAudio:false,audioRecording:false};
 let applicationVersion='',updateChecking=false,updateChecked=false,updateError='',pendingUpdate:AppUpdate|null=null,androidRelease:AndroidRelease|null=null,updateInstalled=false,installedUpdateVersion='',lastNotifiedUpdate='',lastUpdateCheck=0;
 let configuration:RecognitionConfig={...settings.lastConfiguration};
@@ -52,9 +54,13 @@ const nativeRecorderClock=new NativeRecorderClock();
 const recordingSnapshotPoll=new RecordingSnapshotPoll();
 type NativeCapture={state:string;stateRevision?:number;path?:string;elapsedSeconds?:number;elapsedMillis?:number;level?:number;envelope?:number[];envelopeSequence?:number;envelopeIntervalMs?:number};
 function recordingMilliseconds(){return nativeRecordingMillis!==null?nativeRecorderClock.milliseconds(performance.now()):(nativeRecordingSeconds!==null?nativeRecordingSeconds*1000:recordingStarted?Math.max(0,(recordingPausedAt||Date.now())-recordingStarted-recordingPausedMillis):0);}
-function recorderRulerHtml(){const seconds=recordingMilliseconds()/1000,span=recorderEnvelope.size*recorderEnvelope.interval/1000;return Array.from({length:5},(_,index)=>{const time=seconds+(index-2)*span/2;return `<span>${time>=0?formatTime(time):''}</span>`;}).join('');}
-function recordingMeterHtml(){return `<div class="recorder-timeline" role="img" aria-label="${tr('Уровень микрофона')}"><div class="recorder-ruler" aria-hidden="true">${recorderRulerHtml()}</div><div class="recorder-wave"><div class="recorder-bars">${recorderEnvelope.levels().map(level=>`<i style="--level:${level}"></i>`).join('')}</div><div class="recorder-playhead" aria-hidden="true"></div></div></div>`;}
-function paintRecorderMeter(){const meter=document.querySelector('.recorder-bars');if(meter)meter.querySelectorAll<HTMLElement>('i').forEach((bar,index)=>bar.style.setProperty('--level',String(recorderEnvelope.levels()[index])));const ruler=document.querySelector('.recorder-ruler');if(ruler)ruler.innerHTML=recorderRulerHtml();const timer=document.querySelector('#recording-duration');if(timer)timer.textContent=recordingDuration();}
+let recorderPalette:RecorderPalette|null=null;
+function recordingMeterHtml(){return `<div class="recorder-timeline" role="img" aria-label="${tr('Уровень микрофона')}"><canvas class="recorder-canvas" aria-hidden="true"></canvas></div>`;}
+function paintRecorderMeter(){
+  const millis=recordingMilliseconds(),canvas=document.querySelector<HTMLCanvasElement>('.recorder-canvas');
+  if(canvas){recorderPalette??=readPalette(canvas);drawRecorder(canvas,recorderEnvelope.levels(),recorderEnvelope.newestMillis(),recorderEnvelope.interval,millis,recordingPhase!=='recording',recorderPalette);}
+  const timer=document.querySelector('#recording-duration'),label=recordingDuration(millis);if(timer&&timer.textContent!==label)timer.textContent=label;
+}
 function applyNativeCapture(p:NativeCapture){
   const sameSession=!p.path||p.path===nativeRecordingPath;
   const old=Boolean(['recording','paused'].includes(p.state)&&sameSession&&p.elapsedMillis!==undefined&&nativeRecordingMillis!==null&&p.elapsedMillis<nativeRecordingMillis);
@@ -62,17 +68,77 @@ function applyNativeCapture(p:NativeCapture){
   if(p.path&&p.path!==nativeRecordingPath){nativeRecordingPath=p.path;nativeRecordingMillis=null;nativeRecordingSeconds=null;nativeRecorderClock.reset();recorderEnvelope.reset();}
   if(p.elapsedMillis!==undefined){nativeRecordingMillis=p.elapsedMillis;nativeRecorderClock.synchronize(p.elapsedMillis,p.state,performance.now());}
   if(p.elapsedSeconds!==undefined)nativeRecordingSeconds=p.elapsedSeconds;
-  if(p.envelope&&p.envelopeSequence!==undefined&&p.path)recorderEnvelope.synchronize(p.envelope,p.envelopeSequence,p.path);
-  paintRecorderMeter();return true;
+  if(p.envelope&&p.envelopeSequence!==undefined&&p.path)recorderEnvelope.synchronize(p.envelope,p.envelopeSequence,p.path,p.envelopeIntervalMs||recorderEnvelope.interval);
+  requestFrames();return true;
 }
-function updateRecorderMeter(){
-  if(document.hidden||!['recording','paused'].includes(recordingPhase))return;
-  if(platform.os==='android'&&!preview){paintRecorderMeter();return;}
-  if(recordingPhase==='recording'&&recorderEnvelope.sample(recordingInputLevel(),performance.now(),true))paintRecorderMeter();
+// Desktop levels come from the WebView microphone; native capture delivers its own envelope.
+function sampleRecorderLevel(){
+  if(document.hidden||recordingPhase!=='recording'||(platform.os==='android'&&!preview))return;
+  recorderEnvelope.sample(recordingInputLevel(),performance.now(),true,recordingMilliseconds());
 }
-setInterval(updateRecorderMeter,125);
+setInterval(sampleRecorderLevel,recorderEnvelope.interval);
+
+// One animation loop paints everything that moves: the recorder, revealed text and progress.
+// A frame requested while the WebView was in the background may never arrive; ask again after a while.
+let frameRequestedAt=-1;
+function requestFrames(){const now=performance.now();if(frameRequestedAt>=0&&now-frameRequestedAt<500)return;frameRequestedAt=now;requestAnimationFrame(animate);}
+function animate(now:number){
+  frameRequestedAt=-1;let again=false;
+  if(['recording','paused','stopping'].includes(recordingPhase)){paintRecorderMeter();again=recordingPhase!=='stopping';}
+  if(revealing){paintReveal(now);again||=revealing;}
+  if(busy&&progress?.total){paintProgress(now);again=true;}
+  if(again&&!document.hidden)requestFrames();
+}
+document.addEventListener('visibilitychange',()=>{if(document.hidden)return;if(revealing)textPacer.hurry(900);requestFrames();});
+
+// Text arrives a segment at a time; reveal it at the pace segments arrive so it flows without pauses.
+const textPacer=new Pacer('reveal');
+let revealing=false,revealRecord='';
+function shownText():string {
+  if(!revealing||revealRecord!==active?.id)return text;
+  let end=Math.min(text.length,Math.floor(textPacer.value));
+  const code=text.charCodeAt(end-1);if(code>=0xd800&&code<0xdc00)end--;
+  return text.slice(0,end);
+}
+function startReveal(from=0){textPacer.reset(from,performance.now());revealing=true;revealRecord=active?.id||'';requestFrames();}
+function feedReveal(){if(!revealing)return;textPacer.set(text.length,performance.now());requestFrames();}
+function finishReveal(){if(!revealing)return;const now=performance.now();textPacer.set(text.length,now);textPacer.finish(now);requestFrames();}
+function stopReveal(){revealing=false;}
+function paintReveal(now:number){
+  if(revealRecord!==active?.id){revealing=false;return;}
+  const before=Math.floor(textPacer.value);textPacer.frame(now);
+  if(textPacer.finished)revealing=false;
+  if(Math.floor(textPacer.value)===before&&revealing)return;
+  const article=document.querySelector('#transcript-text'),result=document.querySelector<HTMLElement>('#result');
+  if(!article){if(shownText())paintPartial();return;}
+  const follow=Boolean(result&&result.scrollHeight-result.scrollTop-result.clientHeight<90);
+  article.textContent=shownText();if(follow&&result)result.scrollTop=result.scrollHeight;
+}
+
+// Progress arrives in steps (segment i of n); predict motion inside the current step without claiming it.
+const progressPacer=new Pacer('predict');
+let progressKey='';
+function feedProgress(){
+  if(!progress?.total)return;
+  const key=`${progress.kind}:${progress.total}`,percent=Math.min(100,progress.current/progress.total*100),now=performance.now();
+  // Few large steps (segments) are predicted; byte counts are already fine-grained.
+  const step=progress.total<=1000?100/progress.total:undefined;
+  if(key!==progressKey){progressKey=key;progressPacer.reset(percent,now);if(progress.kind==='transcribe')progressPacer.expect((settings.chunkSeconds||120)*350);}
+  progressPacer.set(percent,now,step);requestFrames();
+}
+function smoothPercent():number|null {return progress?.total?Math.min(99,progressPacer.value):null;}
+function paintProgress(now:number){
+  progressPacer.frame(now);
+  const value=smoothPercent();if(value===null)return;
+  const whole=`${Math.floor(value)}%`;
+  document.querySelectorAll<HTMLElement>('#progress .track i').forEach(bar=>{bar.style.width=`${value.toFixed(2)}%`;});
+  document.querySelectorAll('#progress .progress-percent').forEach(label=>{if(label.textContent!==whole)label.textContent=whole;});
+  document.querySelector<HTMLElement>('.stage-wave')?.style.setProperty('--progress',`${value.toFixed(2)}%`);
+  document.querySelectorAll('.record-state.live').forEach(chip=>{const next=`<i aria-hidden="true"></i>${whole}`;if(chip.innerHTML!==next)chip.innerHTML=next;});
+  const banner=document.querySelector('.job-banner small'),stage=progress?`${progress.stage} · ${whole}`:'';if(banner&&banner.textContent!==stage)banner.textContent=stage;
+}
 let recordingPausedAt=0,recordingPausedMillis=0;
-const recordingDuration=()=>{const millis=recordingMilliseconds();return `${String(Math.floor(millis/60000)).padStart(2,'0')}:${String(Math.floor(millis/1000)%60).padStart(2,'0')}.${String(Math.floor(millis/10)%100).padStart(2,'0')}`;};
+const recordingDuration=(millis=recordingMilliseconds())=>{return `${String(Math.floor(millis/60000)).padStart(2,'0')}:${String(Math.floor(millis/1000)%60).padStart(2,'0')}.${String(Math.floor(millis/10)%100).padStart(2,'0')}`;};
 document.documentElement.dataset.theme=theme;
 const title:Record<View,string>={work:"Запись",history:"Записи",models:"Модели",settings:"Настройки",devices:"Устройства",rules:"Правила обработки"};
 const formatTime=(seconds:number)=>`${Math.floor(seconds/60)}:${String(Math.floor(seconds)%60).padStart(2,'0')}`;
@@ -110,16 +176,16 @@ function updateNotice() {
 }
 function beginOperation(kind:Progress['kind'],stage:string) {
   if(noticeTimer){clearTimeout(noticeTimer);noticeTimer=null;}
-  busy=true;status='';operationStarted=Date.now();progress={kind,stage,current:0,total:0,elapsed:0};
+  busy=true;status='';operationStarted=Date.now();progress={kind,stage,current:0,total:0,elapsed:0};progressKey='';progressPacer.reset(0,performance.now());
   if (elapsedTimer) clearInterval(elapsedTimer);
   elapsedTimer=setInterval(()=>{if(progress){progress.elapsed=Math.max(progress.elapsed,Math.floor((Date.now()-operationStarted)/1000));updateProgress();}},1000);
 }
 function endOperation() {busy=false;progress=null;nativeOperation=null;operationCancelling=false;if(elapsedTimer)clearInterval(elapsedTimer);elapsedTimer=null;}
 function progressBodyHtml():string {
-  const p=progress!,percent=p.total?Math.min(100,Math.floor(p.current/p.total*100)):null;
+  const p=progress!,smooth=smoothPercent(),percent=smooth===null?null:Math.floor(smooth);
   const remaining=p.elapsed>0&&p.current>0&&p.total>p.current?Math.ceil((p.total-p.current)/(p.current/p.elapsed)):0;
   const amount=(p.kind==='download'||p.kind==='update')&&p.total?`${(p.current/1048576).toFixed(1)} / ${(p.total/1048576).toFixed(1)}${tr(" МБ · ")}`:'';
-  return `<div class="progress-label"><strong>${esc(p.stage)}</strong><span class="progress-percent">${percent===null?'':`${percent}%`}</span></div><div class="track ${percent===null?'indeterminate':''}"><i style="width:${percent??25}%"></i></div><div class="progress-detail"><span>${amount}${tr("Прошло ")}${formatTime(p.elapsed)}</span><span>${remaining?`${tr("Осталось около ")}${formatTime(remaining)}`:''}</span></div>`;
+  return `<div class="progress-label"><strong>${esc(p.stage)}</strong><span class="progress-percent">${percent===null?'':`${percent}%`}</span></div><div class="track ${percent===null?'indeterminate':''}"><i style="width:${smooth===null?25:smooth.toFixed(2)}%"></i></div><div class="progress-detail"><span>${amount}${tr("Прошло ")}${formatTime(p.elapsed)}</span><span>${remaining?`${tr("Осталось около ")}${formatTime(remaining)}`:''}</span></div>`;
 }
 const cancelKey=()=>`${nativeOperation?.state||''}:${operationCancelling}`;
 function cancelHtml():string {return nativeOperation?.state==='running'?`<button type="button" class="secondary" id="cancel-operation" ${operationCancelling?'disabled':''}>${tr(operationCancelling?'Отменяем…':'Отменить')}</button>`:'';}
@@ -147,7 +213,7 @@ function groupLabel(timestamp:number) {
 }
 const displayName=(entry:Entry)=>recordNameParts(entry.name,entry.inputPath).title||entry.name;
 const sizeLabel=(bytes:number)=>`${(bytes/1048576).toFixed(bytes<10485760?1:0)}${tr(" МБ")}`;
-const progressPercent=()=>progress?.total?Math.min(99,Math.floor(progress.current/progress.total*100)):null;
+const progressPercent=()=>{const value=smoothPercent();return value===null?null:Math.floor(value);};
 const jobRecord=()=>busy&&progress&&(progress.kind==='transcribe'||progress.kind==='postprocess')?active?.id||null:null;
 // Deterministic bar heights give each recording a recognisable silhouette in the brand's five-bar style.
 function waveBars(seed:string,count:number):number[] {
@@ -202,7 +268,8 @@ function stageHtml():string {
 function outputHtml():string {
   if(recordingPhase!=='idle'||!active)return captureHtml();
   if(outputTab==='results')return resultsHtml();
-  if (text) return `<article class="transcript" lang="${esc(currentLanguage())}">${esc(text)}</article>`;
+  const visible=shownText();
+  if (visible) return `<article class="transcript" id="transcript-text" lang="${esc(currentLanguage())}">${esc(visible)}</article>`;
   return stageHtml();
 }
 function resultMeta():string {return busy&&progress?.kind==='transcribe'?tr("Расшифровываем…"):text?`${countLabel(words(),'word')}${resultSaved?'':tr(" · не сохранено")}`:tr("Без текста");}
@@ -374,6 +441,7 @@ function render() {
   // Re-use the playing <audio> element so unrelated re-renders never interrupt playback.
   const slot=document.querySelector<HTMLAudioElement>('#audio');let reused=false;
   if(kept&&slot&&kept.getAttribute('src')===slot.getAttribute('src')){slot.replaceWith(kept);reused=true;}
+  recorderPalette=null;requestFrames();
   bind();updateNotice();if(!reused)restorePlayback();if(view==='work'&&active&&platform.mobile&&recordingPhase==='idle')void ensureNativePlayer();else stopPlayerPolling();
 }
 function restorePlayback() {
@@ -515,12 +583,12 @@ async function applySettings():Promise<boolean> {
   const form=document.querySelector<HTMLFormElement>('#settings-form');if(!form||!form.reportValidity())return false;
   const draft=readSettingsDraft(form),connectionChanged=draft.url.trim()!==settings.openrouterUrl||Boolean(draft.token.trim());
   settingsDraft=draft;settingsSaving=true;settingsError='';render();
-  const saved=await persist(draft.token.trim()||undefined,{language:draft.language,openrouterUrl:draft.url.trim()});
+  const saved=await persist(draft.token.trim()||undefined,{language:draft.language,openrouterUrl:draft.url.trim(),chunkSeconds:draft.chunkSeconds});
   settingsSaving=false;
   if(!saved){settingsError=settingsLabel('Настройки не сохранены. Ваши изменения остаются здесь; попробуйте ещё раз.','Settings were not saved. Your changes are still here; try again.');render();return false;}
   settingsDraft=null;if(connectionChanged){cloudModels=readAudioCatalog(localStorage,settings.openrouterUrl);catalogError='';void loadCloudModels();}render();notice(tr("Настройки применены"));return true;
 }
-async function persist(token?:string,snapshot:{language:LanguagePreference;openrouterUrl:string}={language:settings.language,openrouterUrl:settings.openrouterUrl}):Promise<boolean> {
+async function persist(token?:string,snapshot:{language:LanguagePreference;openrouterUrl:string;chunkSeconds?:number}={language:settings.language,openrouterUrl:settings.openrouterUrl,chunkSeconds:settings.chunkSeconds}):Promise<boolean> {
   const operation=settingsSaveQueue.then(async()=>{try{settings=await call<Settings>('save_settings',{settings:snapshot,...(token!==undefined?{token}:{})});applyLanguagePreference();return true;}catch(error){notice(`${tr("Не удалось применить настройки: ")}${errorText(error)}`,true);return false;}});
   settingsSaveQueue=operation;return operation;
 }
@@ -778,16 +846,16 @@ async function run() {
   const id=active.id,beforeAttempt={text,saved:resultSaved};
   if(text&&resultSaved)previousResult={text,saved:true};
   receivedPartial=false;outputTab='transcript';
-  beginOperation('transcribe',tr("Подготавливаем запись"));render();
+  beginOperation('transcribe',tr("Подготавливаем запись"));startReveal(0);render();
   try {
     await settingsSaveQueue;await configurationSaveQueue;
-    text=await call<string>('transcribe',{id,configuration:{...configuration}});
+    text=await call<string>('transcribe',{id,configuration:{...configuration}});finishReveal();
     const detail=await call<{entry:Entry;text:string;warning?:string|null}>('get_history',{id});active=detail.entry;resultSaved=Boolean(detail.entry.outputPath&&detail.text);previousResult=null;
     settings=await call<Settings>('get_settings');
     history=sortHistory(await call<Entry[]>('list_history'));resume=null;
   } catch(error) {
     void refreshResume(id);
-    if(!receivedPartial){text=beforeAttempt.text;resultSaved=beforeAttempt.saved;if(resultSaved)previousResult=null;}
+    if(!receivedPartial){text=beforeAttempt.text;resultSaved=beforeAttempt.saved;if(resultSaved)previousResult=null;stopReveal();}else finishReveal();
     status=`${tr("Не удалось завершить распознавание: ")}${errorText(error)}`;isError=true;
   } finally {ensureRules();try{settings=await call<Settings>('get_settings');}catch{/* Keep known defaults when settings cannot be refreshed. */}endOperation();render();}
 }
@@ -825,7 +893,7 @@ void initializeTransfers({refresh:refreshAfterTransfer,busy:()=>busy,setBusy:val
 subscribe<null>('hearfolio-request-restart',()=>{void restartAfterUpdate(false);}).catch(error=>notice(errorText(error),true));
 setInterval(()=>{if(!preview&&Date.now()-lastUpdateCheck>=4*60*60*1000)void checkUpdates();},4*60*60*1000);
 document.addEventListener('visibilitychange',()=>{if(!preview&&document.visibilityState==='visible'&&Date.now()-lastUpdateCheck>=4*60*60*1000)void checkUpdates();});
-subscribe<Progress>('task-progress',payload=>{if(!busy||!progress||payload.kind!==progress.kind)return;progress={...payload,stage:errorText(payload.stage),elapsed:Math.max(payload.elapsed,Math.floor((Date.now()-operationStarted)/1000))};updateProgress();}).catch(error=>notice(errorText(error),true));
+subscribe<Progress>('task-progress',payload=>{if(!busy||!progress||payload.kind!==progress.kind)return;progress={...payload,stage:errorText(payload.stage),elapsed:Math.max(payload.elapsed,Math.floor((Date.now()-operationStarted)/1000))};feedProgress();updateProgress();}).catch(error=>notice(errorText(error),true));
 function paintPartial(){
   const result=document.querySelector('#result');if(result){const follow=result.scrollHeight-result.scrollTop-result.clientHeight<90;result.innerHTML=outputHtml();if(follow)result.scrollTop=result.scrollHeight;}
   const meta=document.querySelector('#text-meta');if(meta)meta.innerHTML=recordMetaHtml();
@@ -834,7 +902,9 @@ subscribe<PartialTextEvent>('partial-text',payload=>{
   if(!busy||progress?.kind!=='transcribe'||!payload.text)return;
   if(payload.recordId&&payload.recordId!==active?.id)return;
   if(nativeOperation?.id&&payload.operationId&&payload.operationId!==nativeOperation.id)return;
-  if(!receivedPartial)void call<Settings>('get_settings').then(saved=>{settings=saved;}).catch(()=>{});receivedPartial=true;text=payload.text;resultSaved=false;paintPartial();
+  if(!receivedPartial)void call<Settings>('get_settings').then(saved=>{settings=saved;}).catch(()=>{});receivedPartial=true;text=payload.text;resultSaved=false;
+  if(!revealing||revealRecord!==active?.id)startReveal(0);feedReveal();
+  const meta=document.querySelector('#text-meta');if(meta)meta.innerHTML=recordMetaHtml();
 }).catch(error=>notice(errorText(error),true));
 // Desktop runs the same cancellable operation guard; poll its id so the progress card can offer Cancel.
 setInterval(()=>{
@@ -926,14 +996,15 @@ async function consumeNativeOperation(snapshot:OperationSnapshot){
       try{
         if(snapshot.recordId){const detail=await call<{entry:Entry;text:string}>('get_history',{id:snapshot.recordId});resetPlayback();active=detail.entry;restoreConfiguration(active);text=detail.text;resultSaved=Boolean(active.outputPath&&detail.text);}
         if(snapshot.partial){text=snapshot.partial;resultSaved=false;receivedPartial=true;}
+        if(snapshot.kind==='transcribe')startReveal(text.length);
         beginOperation(snapshot.kind,errorText(snapshot.progress?.stage||`progress.${snapshot.kind}`));
         view='work';outputTab=snapshot.kind==='postprocess'?'results':'transcript';
         restorePostprocessActivity(snapshot.recordId||null,snapshot.kind==='postprocess');
         render();
       }catch(error){nativeOperation=null;notice(errorText(error),true);}finally{recoveringOperation=false;}
     }
-    if(snapshot.progress){progress={...snapshot.progress,kind:snapshot.kind,stage:errorText(snapshot.progress.stage)};operationStarted=Date.now()-progress.elapsed*1000;}
-    if(snapshot.kind==='transcribe'&&snapshot.partial&&active?.id===snapshot.recordId&&snapshot.partial!==text){text=snapshot.partial;resultSaved=false;receivedPartial=true;paintPartial();}
+    if(snapshot.progress){progress={...snapshot.progress,kind:snapshot.kind,stage:errorText(snapshot.progress.stage)};operationStarted=Date.now()-progress.elapsed*1000;feedProgress();}
+    if(snapshot.kind==='transcribe'&&snapshot.partial&&active?.id===snapshot.recordId&&snapshot.partial!==text){text=snapshot.partial;resultSaved=false;receivedPartial=true;if(!revealing)startReveal(0);feedReveal();}
     updateProgress();return;
   }
   // A newly opened WebView has no pending invoke. Read the already committed
@@ -943,6 +1014,7 @@ async function consumeNativeOperation(snapshot:OperationSnapshot){
   try{
     const imported=snapshot.kind==='import'&&snapshot.state==='finished'?snapshot.result as Entry:null;
     const id=imported?.id||snapshot.recordId;
+    stopReveal();
     if(id){const detail=await call<{entry:Entry;text:string}>('get_history',{id});resetPlayback();active=detail.entry;restoreConfiguration(active);text=detail.text;resultSaved=Boolean(active.outputPath&&detail.text);previousResult=null;view='work';outputTab=snapshot.kind==='postprocess'?'results':'transcript';}
     if(imported)pendingRecording=null;
     restorePostprocessActivity(null,false);endOperation();

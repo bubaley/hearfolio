@@ -272,15 +272,8 @@ button.brand:disabled { opacity: 1; }
 .recorder-paused .recorder-dot, .recorder-busy .recorder-dot { animation: none; }
 .recording-duration { margin: 18px 0 26px; font-size: clamp(48px, 9vw, 76px); font-weight: 300; letter-spacing: -.04em; line-height: 1; font-variant-numeric: tabular-nums; }
 .recorder-timeline { width: 100%; }
-.recorder-ruler { display: flex; justify-content: space-between; height: 22px; color: var(--faint); font-size: 10px; font-variant-numeric: tabular-nums; }
-.recorder-ruler span { width: 44px; text-align: center; }
-.recorder-ruler span:first-child { text-align: left; }
-.recorder-ruler span:last-child { text-align: right; }
-.recorder-wave { position: relative; height: 140px; border-radius: var(--radius-m); background: var(--subtle); overflow: hidden; }
-.recorder-bars { position: absolute; inset: 14px 50% 14px 12px; display: flex; align-items: center; gap: 2px; }
-.recorder-bars i { flex: 1; min-width: 1px; height: calc(2px + var(--level, 0) * 100%); border-radius: 2px; background: var(--ink); opacity: .85; }
-.recorder-playhead { position: absolute; left: 50%; top: 10px; bottom: 10px; width: 2px; border-radius: 2px; background: var(--live); }
-.recorder-paused .recorder-playhead { background: var(--faint); }
+.recorder-canvas { display: block; width: 100%; height: 176px; border-radius: var(--radius-m); background: var(--subtle); }
+.mobile-platform .recorder-canvas { height: 150px; }
 .recorder-actions { display: flex; align-items: center; justify-content: center; gap: 28px; margin-top: 32px; }
 .round-button { width: 52px; height: 52px; border-radius: 50%; background: var(--hover); color: var(--text); }
 .round-button:hover:not(:disabled) { background: var(--selected); }
@@ -479,7 +472,6 @@ html.qr-scanning #app { visibility: hidden; }
 .mobile-platform .run-button { min-height: 52px; font-size: 16px; }
 .mobile-platform .welcome h1 { font-size: 24px; }
 .mobile-platform .recorder { padding: 16px 20px calc(24px + env(safe-area-inset-bottom)); }
-.mobile-platform .recorder-wave { height: 120px; }
 .mobile-platform .recording-duration { font-size: 60px; }
 .mobile-platform .round-button { width: 60px; height: 60px; }
 .mobile-platform .record-orb.recording { width: 84px; height: 84px; }

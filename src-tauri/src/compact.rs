@@ -344,7 +344,7 @@ mod tests {
         assert!(fs::metadata(&output).unwrap().len() < fs::metadata(&source).unwrap().len());
         assert!(archived_matches(&source, &output).unwrap());
         // Lossless: decoded chunks equal the source PCM sample for sample.
-        let chunks = crate::audio::prepare_cloud_chunks(&output, &dir, |_, _| {}).unwrap();
+        let chunks = crate::audio::prepare_cloud_chunks(&output, &dir, 30, |_, _| {}).unwrap();
         assert_eq!(chunks.len(), 2);
         let mut first = hound::WavReader::open(&chunks[0]).unwrap();
         assert_eq!(first.spec().sample_rate, 16000);
@@ -387,7 +387,7 @@ mod tests {
         // About 48 kbps: 40 s is roughly 240 KB instead of 1.28 MB of PCM.
         assert!(size < 300_000, "unexpected AAC size {size}");
         assert!(archived_matches(&source, &output).unwrap());
-        let chunks = crate::audio::prepare_cloud_chunks(&output, &dir, |_, _| {}).unwrap();
+        let chunks = crate::audio::prepare_cloud_chunks(&output, &dir, 30, |_, _| {}).unwrap();
         assert_eq!(chunks.len(), 2);
         let first = hound::WavReader::open(&chunks[0]).unwrap();
         assert_eq!(first.spec().sample_rate, 16000);
