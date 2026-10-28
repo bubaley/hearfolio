@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.0 (2026-10-28)
+
+### Features
+
+- archive screen to recover, retry and export unprocessed recordings ([04f3f29](https://github.com/bubaley/hearfolio/commit/04f3f29d93a383b635bc668e62ce23fdd611e4f7))
+
 ## 0.9.0 (2026-10-22)
 
 ### Features
