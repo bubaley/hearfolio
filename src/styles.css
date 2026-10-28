@@ -584,3 +584,26 @@ dialog form {display:grid;gap:12px;min-width:240px;}
 .devices-list button:focus-visible {outline-offset:-2px}
 
 .inline-error {color:var(--error);font-size:12px;margin-top:8px}
+
+/* Archive: every recording with its processing state; unprocessed audio first */
+.nav-item .nav-badge { margin-left: auto; }
+.nav-badge { min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--error); color: #fff; font-size: 11px; font-weight: 600; line-height: 18px; text-align: center; font-variant-numeric: tabular-nums; }
+.badge-host { position: relative; }
+.badge-host .nav-badge { position: absolute; top: -2px; right: -4px; min-width: 16px; height: 16px; line-height: 16px; font-size: 10px; padding: 0 4px; }
+.archive-section { margin-bottom: 28px; }
+.archive-section h2 { font-size: 13px; font-weight: 600; color: var(--muted); margin-bottom: 10px; }
+.archive-section h2 small { color: var(--faint); font-weight: 500; margin-left: 4px; }
+.archive-hint { color: var(--muted); font-size: 13px; line-height: 1.5; margin-bottom: 12px; }
+.archive-item { display: flex; flex-direction: column; gap: 12px; padding: 14px 16px; border: 1px solid var(--line); border-radius: var(--radius-m); margin-bottom: 8px; }
+.archive-item-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.archive-item-title { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.archive-item-title strong { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archive-meta { display: flex; flex-wrap: wrap; gap: 4px 10px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.archive-status { flex: none; display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 550; color: var(--faint); }
+.archive-status.done { color: var(--done); }
+.archive-status.failed { color: var(--error); }
+.archive-status.done::before, .archive-status.failed::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.archive-item-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.archive-item-actions button:not(.icon-button) { height: 32px; padding: 0 12px; gap: 6px; font-size: 13px; }
+.archive-item-actions svg { width: 15px; height: 15px; }
+.archive-item-actions .danger { margin-left: auto; color: var(--error); }

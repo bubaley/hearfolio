@@ -27,6 +27,7 @@ const paths: Record<string, string> = {
   cloud: 'M6 18a5 5 0 0 1-1-10 7 7 0 0 1 13-1 5.5 5.5 0 0 1 0 11H6',
   pause: 'M8 5v14M16 5v14',
   play: 'm9 5 11 7-11 7V5',
+  archive: 'M3 4h18v4H3zM5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8m-9 4h4',
 };
 export function icon(name: string): string {
   return `<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><path d="${paths[name] || paths.file}"/></svg>`;

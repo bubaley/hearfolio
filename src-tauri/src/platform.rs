@@ -251,45 +251,48 @@ pub async fn save_audio(app: AppHandle, id: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
         let (source, name) = tracked_audio(&id)?;
-        #[cfg(target_os = "android")]
-        return android(
-            &app,
-            "saveAudio",
-            serde_json::json!({"path":source,"name":name}),
-        );
-        #[cfg(not(target_os = "android"))]
-        {
-            let extension = source
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .unwrap_or("wav");
-            let name = Path::new(&name)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("Recording");
-            let name = if name.to_lowercase().ends_with(&format!(".{extension}")) {
-                name.to_owned()
-            } else {
-                format!("{name}.{extension}")
-            };
-            let Some(target) = app.dialog().file().set_file_name(name).blocking_save_file() else {
-                return Ok(());
-            };
-            let mut options = tauri_plugin_fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            let mut target = app
-                .fs()
-                .open(target, options)
-                .map_err(|_| "errors.exportWrite")?;
-            let mut source = fs::File::open(source).map_err(|_| "errors.audioRead")?;
-            std::io::copy(&mut source, &mut target)
-                .and_then(|_| target.flush())
-                .map_err(|_| "errors.exportWrite")?;
-            Ok(())
-        }
+        save_copy(&app, &source, &name)
     })
     .await
     .map_err(|_| "errors.exportWrite")?
+}
+fn save_copy(app: &AppHandle, source: &Path, name: &str) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    return android(
+        app,
+        "saveAudio",
+        serde_json::json!({"path":source,"name":name}),
+    );
+    #[cfg(not(target_os = "android"))]
+    {
+        let extension = source
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("wav");
+        let name = Path::new(name)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Recording");
+        let name = if name.to_lowercase().ends_with(&format!(".{extension}")) {
+            name.to_owned()
+        } else {
+            format!("{name}.{extension}")
+        };
+        let Some(target) = app.dialog().file().set_file_name(name).blocking_save_file() else {
+            return Ok(());
+        };
+        let mut options = tauri_plugin_fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        let mut target = app
+            .fs()
+            .open(target, options)
+            .map_err(|_| "errors.exportWrite")?;
+        let mut source = fs::File::open(source).map_err(|_| "errors.audioRead")?;
+        std::io::copy(&mut source, &mut target)
+            .and_then(|_| target.flush())
+            .map_err(|_| "errors.exportWrite")?;
+        Ok(())
+    }
 }
 #[tauri::command]
 pub async fn share_audio(app: AppHandle, id: String) -> Result<(), String> {
@@ -307,6 +310,32 @@ pub async fn share_audio(app: AppHandle, id: String) -> Result<(), String> {
     .map_err(|_| "errors.audioShare")?;
     #[cfg(not(target_os = "android"))]
     save_audio(app, id).await
+}
+/// Export for audio the archive never took in (see `list_loose_recordings`).
+#[tauri::command]
+pub async fn export_loose_recording(
+    app: AppHandle,
+    path: String,
+    name: String,
+    share: bool,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _job = crate::JobGuard::acquire()?;
+        let source = crate::recording::loose_recording(&app, &path)?;
+        #[cfg(target_os = "android")]
+        if share {
+            return android(
+                &app,
+                "shareAudio",
+                serde_json::json!({"path":source,"name":name}),
+            );
+        }
+        #[cfg(not(target_os = "android"))]
+        let _ = share;
+        save_copy(&app, &source, &name)
+    })
+    .await
+    .map_err(|_| "errors.exportWrite")?
 }
 #[tauri::command]
 pub async fn share_text(app: AppHandle, name: String, text: String) -> Result<(), String> {

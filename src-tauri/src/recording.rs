@@ -475,6 +475,134 @@ pub async fn recover_audio_recordings() -> Result<Vec<AudioSelection>, String> {
     .map_err(|_| "errors.recordingUnavailable".to_owned())?
 }
 
+/// Captured audio the archive never took in. A failed or interrupted import
+/// keeps the source in temp (or the quick-recording folder); after a restart
+/// nothing else lists it, so the archive screen offers retry and export.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LooseRecording {
+    path: String,
+    size_bytes: u64,
+    created_at: u64,
+    duration_seconds: Option<f64>,
+}
+
+fn loose_recording_paths(app: &tauri::AppHandle) -> Result<Vec<PathBuf>, String> {
+    let active = SESSION
+        .lock()
+        .map_err(|_| "errors.recordingUnavailable")?
+        .as_ref()
+        .map(|session| session.path.clone());
+    // The service may still be writing a file the WebView has not adopted yet.
+    #[cfg(target_os = "android")]
+    let active = {
+        let status: serde_json::Value = native_call(app, "recordingStatus", serde_json::json!({}))?;
+        let terminal = ["idle", "finished", "error", "cancelled"]
+            .contains(&status["state"].as_str().unwrap_or("idle"));
+        match status["path"].as_str() {
+            Some(path) if !terminal => Some(PathBuf::from(path)),
+            _ => active,
+        }
+    };
+    let archived: HashSet<String> = {
+        let _lock = crate::history_lock()?;
+        crate::read_history_at(&crate::base()?)?
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect()
+    };
+    let mut found = Vec::new();
+    for entry in fs::read_dir(crate::base()?.join("temp"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = entry.path();
+        // Compare names: Android reports /data/user/0 where temp may read /data/data.
+        let recording = active
+            .as_ref()
+            .is_some_and(|active| active.file_name() == path.file_name());
+        if recording || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if native_recording_id(&path).is_some_and(|id| !archived.contains(&id)) {
+            found.push(path);
+        }
+    }
+    #[cfg(target_os = "android")]
+    {
+        let pending: serde_json::Value = app
+            .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
+            .transfer("quickRecordings", serde_json::json!({}))?;
+        for path in pending["paths"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|path| path.as_str())
+        {
+            let path = PathBuf::from(path);
+            if quick_recording_id(&path).is_ok_and(|id| !archived.contains(&id)) {
+                found.push(path);
+            }
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = app;
+    Ok(found)
+}
+
+/// Accepts only a path the archive scan itself reported.
+pub(crate) fn loose_recording(app: &tauri::AppHandle, path: &str) -> Result<PathBuf, String> {
+    loose_recording_paths(app)?
+        .into_iter()
+        .find(|candidate| candidate == Path::new(path))
+        .ok_or_else(|| "errors.recordMissing".into())
+}
+
+#[tauri::command]
+pub async fn list_loose_recordings(app: tauri::AppHandle) -> Result<Vec<LooseRecording>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(loose_recording_paths(&app)?
+            .into_iter()
+            .filter_map(|path| {
+                let metadata = fs::metadata(&path).ok()?;
+                let created_at = metadata
+                    .modified()
+                    .ok()?
+                    .duration_since(UNIX_EPOCH)
+                    .ok()?
+                    .as_millis() as u64;
+                Some(LooseRecording {
+                    duration_seconds: crate::audio::duration(&path)
+                        .or_else(|| crate::platform::native_audio_duration(&app, &path)),
+                    path: path.to_string_lossy().into_owned(),
+                    size_bytes: metadata.len(),
+                    created_at,
+                })
+            })
+            .collect())
+    })
+    .await
+    .map_err(|_| "errors.recordingUnavailable".to_owned())?
+}
+
+/// Registers a loose recording as finished so `import_audio` compacts it,
+/// keeps it on failure and removes the source once archived.
+#[tauri::command]
+pub async fn adopt_loose_recording(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _job = JobGuard::acquire()?;
+        let path = loose_recording(&app, &path)?;
+        FINISHED
+            .lock()
+            .map_err(|_| "errors.recordingUnavailable")?
+            .insert(path);
+        Ok(())
+    })
+    .await
+    .map_err(|_| "errors.recordingUnavailable".to_owned())?
+}
+
 /// Recordings (not user imports) are compacted before archiving.
 pub(crate) fn is_recording_source(path: &Path) -> bool {
     FINISHED.lock().is_ok_and(|paths| paths.contains(path)) || quick_recording_id(path).is_ok()
@@ -945,6 +1073,38 @@ fn quick_recording_id(path: &Path) -> Result<String, String> {
         .ok_or("Invalid quick recording name")?;
     Ok(format!("hearing-quick-{uuid}"))
 }
+#[cfg(target_os = "android")]
+fn import_quick_recording(
+    app: &tauri::AppHandle,
+    path: &str,
+) -> Result<crate::records::HistoryEntry, String> {
+    let source = Path::new(path);
+    let id = quick_recording_id(source)?;
+    let existing = {
+        let _lock = crate::history_lock()?;
+        crate::read_history_at(&crate::base()?)?
+            .into_iter()
+            .find(|e| e.id == id)
+    };
+    let entry = if let Some(entry) = existing {
+        // Never discard the source if the archived copy is missing or damaged.
+        if !crate::compact::archived_matches(source, Path::new(&entry.input_path))? {
+            return Err("Archived quick recording differs; source preserved".into());
+        }
+        entry
+    } else {
+        let configuration = crate::cloud::load()?.last_configuration;
+        crate::import_audio_with_id(
+            app,
+            path.into(),
+            Some(format!("Recording-{}.wav", crate::clock())),
+            configuration,
+            Some(id),
+        )?
+    };
+    fs::remove_file(source).map_err(|e| format!("errors.audioRead|{e}"))?;
+    Ok(entry)
+}
 #[tauri::command]
 pub async fn import_quick_recordings(
     app: tauri::AppHandle,
@@ -958,40 +1118,24 @@ pub async fn import_quick_recordings(
                 .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
                 .transfer("quickRecordings", serde_json::json!({}))?;
             let mut imported = Vec::new();
+            let mut failure = None;
             for path in pending["paths"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter_map(|p| p.as_str())
             {
-                let source = Path::new(path);
-                let id = quick_recording_id(source)?;
-                let existing = {
-                    let _lock = crate::history_lock()?;
-                    crate::read_history_at(&crate::base()?)?
-                        .into_iter()
-                        .find(|e| e.id == id)
-                };
-                let entry = if let Some(entry) = existing {
-                    // Never discard the source if the archived copy is missing or damaged.
-                    if !crate::compact::archived_matches(source, Path::new(&entry.input_path))? {
-                        return Err("Archived quick recording differs; source preserved".into());
-                    }
-                    entry
-                } else {
-                    let configuration = crate::cloud::load()?.last_configuration;
-                    crate::import_audio_with_id(
-                        &app,
-                        path.into(),
-                        Some(format!("Recording-{}.wav", crate::clock())),
-                        configuration,
-                        Some(id),
-                    )?
-                };
-                fs::remove_file(source).map_err(|e| format!("errors.audioRead|{e}"))?;
-                imported.push(entry);
+                // One damaged file must not hold back the rest; it stays in
+                // the archive screen's unprocessed list for retry or export.
+                match import_quick_recording(&app, path) {
+                    Ok(entry) => imported.push(entry),
+                    Err(error) => failure = failure.or(Some(error)),
+                }
             }
-            Ok(imported)
+            match failure {
+                Some(error) if imported.is_empty() => Err(error),
+                _ => Ok(imported),
+            }
         })
         .await
         .map_err(|e| e.to_string())?

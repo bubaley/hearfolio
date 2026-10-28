@@ -96,6 +96,12 @@ async function invokeOperation<T>(command:string,args:Record<string,unknown>):Pr
   });
 }
 
+// Captured audio that never made it into the archive (failed or interrupted import).
+export type LooseRecording = {path:string;sizeBytes:number;createdAt:number;durationSeconds?:number|null};
+let previewLoose:LooseRecording[]=new URLSearchParams(window.location.search).get('loose')==='1'?[{path:'/preview/temp/hearfolio-recording-1.wav',sizeBytes:362_000_000,createdAt:Date.now()-3*3600_000,durationSeconds:3780}]:[];
+export const listLooseRecordings=()=>call<LooseRecording[]>('list_loose_recordings');
+export const adoptLooseRecording=(path:string)=>call<void>('adopt_loose_recording',{path});
+export const exportLooseRecording=(path:string,name:string,share:boolean)=>call<void>('export_loose_recording',{path,name,share});
 export async function call<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
   if (!preview) return invokeOperation<T>(command, args);
   let value: unknown;
@@ -104,6 +110,8 @@ export async function call<T>(command: string, args: Record<string, unknown> = {
     case 'acknowledge_operation':case 'cancel_background_operation':value=undefined;break;
     case 'cloud_resume_state':value=null;break;
     case 'import_quick_recordings':value=[];break;
+    case 'list_loose_recordings':value=previewLoose.map(item=>({...item}));break;
+    case 'adopt_loose_recording':case 'export_loose_recording':if(!previewLoose.some(item=>item.path===args.path))throw new Error('errors.recordMissing');break;
     case 'get_runtime_platform':value={...previewCapabilities};break;
     case 'get_latest_android_release':value=new URLSearchParams(window.location.search).get('update')==='available'?{version:'0.2.0',url:'https://github.com/bubaley/hearfolio/releases/latest'}:null;break;
     case 'runtime_status': value = {ffmpeg:true,whisper:true,nemo:false}; break;
@@ -162,7 +170,7 @@ export async function call<T>(command: string, args: Record<string, unknown> = {
     case 'import_audio': {
       const path = String(args.path); const selected = previewFiles.get(path);
       const entry: Entry = {id:crypto.randomUUID(),name:(args.name?String(args.name):'') || selected?.file.name || path.split('/').pop() || 'Recording.m4a',configuration:{...(args.configuration as RecognitionConfig || previewSettings.lastConfiguration)},inputPath:path,outputPath:null,model:null,createdAt:Date.now(),sizeBytes:selected?.file.size};
-      previewEntries.unshift(entry); value = {...entry}; break;
+      previewEntries.unshift(entry); previewLoose=previewLoose.filter(item=>item.path!==path); value = {...entry}; break;
     }
     case 'get_history': {
       const entry = previewEntries.find(entry => entry.id === args.id);

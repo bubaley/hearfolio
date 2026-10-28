@@ -207,6 +207,13 @@ const messages: Record<string,string> = {
   'Показать список':'Show list','Скрыть список':'Hide list','Предыдущий текст сохранён в архиве.':'The previous text is saved in the archive.',
   'Расшифровать заново':'Transcribe again','Расшифровать':'Transcribe','Расшифровываем…':'Transcribing…','Расшифровываем':'Transcribing',
   'Сделать выжимку':'Summarize','Сохраните запись, чтобы расшифровать её.':'Save the recording to transcribe it.','Текст':'Text','Удалить':'Delete','Файл':'File',
+  'Не обработаны':'Unprocessed','Не обработана':'Not processed','В архиве':'In archive','Расшифрована':'Transcribed','Открыть':'Open',
+  'Ищем необработанные записи…':'Looking for unprocessed recordings…',
+  'Все записи на этом устройстве и статус их обработки.':'Every recording on this device and its processing status.',
+  'Обработка этих записей не завершилась. Аудио сохранено: повторите обработку или выгрузите файл.':'Processing did not finish for these recordings. The audio is kept: retry or export the file.',
+  'Это аудио ещё не попало в архив. После удаления его нельзя будет восстановить.':'This audio is not in the archive yet. Once deleted, it cannot be recovered.',
+  'Не обработано записей:':'Unprocessed recordings:','Они в «Архиве».':'Find them in Archive.',
+  'Аудио сохранено в разделе «Архив».':'The audio is kept in Archive.',
   'выберите аудиофайл':'choose an audio file','выберите на диске':'choose one on disk','потоковый текст':'streaming text','файл целиком':'whole file',
 };
 const orderedMessages=Object.entries(messages).sort(([a],[b])=>b.length-a.length);
