@@ -344,14 +344,14 @@ mod tests {
         assert!(fs::metadata(&output).unwrap().len() < fs::metadata(&source).unwrap().len());
         assert!(archived_matches(&source, &output).unwrap());
         // Lossless: decoded chunks equal the source PCM sample for sample.
-        let chunks = crate::audio::prepare_cloud_chunks(&output, &dir, 30, |_, _| {}).unwrap();
+        let chunks = crate::audio::prepare_cloud_chunks(&output, &dir, 20, |_, _| {}).unwrap();
         assert_eq!(chunks.len(), 2);
         let mut first = hound::WavReader::open(&chunks[0]).unwrap();
         assert_eq!(first.spec().sample_rate, 16000);
-        assert_eq!(first.duration(), 16000 * 30);
+        assert_eq!(first.duration(), 16000 * 20);
         assert_eq!(
             hound::WavReader::open(&chunks[1]).unwrap().duration(),
-            16000 * 5
+            16000 * 15
         );
         let original: Vec<i16> = hound::WavReader::open(&source)
             .unwrap()

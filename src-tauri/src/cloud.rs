@@ -708,11 +708,16 @@ pub fn postprocess_text(
         .and_then(|header| header.to_str().ok())
         .is_some_and(|value| value.contains("text/event-stream"));
     if is_stream {
-        return consume_sse_lines(
+        let streamed = consume_sse_lines(
             cancellable_lines(BufReader::new(response.take(8 * 1024 * 1024))),
             &settings.token,
             update,
-        );
+        )?;
+        // A summary cut short is not a summary; the caller keeps nothing.
+        if streamed.truncated {
+            return Err("errors.cloudIncomplete".into());
+        }
+        return Ok(streamed.text);
     }
     let body = read_limited_response(response, 2 * 1024 * 1024)?;
     let value: serde_json::Value =
@@ -746,8 +751,13 @@ pub fn normalize_configuration(
         if s.token.is_empty() {
             return Err("errors.tokenRequired".into());
         }
-        let models = catalog(s)?;
-        normalize_from_models(configuration, &models)?;
+        // The catalog only refines routing. Its outage must not block a run
+        // with a model the user has already chosen.
+        match catalog(s) {
+            Ok(models) => normalize_from_models(configuration, &models)?,
+            Err(error) if error.starts_with("errors.catalog") => {}
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
@@ -762,22 +772,63 @@ fn normalize_from_models(
     configuration.mode = model.preferred_mode.clone();
     Ok(())
 }
+/// Text returned by one request. `truncated` means the model stopped before
+/// finishing (output limit or content filter): the text is real but incomplete.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Recognized {
+    pub text: String,
+    pub truncated: bool,
+}
+/// Output budget for `seconds` of audio. Fast speech is about ten tokens a
+/// second; four times that, plus room for a reasoning model's own thinking, is
+/// never reached by a real transcript. Without a budget the provider's own
+/// limit applies (tens of thousands of tokens), and a model that has started
+/// repeating itself runs for minutes of paid output before it is cut off.
+pub fn completion_budget(seconds: f64) -> u64 {
+    let seconds = if seconds.is_finite() {
+        seconds.max(0.0)
+    } else {
+        0.0
+    };
+    ((seconds * 40.0).ceil() as u64 + 4096).min(32_768)
+}
+/// Failures worth repeating the same request for: the network, the provider
+/// being overloaded or rate limiting, a response cut off in transit.
+pub fn transient(error: &str) -> bool {
+    let code = error.split('|').next().unwrap_or(error);
+    match code {
+        "errors.cloudConnect"
+        | "errors.cloudInterrupted"
+        | "errors.cloudResponseRead"
+        | "errors.cloudResponseInvalid"
+        | "errors.cloudStreamInvalid"
+        | "errors.cloudService" => true,
+        "errors.cloudHttp" => error
+            .split("HTTP ")
+            .nth(1)
+            .and_then(|rest| rest.get(..3))
+            .and_then(|status| status.parse::<u16>().ok())
+            .is_some_and(|status| matches!(status, 408 | 409 | 425 | 429 | 500..=599)),
+        _ => false,
+    }
+}
 #[cfg(test)]
 fn consume_sse(
     reader: impl BufRead,
     token: &str,
     update: impl FnMut(&str),
-) -> Result<String, String> {
+) -> Result<Recognized, String> {
     consume_sse_lines(reader.lines(), token, update)
 }
 fn consume_sse_lines(
     lines: impl Iterator<Item = std::io::Result<String>>,
     token: &str,
     mut update: impl FnMut(&str),
-) -> Result<String, String> {
+) -> Result<Recognized, String> {
     let mut text = String::new();
     let mut data = Vec::new();
     let mut done = false;
+    let mut truncated = false;
     let mut event = |data: &mut Vec<String>| -> Result<bool, String> {
         if data.is_empty() {
             return Ok(false);
@@ -798,15 +849,19 @@ fn consume_sse_lines(
         if value["choices"][0]["finish_reason"] == "error" {
             return Err("errors.cloudInterrupted".into());
         }
+        // The final event may carry both the last words and the finish reason.
+        if let Some(delta) = value["choices"][0]["delta"]["content"].as_str() {
+            if !delta.is_empty() {
+                text.push_str(delta);
+                update(&text);
+            }
+        }
         if matches!(
             value["choices"][0]["finish_reason"].as_str(),
             Some("length" | "content_filter")
         ) {
-            return Err("errors.cloudIncomplete".into());
-        }
-        if let Some(delta) = value["choices"][0]["delta"]["content"].as_str() {
-            text.push_str(delta);
-            update(&text);
+            truncated = true;
+            return Ok(true);
         }
         Ok(false)
     };
@@ -828,17 +883,23 @@ fn consume_sse_lines(
     if !done {
         return Err("errors.cloudInterrupted".into());
     }
-    if text.trim().is_empty() {
+    if text.trim().is_empty() && !truncated {
         return Err("errors.emptyTranscript".into());
     }
-    Ok(text.trim().into())
+    Ok(Recognized {
+        text: text.trim().into(),
+        truncated,
+    })
 }
+/// Sends one piece of audio (`seconds` long) and returns what the model wrote.
+/// Whether to retry, split or accept the result is decided by `cloud_job`.
 pub fn transcribe(
     s: &Settings,
     configuration: &RecognitionConfig,
     audio: &Path,
+    seconds: f64,
     mut update: impl FnMut(&str),
-) -> Result<String, String> {
+) -> Result<Recognized, String> {
     crate::background::check_current()?;
     if s.token.is_empty() {
         return Err("errors.tokenRequired".into());
@@ -884,9 +945,12 @@ pub fn transcribe(
             return Err("errors.emptyTranscript".into());
         }
         update(text);
-        return Ok(text.into());
+        return Ok(Recognized {
+            text: text.into(),
+            truncated: false,
+        });
     }
-    let body = serde_json::json!({"model":configuration.model,"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"Transcribe all speech in this audio accurately in its original language. Return only the transcript, without commentary, summaries, or invented content."},{"type":"input_audio","input_audio":{"data":data,"format":format}}]}]});
+    let body = serde_json::json!({"model":configuration.model,"stream":true,"max_tokens":completion_budget(seconds),"messages":[{"role":"user","content":[{"type":"text","text":"Transcribe all speech in this audio accurately in its original language. Return only the transcript, without commentary, summaries, or invented content."},{"type":"input_audio","input_audio":{"data":data,"format":format}}]}]});
     let request = client()?
         .post(format!("{}/chat/completions", s.openrouter_url))
         .bearer_auth(&s.token)
@@ -922,21 +986,22 @@ pub fn transcribe(
                 api_error(&body, &s.token)
             ));
         }
-        if matches!(
+        let truncated = matches!(
             v["choices"][0]["finish_reason"].as_str(),
             Some("length" | "content_filter")
-        ) {
-            return Err("errors.cloudIncomplete".into());
-        }
+        );
         let text = v["choices"][0]["message"]["content"]
             .as_str()
-            .ok_or("errors.emptyTranscript")?
+            .unwrap_or("")
             .trim();
-        if text.is_empty() {
+        if text.is_empty() && !truncated {
             return Err("errors.emptyTranscript".into());
         }
         update(text);
-        Ok(text.into())
+        Ok(Recognized {
+            text: text.into(),
+            truncated,
+        })
     }
 }
 #[cfg(test)]
@@ -974,9 +1039,62 @@ mod tests {
         let mut updates = vec![];
         assert_eq!(
             consume_sse(stream.as_bytes(), "", |s| updates.push(s.to_owned())).unwrap(),
-            "Привет мир"
+            Recognized {
+                text: "Привет мир".into(),
+                truncated: false
+            }
         );
         assert_eq!(updates.len(), 2);
+    }
+    #[test]
+    fn stream_cut_by_the_output_limit_keeps_every_word_and_reports_truncation() {
+        // The last words arrive in the same event as the finish reason.
+        for reason in ["length", "content_filter"] {
+            let stream = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"one \"}}}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{\"content\":\"two\"}},\"finish_reason\":\"{reason}\"}}]}}\n\ndata: [DONE]\n\n");
+            assert_eq!(
+                consume_sse(stream.as_bytes(), "", |_| {}).unwrap(),
+                Recognized {
+                    text: "one two".into(),
+                    truncated: true
+                }
+            );
+        }
+        // A normal stop is complete, and an empty complete answer is still "no speech".
+        let stop = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        assert!(!consume_sse(stop.as_bytes(), "", |_| {}).unwrap().truncated);
+        let silent = "data: {\"choices\":[{\"delta\":{\"content\":\" \"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        assert_eq!(
+            consume_sse(silent.as_bytes(), "", |_| {}).unwrap_err(),
+            "errors.emptyTranscript"
+        );
+    }
+    #[test]
+    fn output_budget_scales_with_audio_and_only_passing_failures_are_retried() {
+        assert_eq!(completion_budget(0.0), 4096);
+        assert_eq!(completion_budget(120.0), 8896);
+        assert_eq!(completion_budget(f64::NAN), 4096);
+        assert_eq!(completion_budget(1e9), 32_768);
+        for error in [
+            "errors.cloudConnect",
+            "errors.cloudInterrupted",
+            "errors.cloudService|Provider returned error",
+            "errors.cloudHttp|HTTP 429: slow down",
+            "errors.cloudHttp|HTTP 503: overloaded",
+            "errors.cloudHttp|HTTP 408: timeout",
+        ] {
+            assert!(transient(error), "{error}");
+        }
+        for error in [
+            "errors.cloudHttp|HTTP 401: bad token",
+            "errors.cloudHttp|HTTP 402: no credits",
+            "errors.cloudHttp|HTTP 400: bad audio",
+            "errors.tokenRequired",
+            "errors.operationCancelled",
+            "errors.emptyTranscript",
+            "errors.audioTooLarge",
+        ] {
+            assert!(!transient(error), "{error}");
+        }
     }
     #[test]
     fn stream_rejects_interruption_and_redacts_error() {
@@ -1048,6 +1166,7 @@ mod tests {
                 assert_eq!(v["input_audio"]["data"], "c2FtcGxl");
             } else {
                 assert_eq!(v["stream"], true);
+                assert_eq!(v["max_tokens"], 4496);
                 assert_eq!(
                     v["messages"][0]["content"][1]["input_audio"]["format"],
                     "wav"
@@ -1073,7 +1192,9 @@ mod tests {
         ));
         fs::write(&path, b"sample").unwrap();
         assert_eq!(
-            transcribe(&settings, &configuration, &path, |_| {}).unwrap(),
+            transcribe(&settings, &configuration, &path, 10.0, |_| {})
+                .unwrap()
+                .text,
             "hello"
         );
         handle.join().unwrap();

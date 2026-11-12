@@ -122,11 +122,11 @@ Open **Devices**, enter your own relay URL and this device's name, and connect t
 
 ## Microphone recording
 
-Select **Record audio** on the new recording screen. Allow microphone access when the operating system asks, then use **Pause**, **Resume**, or **Save recording**. Cancel discards the capture. A failed archive save keeps the recording available for another attempt. Open **Share** on a saved recording to send its audio or text, transfer it to another device, save a copy, or copy the transcript. Text actions appear once a transcript is available.
+Select **Record audio** on the new recording screen. Allow microphone access when the operating system asks, then use **Pause**, **Resume**, or **Save recording**. Cancel discards the capture after you confirm it; stopping a recording longer than five minutes also asks first, and the microphone keeps recording while the question is open. A failed archive save keeps the recording available for another attempt. Open **Share** on a saved recording to send its audio or text, transfer it to another device, save a copy, or copy the transcript. Text actions appear once a transcript is available.
 
 The recorder shows measured audio history to the left of the current-time marker. On Android, its timer and waveform come from captured PCM, survive returning from the background, and exclude paused time. Recoverable microphone failures recreate the audio input while keeping the same WAV file and sample rate. If recovery fails, the captured audio is preserved with an interruption warning. A pending disk write must finish before the recording becomes available for playback or export.
 
-Android uses foreground services with persistent notifications for recording, transcription, text processing, and transfers. You can lock the screen after starting an operation. Returning to Hearfolio restores its progress or committed result without repeating a cloud request. If the process is killed, recoverable WAV audio is retained and unfinished processing is reported as interrupted. Recording audio does not send it to OpenRouter until you start transcription with that service selected.
+Android uses foreground services with persistent notifications for recording, transcription, text processing, and transfers. You can lock the screen after starting an operation. Returning to Hearfolio restores its progress or committed result without repeating a cloud request. If the process is killed, recoverable WAV audio is retained and unfinished processing is reported once as interrupted: the recording list shows how many segments are done, **Archive** lists audio that was never saved, and temporary files of the interrupted job are removed at the next start. Recording audio does not send it to OpenRouter until you start transcription with that service selected.
 
 Android capture is limited to four hours, cloud processing and transfers to two hours, and background transfer waiting to twelve hours per session. System restrictions can stop work earlier. **Settings → Background tasks** links to the app's Android battery settings if the device interrupts recording. Force-stopping the app ends its work; it does not restart paid processing automatically.
 
@@ -148,6 +148,8 @@ The **Results** tab keeps each output with its rule, model, and time. Copy, shar
 | Nemotron 3.5 Streaming | On your computer via NeMo-Speech.cpp | Text arrives through the local streaming WebSocket API. |
 | OpenRouter: streaming text | The configured remote API | Compatible audio models return text through Chat Completions streaming. |
 | OpenRouter: transcription | The configured remote API | A specialized speech-to-text endpoint returns completed audio chunks. |
+
+Long recordings are sent to OpenRouter in segments (two minutes by default, configurable in **Settings → Recognition**). Each finished segment is saved before the next request, so a retry continues where the previous attempt stopped. A dropped connection, a rate limit or a provider outage repeats only the current segment, up to five times with growing pauses. If a model stops at its output limit, the same audio is sent again as two shorter pieces cut at a pause; a passage it still cannot finish keeps the text it produced and is named in a notice once the transcript is saved. Silent segments are skipped instead of failing the recording.
 
 Whisper and Nemotron can run locally after their runtimes and models are installed. Model support, processing speed, and recognition quality depend on the selected model and hardware.
 

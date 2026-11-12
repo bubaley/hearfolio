@@ -52,7 +52,8 @@ pub fn read_history_at(dir: &Path) -> Result<Vec<HistoryEntry>, String> {
 pub fn write_history_at(dir: &Path, entries: &[HistoryEntry]) -> Result<(), String> {
     let path = dir.join("history.json");
     let temp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(entries).map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec_pretty(entries)
+        .map_err(|error| format!("errors.historySave|{error}"))?;
     let mut file =
         fs::File::create(&temp).map_err(|error| format!("errors.historySave|{error}"))?;
     file.write_all(&bytes)

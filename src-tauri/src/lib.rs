@@ -1,6 +1,7 @@
 mod audio;
 mod background;
 mod cloud;
+mod cloud_job;
 mod compact;
 mod platform;
 mod postprocess;
@@ -731,6 +732,10 @@ fn clear_history() -> Result<(), String> {
 /// Committed cloud chunks of an unfinished attempt: `{done,total,configuration}`
 /// or null. Starting `transcribe` with that configuration skips them.
 #[tauri::command]
+fn unfinished_transcriptions() -> Result<Vec<resume::Unfinished>, String> {
+    Ok(resume::unfinished(&base()?))
+}
+#[tauri::command]
 fn cloud_resume_state(id: String) -> Result<Option<serde_json::Value>, String> {
     Ok(resume::resumable(&base()?, &id))
 }
@@ -1013,6 +1018,105 @@ fn stream_nemotron(
     result
 }
 
+/// Chunk folders of a cloud run: `<record>-cloud-<timestamp>`.
+fn is_cloud_scratch(name: &str) -> bool {
+    name.rsplit_once("-cloud-").is_some_and(|(record, stamp)| {
+        record.starts_with("hearing-")
+            && !stamp.is_empty()
+            && stamp.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+/// A process killed in the middle of a job never runs its own cleanup. Its
+/// prepared audio pieces (hundreds of megabytes for a long recording) and
+/// half-written archive copies are removed at the next start, when no job can
+/// be using them. Recordings, their journals and committed transcription
+/// progress are never touched.
+fn remove_interrupted_scratch(root: &Path) {
+    for entry in fs::read_dir(root.join("temp"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let directory = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if directory && is_cloud_scratch(name) {
+            let _ = fs::remove_dir_all(entry.path());
+        } else if !directory
+            && name.starts_with("hearing-")
+            && (name.contains("-compact-") || name.ends_with("-import.audio"))
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+/// Text of the finished pieces; a silent piece contributes nothing.
+fn join_parts(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+/// The real requests behind `cloud_job`: OpenRouter, a cancellable pause and
+/// halves written next to the piece.
+struct CloudBackend<'a> {
+    app: &'a tauri::AppHandle,
+    settings: &'a cloud::Settings,
+    configuration: &'a RecognitionConfig,
+    promoted: &'a mut bool,
+    index: u64,
+    total: u64,
+    start: Instant,
+}
+/// A piece is divided only while both halves keep enough context to be worth sending.
+const SHORTEST_PIECE_SECONDS: u32 = 30;
+impl cloud_job::Backend for CloudBackend<'_> {
+    fn recognize(
+        &mut self,
+        audio: &Path,
+        live: &mut dyn FnMut(&str),
+    ) -> Result<cloud::Recognized, String> {
+        background::check_current()?;
+        let seconds = audio::wav_seconds(audio).unwrap_or(f64::from(self.settings.chunk_seconds));
+        cloud::transcribe(self.settings, self.configuration, audio, seconds, |text| {
+            if !*self.promoted && !text.trim().is_empty() {
+                *self.promoted = cloud::mark_working(self.configuration).is_ok();
+            }
+            live(text);
+            emit(
+                self.app,
+                "transcribe",
+                "progress.recognizeCloud",
+                self.index,
+                self.total,
+                self.start.elapsed().as_secs(),
+            );
+        })
+    }
+    fn wait(&mut self, delay: Duration) -> Result<(), String> {
+        let until = Instant::now() + delay;
+        while Instant::now() < until {
+            background::check_current()?;
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        background::check_current()
+    }
+    fn split(&mut self, audio: &Path) -> Result<Option<(PathBuf, PathBuf)>, String> {
+        audio::split_wav(audio, SHORTEST_PIECE_SECONDS)
+    }
+    fn stage(&mut self, stage: &'static str) {
+        emit(
+            self.app,
+            "transcribe",
+            stage,
+            self.index,
+            self.total,
+            self.start.elapsed().as_secs(),
+        );
+    }
+}
 #[tauri::command]
 async fn transcribe(
     app: tauri::AppHandle,
@@ -1095,14 +1199,15 @@ async fn transcribe(
                         chunks.len() as u64,
                     )?;
                     let mut parts = progress.parts().to_vec();
+                    let total = chunks.len() as u64;
                     if !parts.is_empty() {
-                        partial(&app, &parts.join("\n"));
+                        partial(&app, &join_parts(&parts));
                         emit(
                             &app,
                             "transcribe",
                             "progress.recognizedChunks",
                             parts.len() as u64,
-                            chunks.len() as u64,
+                            total,
                             start.elapsed().as_secs(),
                         );
                     }
@@ -1114,52 +1219,72 @@ async fn transcribe(
                             "transcribe",
                             "progress.sendCloudChunk",
                             index as u64,
-                            chunks.len() as u64,
+                            total,
                             start.elapsed().as_secs(),
                         );
-                        let prior = parts.join("\n");
-                        let text = cloud::transcribe(&settings, &configuration, chunk, |text| {
-                            if !promoted && !text.trim().is_empty() {
-                                promoted = cloud::mark_working(&configuration).is_ok();
-                            }
+                        let prior = join_parts(&parts);
+                        let mut backend = CloudBackend {
+                            app: &app,
+                            settings: &settings,
+                            configuration: &configuration,
+                            promoted: &mut promoted,
+                            index: index as u64,
+                            total,
+                            start,
+                        };
+                        let outcome = cloud_job::recognize(&mut backend, chunk, &mut |text| {
                             partial(
                                 &app,
                                 &format!(
                                     "{}{}{}",
                                     prior,
-                                    if prior.is_empty() { "" } else { "\n" },
+                                    if prior.is_empty() || text.is_empty() {
+                                        ""
+                                    } else {
+                                        "\n"
+                                    },
                                     text
                                 ),
                             );
-                            emit(
-                                &app,
-                                "transcribe",
-                                "progress.recognizeCloud",
-                                index as u64,
-                                chunks.len() as u64,
-                                start.elapsed().as_secs(),
-                            );
                         })?;
                         // Paid work is durable before the next request starts.
-                        progress.commit(&root, text.clone())?;
-                        parts.push(text);
+                        progress.commit(&root, outcome.text.clone(), outcome.incomplete)?;
+                        parts.push(outcome.text);
                         emit(
                             &app,
                             "transcribe",
                             "progress.recognizedChunks",
                             (index + 1) as u64,
-                            chunks.len() as u64,
+                            total,
                             start.elapsed().as_secs(),
                         );
                     }
-                    Ok::<String, String>(parts.join("\n"))
+                    let text = join_parts(&parts);
+                    if text.trim().is_empty() {
+                        return Err("errors.emptyTranscript".into());
+                    }
+                    Ok::<(String, Vec<u64>), String>((text, progress.incomplete().to_vec()))
                 })();
                 let _ = fs::remove_dir_all(chunk_dir);
-                let text = result?;
+                let (text, incomplete) = result?;
                 cloud::mark_working(&configuration)?;
                 background::check_current()?;
                 save_transcript(&id, format!("openrouter/{}", configuration.model), &text)?;
                 resume::remove(&base()?, &id);
+                if !incomplete.is_empty() {
+                    // The transcript is saved; say which passages to check by ear.
+                    let seconds = u64::from(settings.chunk_seconds);
+                    let _ = app.emit(
+                        "transcribe-incomplete",
+                        serde_json::json!({
+                            "recordId": id,
+                            "ranges": incomplete
+                                .iter()
+                                .map(|index| [index * seconds, (index + 1) * seconds])
+                                .collect::<Vec<_>>(),
+                        }),
+                    );
+                }
                 emit(
                     &app,
                     "transcribe",
@@ -1283,6 +1408,11 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             restart::install_menu(app.handle())?;
             if let Ok(root) = base() {
+                // Android may recreate the activity inside a living process:
+                // a job that is running owns its scratch files.
+                if !JOB_ACTIVE.load(Ordering::Acquire) {
+                    remove_interrupted_scratch(&root);
+                }
                 transfer::cleanup_partial_files(&root);
                 app.asset_protocol_scope()
                     .allow_directory(root.join("input"), false)?;
@@ -1340,6 +1470,7 @@ pub fn run() {
             background::cancel_background_operation,
             background::acknowledge_operation,
             cloud_resume_state,
+            unfinished_transcriptions,
             recording::import_quick_recordings,
             recording::list_loose_recordings,
             recording::adopt_loose_recording,
@@ -1357,4 +1488,55 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn startup_removes_only_the_scratch_of_an_interrupted_job() {
+        let root = std::env::temp_dir().join(format!("hearfolio-scratch-{}", uuid::Uuid::new_v4()));
+        let temp = root.join("temp");
+        fs::create_dir_all(temp.join("hearing-recording-17-cloud-1731400000000")).unwrap();
+        fs::write(
+            temp.join("hearing-recording-17-cloud-1731400000000/chunk-000000.wav"),
+            b"pcm",
+        )
+        .unwrap();
+        fs::create_dir_all(temp.join("someone-elses-cloud-1")).unwrap();
+        let scratch = [
+            "hearing-recording-17-compact-1731400000000.m4a",
+            "hearing-1731400000000-import.audio",
+        ];
+        let kept = [
+            // Captured audio, its journal and paid transcription progress.
+            "hearfolio-recording-17.wav",
+            "hearfolio-recording-17.wav.state.json",
+            "hearing-recording-17-cloud-progress.json",
+            "operation-control-1.json",
+            "notes-compact-1.m4a",
+        ];
+        for name in scratch.iter().chain(&kept) {
+            fs::write(temp.join(name), b"data").unwrap();
+        }
+        remove_interrupted_scratch(&root);
+        assert!(!temp
+            .join("hearing-recording-17-cloud-1731400000000")
+            .exists());
+        assert!(temp.join("someone-elses-cloud-1").is_dir());
+        for name in scratch {
+            assert!(!temp.join(name).exists(), "{name}");
+        }
+        for name in kept {
+            assert!(temp.join(name).exists(), "{name}");
+        }
+        assert!(!is_cloud_scratch("hearing-1-cloud-progress.json"));
+        assert!(!is_cloud_scratch("hearing-1-cloud-"));
+        // Finished pieces are joined without leaving holes for silent ones.
+        assert_eq!(
+            join_parts(&["one".into(), String::new(), " two \n".into()]),
+            "one\ntwo"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }

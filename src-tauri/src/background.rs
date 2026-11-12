@@ -315,7 +315,7 @@ pub async fn transfer_background(
         }
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|_| "errors.operationFailed".to_owned())?
 }
 
 #[cfg(target_os = "android")]

@@ -423,11 +423,106 @@ pub fn prepare_cloud_chunks(
     for value in &resampled {
         writer.push(*value)?;
     }
-    let chunks = writer.finish()?;
+    let mut chunks = writer.finish()?;
     if chunks.is_empty() {
         return Err("errors.audioEmpty".into());
     }
+    merge_short_tail(&mut chunks)?;
     Ok(chunks)
+}
+
+/// A recording rarely ends on a piece boundary. A last piece of a few seconds
+/// carries too little for a model to work with (it answers with nothing, or
+/// invents text), so it is sent together with the piece before it.
+const SHORT_TAIL_SECONDS: u32 = 8;
+fn merge_short_tail(chunks: &mut Vec<PathBuf>) -> Result<(), String> {
+    if chunks.len() < 2 {
+        return Ok(());
+    }
+    let failed = |error: hound::Error| format!("errors.audioPrepare|{error}");
+    let tail = &chunks[chunks.len() - 1];
+    let mut reader = hound::WavReader::open(tail).map_err(failed)?;
+    if reader.duration() >= reader.spec().sample_rate * SHORT_TAIL_SECONDS {
+        return Ok(());
+    }
+    let samples = reader
+        .samples::<i16>()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(failed)?;
+    drop(reader);
+    let mut writer = hound::WavWriter::append(&chunks[chunks.len() - 2]).map_err(failed)?;
+    for sample in samples {
+        writer.write_sample(sample).map_err(failed)?;
+    }
+    writer.finalize().map_err(failed)?;
+    if let Some(tail) = chunks.pop() {
+        let _ = fs::remove_file(tail);
+    }
+    Ok(())
+}
+
+/// Length of a prepared piece in seconds.
+pub fn wav_seconds(path: &Path) -> Option<f64> {
+    let reader = hound::WavReader::open(path).ok()?;
+    Some(f64::from(reader.duration()) / f64::from(reader.spec().sample_rate.max(1)))
+}
+
+/// Divides a prepared piece in two at the quietest moment near its middle, so
+/// the cut falls between words. Returns `None` when a half would be shorter
+/// than `minimum_seconds`.
+pub fn split_wav(path: &Path, minimum_seconds: u32) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let failed = |error: hound::Error| format!("errors.audioPrepare|{error}");
+    let mut reader = hound::WavReader::open(path).map_err(failed)?;
+    let spec = reader.spec();
+    if spec.channels != 1 || spec.bits_per_sample != 16 {
+        return Ok(None);
+    }
+    let rate = spec.sample_rate as usize;
+    let minimum = rate * minimum_seconds as usize;
+    if (reader.duration() as usize) < minimum * 2 || minimum == 0 {
+        return Ok(None);
+    }
+    let samples = reader
+        .samples::<i16>()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(failed)?;
+    let length = samples.len();
+    let window = (rate * 3 / 10).max(1);
+    let low = minimum.max(length / 3);
+    let high = (length - minimum).min(length * 2 / 3);
+    let mut cut = length / 2;
+    if low + window < high {
+        let mut quietest = f64::MAX;
+        let mut start = low;
+        while start + window <= high {
+            let energy: f64 = samples[start..start + window]
+                .iter()
+                .map(|sample| f64::from(*sample) * f64::from(*sample))
+                .sum();
+            if energy < quietest {
+                quietest = energy;
+                cut = start + window / 2;
+            }
+            start += (rate / 20).max(1);
+        }
+    }
+    let stem = path.with_extension("");
+    let name = stem
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("errors.audioPrepare")?;
+    let halves = (
+        path.with_file_name(format!("{name}-a.wav")),
+        path.with_file_name(format!("{name}-b.wav")),
+    );
+    for (target, range) in [(&halves.0, 0..cut), (&halves.1, cut..length)] {
+        let mut writer = hound::WavWriter::create(target, spec).map_err(failed)?;
+        for sample in &samples[range] {
+            writer.write_sample(*sample).map_err(failed)?;
+        }
+        writer.finalize().map_err(failed)?;
+    }
+    Ok(Some(halves))
 }
 
 #[cfg(test)]
@@ -459,14 +554,22 @@ mod tests {
         }
         writer.finalize().unwrap();
         let chunks = prepare_cloud_chunks(&input, &dir, 30, |_, _| {}).unwrap();
-        assert_eq!(chunks.len(), 2);
+        // The one-second remainder travels with the piece before it.
+        assert_eq!(chunks.len(), 1);
         let mut first = hound::WavReader::open(&chunks[0]).unwrap();
         assert_eq!(first.spec().channels, 1);
-        assert_eq!(first.duration(), 16000 * 30);
+        assert_eq!(first.duration(), 16000 * 31);
         assert_eq!(first.samples::<i16>().next().unwrap().unwrap(), 2000);
+        assert!(!dir.join("chunk-000001.wav").exists());
+        assert_eq!(wav_seconds(&chunks[0]), Some(31.0));
+        // A remainder long enough to carry speech stays a piece of its own.
+        let shorter = dir.join("shorter");
+        fs::create_dir_all(&shorter).unwrap();
+        let pieces = prepare_cloud_chunks(&input, &shorter, 20, |_, _| {}).unwrap();
+        assert_eq!(pieces.len(), 2);
         assert_eq!(
-            hound::WavReader::open(&chunks[1]).unwrap().duration(),
-            16000
+            hound::WavReader::open(&pieces[1]).unwrap().duration(),
+            16000 * 11
         );
         // The configured length decides the boundaries: 31 s fits one 60 s piece.
         let longer = dir.join("longer");
@@ -478,6 +581,37 @@ mod tests {
             16000 * 31
         );
         assert_eq!(detect_extension(&input).unwrap(), "wav");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn a_piece_is_divided_at_the_quietest_moment_without_losing_a_sample() {
+        let dir = fixture();
+        let input = dir.join("chunk-000000.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&input, spec).unwrap();
+        // 80 s of "speech" with one pause at 44.0–44.6 s.
+        let pause = 16000 * 44..16000 * 44 + 9600;
+        for index in 0..16000 * 80 {
+            let loud = if index % 2 == 0 { 9000 } else { -9000 };
+            writer
+                .write_sample::<i16>(if pause.contains(&index) { 0 } else { loud })
+                .unwrap();
+        }
+        writer.finalize().unwrap();
+        let (first, second) = split_wav(&input, 30).unwrap().unwrap();
+        assert_eq!(first, dir.join("chunk-000000-a.wav"));
+        let head = hound::WavReader::open(&first).unwrap().duration() as usize;
+        let tail = hound::WavReader::open(&second).unwrap().duration() as usize;
+        assert_eq!(head + tail, 16000 * 80);
+        assert!(pause.contains(&head), "cut inside the pause, got {head}");
+        // Halves of 44 s and 36 s cannot be divided again into pieces of 30 s.
+        assert!(split_wav(&first, 30).unwrap().is_none());
+        assert!(split_wav(&second, 30).unwrap().is_none());
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

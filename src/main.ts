@@ -1,7 +1,8 @@
 import {recordNameParts, renamedRecordTitle} from './record-name';
 import {normalizeAudioCatalog, readAudioCatalog, saveAudioCatalog} from './cloud-catalog';
 import {RecorderEnvelope,NativeRecordingOrder,NativeRecorderClock,RecordingSnapshotPoll} from './recorder-meter';
-import {drawRecorder,readPalette,type RecorderPalette} from './recorder-canvas';
+import {RecorderView} from './recorder-canvas';
+import {FrameLoop} from './frame-loop';
 import {Pacer} from './pacer';
 import {pauseAudioRecording, resumeAudioRecording, restoreNativeRecordingFlag, observePendingOperation, operationHandled, markOperationHandled} from './api';
 import type {OperationSnapshot} from './operation-recovery';
@@ -41,12 +42,22 @@ let nativeOperation:OperationSnapshot|null=null, operationPolling=false, operati
 let settingsSaveQueue:Promise<unknown>=Promise.resolve(), previousResult:{text:string;saved:boolean}|null=null;
 let receivedPartial=false, audioPosition=0, audioWasPlaying=false, pickingAudio=false;
 let noticeTimer:ReturnType<typeof setTimeout>|null=null;
-let recordingPhase:'idle'|'starting'|'recording'|'paused'|'stopping'|'cancelling'='idle', recordingStarted=0, recordingTimer:ReturnType<typeof setInterval>|null=null, pendingRecording:AudioSelection|null=null;
+let recordingPhase:'idle'|'starting'|'recording'|'paused'|'stopping'|'cancelling'='idle', recordingStarted=0, pendingRecording:AudioSelection|null=null;
 let outputTab:'transcript'|'results'='transcript';
 // Captured audio whose import never finished; the archive view lists it for retry or export.
 let loose:LooseRecording[]=[],looseLoading=false,looseError='';
 let resume:(CloudResume&{id:string})|null=null;
-async function refreshResume(id:string){try{const state=await call<CloudResume|null>('cloud_resume_state',{id});if(active?.id!==id)return;resume=state&&state.done>0&&state.done<state.total?{id,...state}:null;}catch{resume=null;}if(!busy&&view==='work')render();}
+// Records whose cloud transcription stopped part-way; their finished segments are kept on disk.
+let unfinished=new Map<string,{done:number;total:number}>();
+// Startup recovery of an interrupted recording can take a while (the audio is compacted before archiving).
+let restoring=false;
+async function refreshResume(id:string){
+  await refreshUnfinished();
+  try{const state=await call<CloudResume|null>('cloud_resume_state',{id});if(active?.id===id)resume=state&&state.done>0&&state.done<state.total?{id,...state}:null;}
+  catch{if(active?.id===id)resume=null;}
+  // Only screens that show a record's state are redrawn; a form being edited elsewhere is left alone.
+  if(!busy&&['work','history','archive'].includes(view))render();
+}
 const canResume=()=>Boolean(resume&&active&&resume.id===active.id&&resume.configuration.provider===configuration.provider&&resume.configuration.model===configuration.model&&resume.configuration.mode===configuration.mode);
 let playerId='', playerLoading=false, playerError='', playerState:NativePlayerState={duration:0,currentTime:0,playing:false}, playerPoll:ReturnType<typeof setTimeout>|null=null, playerGeneration=0;
 let nativeRecordingSeconds:number|null=null,nativeRecordingMillis:number|null=null,nativeRecordingPath='',externalRecording=false,recordingControlPending=false,nativeCaptureGeneration=0;
@@ -56,12 +67,29 @@ const nativeRecorderClock=new NativeRecorderClock();
 const recordingSnapshotPoll=new RecordingSnapshotPoll();
 type NativeCapture={state:string;stateRevision?:number;path?:string;elapsedSeconds?:number;elapsedMillis?:number;level?:number;envelope?:number[];envelopeSequence?:number;envelopeIntervalMs?:number};
 function recordingMilliseconds(){return nativeRecordingMillis!==null?nativeRecorderClock.milliseconds(performance.now()):(nativeRecordingSeconds!==null?nativeRecordingSeconds*1000:recordingStarted?Math.max(0,(recordingPausedAt||Date.now())-recordingStarted-recordingPausedMillis):0);}
-let recorderPalette:RecorderPalette|null=null;
+const recorderView=new RecorderView();
+// The timer is patched in place every frame; only the part that changed touches the DOM.
+let durationClock:HTMLElement|null=null,durationFraction:HTMLElement|null=null,durationHost:HTMLElement|null=null;
+function durationParts(millis:number):[string,string] {
+  const seconds=Math.floor(millis/1000),pad=(value:number)=>String(value).padStart(2,'0');
+  return [seconds>=3600?`${Math.floor(seconds/3600)}:${pad(Math.floor(seconds/60)%60)}:${pad(seconds%60)}`:`${pad(Math.floor(seconds/60))}:${pad(seconds%60)}`,`.${pad(Math.floor(millis/10)%100)}`];
+}
+function durationHtml(){const [clock,fraction]=durationParts(recordingMilliseconds());return `<div class="recording-duration ${clock.length>5?'long':''}" id="recording-duration" role="timer" aria-label="${tr('Длительность записи')}"><span id="recording-clock">${clock}</span><small id="recording-fraction">${fraction}</small></div>`;}
+function paintDuration(millis=recordingMilliseconds()){
+  if(!durationClock||!durationFraction)return;
+  const [clock,fraction]=durationParts(millis);
+  if(durationClock.textContent!==clock){durationClock.textContent=clock;durationHost?.classList.toggle('long',clock.length>5);}
+  if(durationFraction.textContent!==fraction)durationFraction.textContent=fraction;
+}
 function recordingMeterHtml(){return `<div class="recorder-timeline" role="img" aria-label="${tr('Уровень микрофона')}"><canvas class="recorder-canvas" aria-hidden="true"></canvas></div>`;}
-function paintRecorderMeter(){
-  const millis=recordingMilliseconds(),canvas=document.querySelector<HTMLCanvasElement>('.recorder-canvas');
-  if(canvas){recorderPalette??=readPalette(canvas);drawRecorder(canvas,recorderEnvelope.levels(),recorderEnvelope.newestMillis(),recorderEnvelope.interval,millis,recordingPhase!=='recording',recorderPalette);}
-  const timer=document.querySelector('#recording-duration'),label=recordingDuration(millis);if(timer&&timer.textContent!==label)timer.textContent=label;
+function paintRecorderMeter(now:number){
+  const millis=recordingMilliseconds();
+  recorderView.draw(recorderEnvelope,millis,recordingPhase!=='recording',now);
+  paintDuration(millis);
+}
+function attachRecorderView(){
+  recorderView.attach(document.querySelector<HTMLCanvasElement>('.recorder-canvas'));
+  durationHost=document.querySelector<HTMLElement>('#recording-duration');durationClock=document.querySelector<HTMLElement>('#recording-clock');durationFraction=document.querySelector<HTMLElement>('#recording-fraction');
 }
 function applyNativeCapture(p:NativeCapture){
   const sameSession=!p.path||p.path===nativeRecordingPath;
@@ -76,21 +104,20 @@ function applyNativeCapture(p:NativeCapture){
 // Desktop levels come from the WebView microphone; native capture delivers its own envelope.
 function sampleRecorderLevel(){
   if(document.hidden||recordingPhase!=='recording'||(platform.os==='android'&&!preview))return;
-  recorderEnvelope.sample(recordingInputLevel(),performance.now(),true,recordingMilliseconds());
+  recorderEnvelope.observe(recordingInputLevel(),recordingMilliseconds());
 }
-setInterval(sampleRecorderLevel,recorderEnvelope.interval);
+setInterval(sampleRecorderLevel,40);
 
 // One animation loop paints everything that moves: the recorder, revealed text and progress.
-// A frame requested while the WebView was in the background may never arrive; ask again after a while.
-let frameRequestedAt=-1;
-function requestFrames(){const now=performance.now();if(frameRequestedAt>=0&&now-frameRequestedAt<500)return;frameRequestedAt=now;requestAnimationFrame(animate);}
-function animate(now:number){
-  frameRequestedAt=-1;let again=false;
-  if(['recording','paused','stopping'].includes(recordingPhase)){paintRecorderMeter();again=recordingPhase!=='stopping';}
+// FrameLoop keeps a single pending frame, including after the WebView was in the background.
+const frames=new FrameLoop(now=>{
+  let again=false;
+  if(recordingPhase!=='idle'){paintRecorderMeter(now);again=recordingPhase==='recording';}
   if(revealing){paintReveal(now);again||=revealing;}
   if(busy&&progress?.total){paintProgress(now);again=true;}
-  if(again&&!document.hidden)requestFrames();
-}
+  return again&&!document.hidden;
+});
+function requestFrames(){frames.request();}
 document.addEventListener('visibilitychange',()=>{if(document.hidden)return;if(revealing)textPacer.hurry(900);requestFrames();});
 
 // Text arrives a segment at a time; reveal it at the pace segments arrive so it flows without pauses.
@@ -140,14 +167,14 @@ function paintProgress(now:number){
   const banner=document.querySelector('.job-banner small'),stage=progress?`${progress.stage} · ${whole}`:'';if(banner&&banner.textContent!==stage)banner.textContent=stage;
 }
 let recordingPausedAt=0,recordingPausedMillis=0;
-const recordingDuration=(millis=recordingMilliseconds())=>{return `${String(Math.floor(millis/60000)).padStart(2,'0')}:${String(Math.floor(millis/1000)%60).padStart(2,'0')}.${String(Math.floor(millis/10)%100).padStart(2,'0')}`;};
 document.documentElement.dataset.theme=theme;
 const title:Record<View,string>={work:"Запись",history:"Записи",archive:"Архив",models:"Модели",settings:"Настройки",devices:"Устройства",rules:"Правила обработки"};
 const formatTime=(seconds:number)=>{const whole=Math.floor(seconds),pad=(value:number)=>String(value).padStart(2,'0');return whole>=3600?`${Math.floor(whole/3600)}:${pad(Math.floor(whole/60)%60)}:${pad(whole%60)}`:`${Math.floor(whole/60)}:${pad(whole%60)}`;};
 const dateLabel=(timestamp:number)=>new Date(timestamp).toLocaleDateString(locale(),{day:'numeric',month:'long'});
 const audioFormats='MP3, M4A, WAV, AAC, FLAC, OGG, MP4';
 const recordCount=(count:number)=>countLabel(count,'record');
-const disabled=()=>busy||platform.os==='unknown'?'disabled':'';
+const say=settingsLabel;
+const disabled=()=>busy||restoring||platform.os==='unknown'?'disabled':'';
 const deviceSystemLanguage=()=>((navigator.languages?.[0]||navigator.language).toLowerCase().startsWith('ru')?'ru':'en') as 'ru'|'en';
 const applyLanguagePreference=()=>setLanguage(settings.language,platform.mobile?deviceSystemLanguage():settings.systemLanguage);
 const words=()=>text.trim()?text.trim().split(/\s+/).length:0;
@@ -166,15 +193,23 @@ function readiness():string {
   if (localChoice!=='nemotron-3.5'&&!runtime.whisper) return tr("Установите Whisper для локального распознавания.");
   return '';
 }
-function notice(message:string,error=false) {
-  status=message; isError=error;
+// An action offered next to a notice, e.g. "Retry" after a failed transcription. It belongs to one message.
+type NoticeAction={label:string;run:()=>void};
+let noticeAction:(NoticeAction&{message:string})|null=null;
+function notice(message:string,error=false,action?:NoticeAction) {
+  status=message; isError=error; noticeAction=action&&message?{...action,message}:null;
   if (noticeTimer) clearTimeout(noticeTimer);
   updateNotice();
   if (message&&!error) noticeTimer=setTimeout(()=>{if(status===message&&!isError){status='';updateNotice();}noticeTimer=null;},3500);
 }
 function updateNotice() {
   const element=document.querySelector<HTMLElement>('#status');
-  if (element) {element.className=`notice ${isError?'error':''}`;element.innerHTML=status?`<span>${isError?icon('alert'):icon('check')}${esc(status)}${tr("</span><button class=\"icon-button\" data-dismiss aria-label=\"Закрыть сообщение\">")}${icon('close')}</button>`:'';element.querySelector('[data-dismiss]')?.addEventListener('click',()=>{status='';updateNotice();});}
+  if(!element)return;
+  const action=noticeAction&&noticeAction.message===status?noticeAction:null;
+  element.className=`notice ${isError?'error':''} ${action?'has-action':''}`;
+  element.innerHTML=status?`<span>${isError?icon('alert'):icon('check')}${esc(status)}</span>${action?`<button type="button" class="notice-action" data-notice-action>${esc(action.label)}</button>`:''}<button class="icon-button" data-dismiss aria-label="${tr('Закрыть сообщение')}">${icon('close')}</button>`:'';
+  element.querySelector('[data-dismiss]')?.addEventListener('click',()=>{status='';updateNotice();});
+  element.querySelector('[data-notice-action]')?.addEventListener('click',()=>{status='';updateNotice();action?.run();});
 }
 function beginOperation(kind:Progress['kind'],stage:string) {
   if(noticeTimer){clearTimeout(noticeTimer);noticeTimer=null;}
@@ -224,7 +259,9 @@ function waveBars(seed:string,count:number):number[] {
 }
 function recordStateHtml(entry:Entry):string {
   if(jobRecord()===entry.id){const percent=progressPercent();return `<span class="record-state live"><i aria-hidden="true"></i>${percent===null?tr(progress?.kind==='postprocess'?'Обработка':'Распознаём'):`${percent}%`}</span>`;}
-  return entry.outputPath?`<span class="record-state done">${tr('Текст')}</span>`:`<span class="record-state">${tr('Аудио')}</span>`;
+  if(entry.outputPath)return `<span class="record-state done">${tr('Текст')}</span>`;
+  const partial=unfinished.get(entry.id);
+  return partial?`<span class="record-state paused" title="${tr('Расшифровка не завершена')}">${partial.done}/${partial.total}</span>`:`<span class="record-state">${tr('Аудио')}</span>`;
 }
 function recordDetailHtml(entry:Entry):string {return `<span class="record-detail"><span>${dateLabel(entry.createdAt)}</span>${entry.durationSeconds?`<span>${formatTime(entry.durationSeconds)}</span>`:''}</span>`;}
 function recordActionsHtml(entry:Entry):string {
@@ -260,7 +297,7 @@ function captureHtml():string {
   if(recordingPhase!=='idle'){
     const live=['recording','paused'].includes(recordingPhase),paused=recordingPhase==='paused',locked=!live||recordingControlPending?'disabled':'';
     const label=tr(recordingPhase==='starting'?'Подключаем микрофон…':recordingPhase==='stopping'?'Сохраняем аудио…':recordingPhase==='cancelling'?'Отменяем запись…':paused?'Пауза':'Идёт запись');
-    return `<section class="recorder ${paused?'recorder-paused':''} ${live?'':'recorder-busy'}" aria-label="${tr('Диктофон')}"><div class="recorder-state"><span class="recorder-dot" aria-hidden="true"></span><span>${label}</span></div><div class="recording-duration" id="recording-duration" aria-label="${tr('Длительность записи')}">${recordingDuration()}</div>${recordingMeterHtml()}<div class="recorder-actions"><button type="button" class="round-button" id="cancel-recording" ${locked} aria-label="${tr('Отменить запись')}" title="${tr('Отменить запись')}">${icon('close')}</button><button type="button" class="record-orb recording" id="stop-recording" ${locked} aria-label="${tr('Остановить и сохранить')}"><span class="stop-symbol" aria-hidden="true"></span></button><button type="button" class="round-button" id="pause-recording" ${locked} aria-label="${tr(paused?'Продолжить':'Пауза')}" title="${tr(paused?'Продолжить':'Пауза')}">${icon(paused?'play':'pause')}</button></div><p class="recorder-hint">${tr(platform.os==='android'?'Запись продолжится, даже если заблокировать экран.':'Нажмите ■, чтобы сохранить запись.')}</p></section>`;
+    return `<section class="recorder ${paused?'recorder-paused':''} ${live?'':'recorder-busy'}" aria-label="${tr('Диктофон')}"><div class="recorder-state"><span class="recorder-dot" aria-hidden="true"></span><span>${label}</span></div>${durationHtml()}${recordingMeterHtml()}<div class="recorder-actions"><button type="button" class="round-button" id="cancel-recording" ${locked} aria-label="${tr('Отменить запись')}" title="${tr('Отменить запись')}">${icon('close')}</button><button type="button" class="record-orb recording" id="stop-recording" ${locked} aria-label="${tr('Остановить и сохранить')}"><span class="stop-symbol" aria-hidden="true"></span></button><button type="button" class="round-button" id="pause-recording" ${locked} aria-label="${tr(paused?'Продолжить':'Пауза')}" title="${tr(paused?'Продолжить':'Пауза')}">${icon(paused?'play':'pause')}</button></div><p class="recorder-hint">${tr(platform.os==='android'?'Запись продолжится, даже если заблокировать экран.':'Нажмите ■, чтобы сохранить запись.')}</p></section>`;
   }
   if(pendingRecording)return `<section class="welcome"><h1>${tr('Аудио записано')}</h1><p>${tr('Сохраните запись, чтобы расшифровать её.')}</p><div class="welcome-actions"><button class="primary large" id="retry-recording" ${disabled()}>${tr('Сохранить запись')}</button><button class="text-button danger" id="discard-recording" ${disabled()}>${tr('Удалить')}</button></div></section>`;
   return `<section class="welcome" id="drop-area">${platform.audioRecording?`${recordOrbHtml('start-recording',tr('Начать запись'))}<h1>${tr('Нажмите, чтобы записать')}</h1><p>${tr('Или')} <button class="link-button" data-choose ${disabled()}>${tr('выберите аудиофайл')}</button>${platform.mobile?'':tr(' — его можно просто перетащить сюда')}.</p>`:`<button class="drop-target" data-choose ${disabled()}>${icon('upload')}</button><h1>${tr('Добавьте аудиофайл')}</h1><p>${tr('Перетащите файл сюда или')} <button class="link-button" data-choose ${disabled()}>${tr('выберите на диске')}</button>.</p>`}<small>${audioFormats}</small></section>`;
@@ -342,7 +379,8 @@ function nativePlayerHtml():string {
 }
 function homeHtml():string {
   const job=jobRecord()?history.find(entry=>entry.id===jobRecord()):null;
-  return `<section class="home">${job?`<button class="job-banner" data-history="${esc(job.id)}"><span class="spinner"></span><span><strong>${esc(displayName(job))}</strong><small>${esc(progress?.stage||'')}${progressPercent()!==null?` · ${progressPercent()}%`:''}</small></span>${icon('chevron')}</button>`:''}${history.length>5||search?searchFieldHtml():''}<div class="record-list" id="history-results">${historyResults()}</div></section><div class="home-dock"><button class="dock-side" data-choose ${disabled()}>${icon('upload')}<span>${tr('Файл')}</span></button>${platform.audioRecording?recordOrbHtml('quick-record',tr('Начать запись')):''}<span class="dock-side" aria-hidden="true"></span></div>`;
+  const restoreBanner=restoring?`<div class="job-banner" role="status"><span class="spinner"></span><span><strong>${tr('Восстанавливаем запись…')}</strong><small>${tr('Аудио сохранено. Это займёт немного времени.')}</small></span></div>`:'';
+  return `<section class="home">${restoreBanner}${job?`<button class="job-banner" data-history="${esc(job.id)}"><span class="spinner"></span><span><strong>${esc(displayName(job))}</strong><small>${esc(progress?.stage||'')}${progressPercent()!==null?` · ${progressPercent()}%`:''}</small></span>${icon('chevron')}</button>`:''}${history.length>5||search?searchFieldHtml():''}<div class="record-list" id="history-results">${historyResults()}</div></section><div class="home-dock"><button class="dock-side" data-choose ${disabled()}>${icon('upload')}<span>${tr('Файл')}</span></button>${platform.audioRecording?recordOrbHtml('quick-record',tr('Начать запись')):''}<span class="dock-side" aria-hidden="true"></span></div>`;
 }
 function modelsHtml():string {
   const installationCommand=platform.os==='linux'?'sudo apt install ffmpeg':'brew install ffmpeg whisper.cpp';
@@ -355,7 +393,7 @@ function archiveHtml():string {
   const locked=looseLocked(),detail=(parts:(string|false|undefined)[])=>`<span class="archive-meta">${parts.filter(Boolean).map(part=>`<span>${esc(String(part))}</span>`).join('')}</span>`;
   const looseItems=loose.map(item=>`<article class="archive-item"><div class="archive-item-head"><div class="archive-item-title"><strong>${esc(recordNameParts(looseName(item),item.path).title)}</strong>${detail([dateLabel(item.createdAt),item.durationSeconds?formatTime(item.durationSeconds):'',sizeLabel(item.sizeBytes)])}</div><span class="archive-status failed">${tr('Не обработана')}</span></div><div class="archive-item-actions"><button type="button" class="primary" data-loose-retry="${esc(item.path)}" ${locked}>${icon('history')}<span>${tr('Повторить')}</span></button>${platform.mobile?`<button type="button" class="secondary" data-loose-share="${esc(item.path)}" ${locked}>${icon('share')}<span>${tr('Поделиться')}</span></button>`:''}<button type="button" class="secondary" data-loose-save="${esc(item.path)}" ${locked}>${icon('download')}<span>${tr('Сохранить')}</span></button><button type="button" class="icon-button danger" data-loose-delete="${esc(item.path)}" aria-label="${tr('Удалить запись')}" title="${tr('Удалить запись')}" ${locked}>${icon('trash')}</button></div></article>`).join('');
   const failed=looseLoading&&!loose.length?`<div class="list-empty"><span class="spinner"></span>${tr('Ищем необработанные записи…')}</div>`:looseError?`<div class="list-empty" role="alert">${esc(looseError)}<button class="text-button" id="retry-loose">${tr('Повторить')}</button></div>`:looseItems?`<p class="archive-hint">${tr('Обработка этих записей не завершилась. Аудио сохранено: повторите обработку или выгрузите файл.')}</p>${looseItems}`:'';
-  const saved=history.map(entry=>`<article class="archive-item"><div class="archive-item-head"><div class="archive-item-title"><strong title="${esc(entry.name)}">${esc(displayName(entry))}</strong>${detail([dateLabel(entry.createdAt),entry.durationSeconds?formatTime(entry.durationSeconds):'',entry.sizeBytes?sizeLabel(entry.sizeBytes):''])}</div>${jobRecord()===entry.id?recordStateHtml(entry):`<span class="archive-status ${entry.outputPath?'done':''}">${tr(entry.outputPath?'Расшифрована':'Без текста')}</span>`}</div><div class="archive-item-actions"><button type="button" class="secondary" data-history="${esc(entry.id)}" ${busy&&jobRecord()!==entry.id?'disabled':''}>${icon('chevron')}<span>${tr(entry.outputPath?'Открыть':'Расшифровать')}</span></button>${platform.mobile?`<button type="button" class="secondary" data-archive-share="${esc(entry.id)}" ${locked}>${icon('share')}<span>${tr('Поделиться')}</span></button>`:''}<button type="button" class="secondary" data-archive-save="${esc(entry.id)}" ${locked}>${icon('download')}<span>${tr('Сохранить')}</span></button></div></article>`).join('');
+  const saved=history.map(entry=>`<article class="archive-item"><div class="archive-item-head"><div class="archive-item-title"><strong title="${esc(entry.name)}">${esc(displayName(entry))}</strong>${detail([dateLabel(entry.createdAt),entry.durationSeconds?formatTime(entry.durationSeconds):'',entry.sizeBytes?sizeLabel(entry.sizeBytes):''])}</div>${jobRecord()===entry.id?recordStateHtml(entry):`<span class="archive-status ${entry.outputPath?'done':unfinished.has(entry.id)?'paused':''}">${entry.outputPath?tr('Расшифрована'):unfinished.has(entry.id)?`${tr('Не завершена')} · ${unfinished.get(entry.id)!.done}/${unfinished.get(entry.id)!.total}`:tr('Без текста')}</span>`}</div><div class="archive-item-actions"><button type="button" class="secondary" data-history="${esc(entry.id)}" ${busy&&jobRecord()!==entry.id?'disabled':''}>${icon('chevron')}<span>${tr(entry.outputPath?'Открыть':unfinished.has(entry.id)?'Продолжить':'Расшифровать')}</span></button>${platform.mobile?`<button type="button" class="secondary" data-archive-share="${esc(entry.id)}" ${locked}>${icon('share')}<span>${tr('Поделиться')}</span></button>`:''}<button type="button" class="secondary" data-archive-save="${esc(entry.id)}" ${locked}>${icon('download')}<span>${tr('Сохранить')}</span></button></div></article>`).join('');
   return `<div class="page-heading"><div><h1>${tr('Архив')}</h1><p>${tr('Все записи на этом устройстве и статус их обработки.')}</p></div></div>${failed?`<section class="archive-section"><h2>${tr('Не обработаны')}${loose.length?` <small>${loose.length}</small>`:''}</h2>${failed}</section>`:''}<section class="archive-section"><h2>${tr('В архиве')}${history.length?` <small>${history.length}</small>`:''}</h2>${historyError?`<div class="list-empty">${esc(historyError)}<button class="text-button" id="retry-history">${tr('Повторить')}</button></div>`:saved||`<div class="list-empty">${tr('Пока пусто')}</div>`}</section>`;
 }
 async function refreshLoose(){
@@ -369,6 +407,7 @@ async function retryLoose(path:string){
   const item=loose.find(candidate=>candidate.path===path);if(!item||looseLocked())return;
   if(active&&!await newRecord())return;
   try{await adoptLooseRecording(path);}catch(error){notice(errorText(error),true);await refreshLoose();return;}
+  if(pendingRecording?.path===path)pendingRecording=null;
   const imported=await importSelection({path,name:looseName(item)});
   if(!imported)view='archive';
   await refreshLoose();
@@ -376,7 +415,7 @@ async function retryLoose(path:string){
 async function deleteLoose(path:string){
   if(looseLocked()||!loose.some(item=>item.path===path))return;
   if(!await confirmAction(tr('Удалить запись?'),tr('Это аудио ещё не попало в архив. После удаления его нельзя будет восстановить.'),tr('Удалить запись')))return;
-  try{await adoptLooseRecording(path);await discardAudioRecording({path});}catch(error){notice(errorText(error),true);}
+  try{await adoptLooseRecording(path);await discardAudioRecording({path});if(pendingRecording?.path===path)pendingRecording=null;}catch(error){notice(errorText(error),true);}
   await refreshLoose();
 }
 function bindArchive(){
@@ -482,11 +521,13 @@ function render() {
   if(platform.mobile&&view==='work'&&!active&&recordingPhase==='idle'&&!pendingRecording&&!busy)view='history';
   const kept=document.querySelector<HTMLAudioElement>('#audio');
   document.documentElement.dataset.platform=platform.os;
+  // Dialogs live in <body>, outside the shell: the platform class on the root reaches them too.
+  document.documentElement.classList.toggle('mobile-platform',platform.mobile);
   app.innerHTML=`<div ${(platform.mobile&&catalogOpen)||textPickerOpen()?'inert':''} class="shell ${sidebarCollapsed?'sidebar-collapsed':''} ${platform.mobile?'mobile-platform':''} view-${view}">${sidebarHtml()}<main>${platform.mobile?mobileHeaderHtml():desktopHeaderHtml()}<div class="main-surface ${view==='work'||view==='history'?'work-surface':`page-surface ${view}-surface`}">${surfaceHtml()}<div id="status" class="notice ${isError?'error':''}" role="status" aria-live="polite"></div></div></main></div>${platform.mobile&&catalogOpen?`<div class="catalog-backdrop" id="catalog-backdrop">${catalogHtml()}</div>`:''}${textPickerHtml()}`;
   // Re-use the playing <audio> element so unrelated re-renders never interrupt playback.
   const slot=document.querySelector<HTMLAudioElement>('#audio');let reused=false;
   if(kept&&slot&&kept.getAttribute('src')===slot.getAttribute('src')){slot.replaceWith(kept);reused=true;}
-  recorderPalette=null;requestFrames();
+  attachRecorderView();requestFrames();
   bind();updateNotice();if(!reused)restorePlayback();if(view==='work'&&active&&platform.mobile&&recordingPhase==='idle')void ensureNativePlayer();else stopPlayerPolling();
 }
 function restorePlayback() {
@@ -714,7 +755,8 @@ async function refreshAfterTransfer() {
     } catch(error) {notice(errorText(error),true);}
   }
 }
-async function refreshHistory() {try{history=sortHistory(await call<Entry[]>('list_history'));historyError='';}catch(error){historyError=errorText(error);}loading=false;render();}
+async function refreshUnfinished() {try{unfinished=new Map((await call<{id:string;done:number;total:number}[]>('unfinished_transcriptions')).map(item=>[item.id,{done:item.done,total:item.total}]));}catch{/* The list still works without this hint. */}}
+async function refreshHistory() {try{history=sortHistory(await call<Entry[]>('list_history'));historyError='';}catch(error){historyError=errorText(error);}await refreshUnfinished();loading=false;render();}
 async function refreshRuntime() {
   if(!platform.localRecognition){runtime={ffmpeg:false,whisper:false,nemo:false};runtimeLoaded=true;render();return;}
   const results=await Promise.allSettled([call<typeof runtime>('runtime_status'),call<{id:string;installed:boolean}[]>('model_status')]);
@@ -735,16 +777,15 @@ async function discardPendingRecording():Promise<boolean> {
   catch(error){notice(errorText(error),true);return false;}
   finally{busy=false;render();}
 }
-function clearRecordingTimer(){if(recordingTimer)clearInterval(recordingTimer);recordingTimer=null;}
 function resetRecorderUi(){
-  clearRecordingTimer();recordingPhase='idle';recordingStarted=0;externalRecording=false;busy=false;
+  recordingPhase='idle';recordingStarted=0;externalRecording=false;busy=false;
   nativeRecordingSeconds=null;nativeRecordingMillis=null;nativeRecorderClock.reset();restoreNativeRecordingFlag(false);
 }
 async function startRecording(){
   if(busy||active||!platform.audioRecording||!await mayLeaveSettings()||!await mayReplaceRecord())return;
   if(busy||active)return;
-  nativeCaptureGeneration++;nativeRecordingOrder.beginStart();lastNativeRecordingResult='';nativeRecordingSeconds=null;nativeRecordingMillis=null;nativeRecordingPath='';recordingPausedAt=0;recordingPausedMillis=0;nativeRecorderClock.reset();recorderEnvelope.reset();settingsDraft=null;view='work';recordingPhase='starting';busy=true;status='';recordingStarted=0;render();
-  try{await startAudioRecording();nativeRecordingOrder.confirmStart();recordingStarted=Date.now();recordingPhase='recording';recordingTimer=setInterval(()=>{const timer=document.querySelector('#recording-duration');if(timer)timer.textContent=recordingDuration();},100);await syncNativeRecording(true);render();}
+  nativeCaptureGeneration++;nativeRecordingOrder.beginStart();lastNativeRecordingResult='';nativeRecordingSeconds=null;nativeRecordingMillis=null;nativeRecordingPath='';recordingPausedAt=0;recordingPausedMillis=0;nativeRecorderClock.reset();recorderEnvelope.reset();recorderView.restart();settingsDraft=null;view='work';recordingPhase='starting';busy=true;status='';recordingStarted=0;render();
+  try{await startAudioRecording();nativeRecordingOrder.confirmStart();recordingStarted=Date.now();recordingPhase='recording';await syncNativeRecording(true);render();}
   catch(error){nativeRecordingOrder.abortStart();recordingPhase='idle';busy=false;if(platform.os==='android'&&!preview)await syncNativeRecording(true);render();if(recordingPhase==='idle')notice(errorText(error),true);}
 }
 function recordingName(selected:AudioSelection,started=recordingStarted||Date.now()):string {
@@ -767,9 +808,18 @@ async function toggleRecordingPause(){
   }
   finally{recordingControlPending=false;render();}
 }
+// Ending a long recording by a stray tap is costly; a short one is not worth a question.
+const STOP_CONFIRMATION_MS=5*60*1000;
+const recorderLive=()=>['recording','paused'].includes(recordingPhase)&&!recordingControlPending;
+const recordedLength=()=>formatTime(recordingMilliseconds()/1000);
 async function stopRecording(){
-  if(!['recording','paused'].includes(recordingPhase)||recordingControlPending)return;
-  nativeCaptureGeneration++;recordingControlPending=true;clearRecordingTimer();recordingPhase='stopping';render();
+  if(!recorderLive())return;
+  if(recordingMilliseconds()>STOP_CONFIRMATION_MS){
+    // The microphone keeps recording while the question is open.
+    if(!await confirmAction(say('Завершить запись?','Finish recording?'),say(`Запись (${recordedLength()}) будет сохранена в архив. Дописать её после этого не получится.`,`The recording (${recordedLength()}) will be saved to the archive. You won't be able to add to it afterwards.`),say('Завершить и сохранить','Finish and save'),false,say('Продолжить запись','Keep recording')))return;
+    if(!recorderLive())return;
+  }
+  nativeCaptureGeneration++;recordingControlPending=true;recordingPhase='stopping';render();
   try{
     if(externalRecording){
       try{await call('recording_quick_control',{action:'stop',path:nativeRecordingPath||undefined});await finishQuickRecording();}
@@ -786,8 +836,10 @@ async function stopRecording(){
   }finally{recordingControlPending=false;render();}
 }
 async function cancelRecording(){
-  if(!['recording','paused'].includes(recordingPhase)||recordingControlPending)return;
-  nativeCaptureGeneration++;recordingControlPending=true;clearRecordingTimer();recordingPhase='cancelling';render();
+  if(!recorderLive())return;
+  if(!await confirmAction(say('Отменить запись?','Cancel recording?'),say(`Записанное аудио (${recordedLength()}) будет удалено. Восстановить его не получится.`,`The recorded audio (${recordedLength()}) will be deleted and can't be recovered.`),say('Удалить запись','Delete recording'),true,say('Продолжить запись','Keep recording')))return;
+  if(!recorderLive())return;
+  nativeCaptureGeneration++;recordingControlPending=true;recordingPhase='cancelling';render();
   try{if(externalRecording)await call('recording_quick_control',{action:'cancel',path:nativeRecordingPath||undefined});else await cancelAudioRecording();
     if(platform.os==='android'&&!preview)await syncNativeRecording(true);
     else resetRecorderUi();
@@ -886,32 +938,48 @@ async function download(id:string) {
   catch(error){endOperation();notice(`${tr("Не удалось скачать модель: ")}${errorText(error)}`,true);}
   finally{endOperation();render();}
 }
+// Passages the model could not finish even in short pieces; the transcript is saved, the user is told where to listen.
+let incomplete:{recordId:string;ranges:[number,number][]}|null=null;
+subscribe<{recordId:string;ranges:[number,number][]}>('transcribe-incomplete',payload=>{incomplete=payload;}).catch(()=>{});
+function incompleteNotice(id:string):string {
+  if(incomplete?.recordId!==id||!incomplete.ranges.length)return '';
+  const limit=active?.id===id&&active.durationSeconds?active.durationSeconds:Infinity;
+  const ranges=incomplete.ranges.map(([from,to])=>`${formatTime(from)}–${formatTime(Math.min(to,limit))}`).join(', ');
+  incomplete=null;
+  return `${tr('Часть записи распознана не полностью:')} ${ranges}. ${tr('Сверьте эти места с аудио.')}`;
+}
 async function run() {
   if(!active||busy||readiness())return;
   const id=active.id,beforeAttempt={text,saved:resultSaved};
   if(text&&resultSaved)previousResult={text,saved:true};
-  receivedPartial=false;outputTab='transcript';
+  receivedPartial=false;outputTab='transcript';incomplete=null;
   beginOperation('transcribe',tr("Подготавливаем запись"));startReveal(0);render();
   try {
     await settingsSaveQueue;await configurationSaveQueue;
     text=await call<string>('transcribe',{id,configuration:{...configuration}});finishReveal();
     const detail=await call<{entry:Entry;text:string;warning?:string|null}>('get_history',{id});active=detail.entry;resultSaved=Boolean(detail.entry.outputPath&&detail.text);previousResult=null;
     settings=await call<Settings>('get_settings');
-    history=sortHistory(await call<Entry[]>('list_history'));resume=null;
+    history=sortHistory(await call<Entry[]>('list_history'));resume=null;unfinished.delete(id);
+    const warning=incompleteNotice(id);if(warning){status=warning;isError=true;noticeAction=null;}
   } catch(error) {
     void refreshResume(id);
     if(!receivedPartial){text=beforeAttempt.text;resultSaved=beforeAttempt.saved;if(resultSaved)previousResult=null;stopReveal();}else finishReveal();
-    status=`${tr("Не удалось завершить распознавание: ")}${errorText(error)}`;isError=true;
+    if(String(error).includes('errors.operationCancelled')){status=errorText(error);isError=false;noticeAction=null;}
+    else{status=`${tr("Не удалось завершить распознавание: ")}${errorText(error)}`;isError=true;noticeAction={message:status,label:tr('Повторить'),run:()=>{void run();}};}
   } finally {ensureRules();try{settings=await call<Settings>('get_settings');}catch{/* Keep known defaults when settings cannot be refreshed. */}endOperation();render();}
 }
-function confirmAction(heading:string,message:string,action:string,danger=true):Promise<boolean> {
+function confirmAction(heading:string,message:string,action:string,danger=true,dismiss=tr('Отмена')):Promise<boolean> {
   if(document.querySelector('dialog[open]'))return Promise.resolve(false);
   return new Promise(resolve=>{
     const dialog=document.createElement('dialog');dialog.className='confirmation';dialog.setAttribute('aria-labelledby','confirmation-title');dialog.setAttribute('aria-describedby','confirmation-description');
-    dialog.innerHTML=`<h2 id="confirmation-title">${esc(heading)}</h2><p id="confirmation-description">${esc(message)}${tr("</p><div><button class=\"secondary\" data-cancel>Отмена</button><button class=\"")}${danger?'destructive':'primary'}" data-confirm>${esc(action)}</button></div>`;
+    dialog.innerHTML=`<h2 id="confirmation-title">${esc(heading)}</h2><p id="confirmation-description">${esc(message)}</p><div><button type="button" class="secondary" data-cancel>${esc(dismiss)}</button><button type="button" class="${danger?'destructive':'primary'}" data-confirm>${esc(action)}</button></div>`;
     document.body.append(dialog);dialog.showModal();
-    const finish=(value:boolean)=>{dialog.close();dialog.remove();resolve(value);};
-    dialog.querySelector('[data-cancel]')?.addEventListener('click',()=>finish(false));dialog.querySelector('[data-confirm]')?.addEventListener('click',()=>finish(true));dialog.addEventListener('cancel',event=>{event.preventDefault();finish(false);});dialog.querySelector<HTMLButtonElement>('[data-cancel]')?.focus();
+    let settled=false;
+    const finish=(value:boolean)=>{if(settled)return;settled=true;dialog.close();dialog.remove();resolve(value);};
+    dialog.querySelector('[data-cancel]')?.addEventListener('click',()=>finish(false));dialog.querySelector('[data-confirm]')?.addEventListener('click',()=>finish(true));dialog.addEventListener('cancel',event=>{event.preventDefault();finish(false);});
+    // A tap on the dimmed area dismisses, like the system sheets around it.
+    dialog.addEventListener('click',event=>{if(event.target!==dialog)return;const rect=dialog.getBoundingClientRect();if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)finish(false);});
+    dialog.querySelector<HTMLButtonElement>('[data-cancel]')?.focus();
   });
 }
 
@@ -928,9 +996,16 @@ async function initialize() {
   restoreConfiguration(active);render();
   if(configuration.provider==='openrouter'&&cloudModels.length)void loadCloudModels();
   await Promise.allSettled([refreshHistory(),refreshRuntime()]);ensureRules();
-  if(platform.os==='android'){await syncNativeOperation();await syncNativeRecording();await importQuickRecordings();}
+  if(platform.os==='android'){
+    // Reading the recorder state also archives a capture the last session left behind.
+    const slow=setTimeout(()=>{restoring=true;render();},600);
+    try{await syncNativeOperation();await syncNativeRecording();await importQuickRecordings();}
+    finally{clearTimeout(slow);if(restoring){restoring=false;render();}}
+  }
   // A crash during a desktop recording leaves a repaired WAV in temp; archive it instead of losing it.
   if(!preview&&['macos','linux','windows'].includes(platform.os)){try{const recovered=await call<AudioSelection[]>('recover_audio_recordings');for(const selection of recovered)await importSelection(selection);if(recovered.length)notice(`${tr('Восстановлено записей после сбоя:')} ${recovered.length}`);}catch(error){notice(errorText(error),true);}}
+  // A transcription cut short by a crash or a forced quit: say so once and offer to continue.
+  if(!preview&&!platform.mobile){try{const snapshot=await call<OperationSnapshot>('operation_activity_snapshot');if(snapshot.state==='interrupted'&&snapshot.kind==='transcribe')await consumeNativeOperation(snapshot);}catch{/* Nothing to report. */}}
   await refreshLoose();if(loose.length&&!status)notice(`${tr('Не обработано записей:')} ${loose.length}. ${tr('Они в «Архиве».')}`,true);
   if(!preview)void checkUpdates();
 }
@@ -973,18 +1048,23 @@ document.addEventListener('keydown',event=>{
   if(key==='enter'&&view==='work'){event.preventDefault();run();}
   if(key==='b'){event.preventDefault();setSidebar(!sidebarCollapsed);}
 });
+window.addEventListener('unhandledrejection',event=>{const reason=event.reason instanceof Error?event.reason.message:String(event.reason??'');if(reason.startsWith('errors.')){event.preventDefault();notice(errorText(reason),true);}});
 window.addEventListener('beforeunload',event=>{if(settingsDraft||settingsSaving||hasTransferDraft()||hasRuleDraft()||pendingRecording||busy||(text&&!resultSaved))event.preventDefault();});
 
 function updateCatalogViewport(){const viewport=window.visualViewport;document.documentElement.style.setProperty('--catalog-height',`${viewport?.height||window.innerHeight}px`);document.documentElement.style.setProperty('--catalog-top',`${viewport?.offsetTop||0}px`);}
 updateCatalogViewport();window.visualViewport?.addEventListener('resize',updateCatalogViewport);window.visualViewport?.addEventListener('scroll',updateCatalogViewport);window.addEventListener('resize',updateCatalogViewport);
 
-subscribe<NativeCapture>('recording-native-state',p=>{if(!['recording','paused','stopping'].includes(recordingPhase)||recordingControlPending)return;if(p.path&&nativeRecordingPath&&p.path!==nativeRecordingPath)return;if(!applyNativeCapture(p))return;if(p.state==='finished'){clearRecordingTimer();recordingPhase='stopping';render();void syncNativeRecording(true);return;}const next=p.state==='paused'?'paused':p.state==='recording'?'recording':p.state==='stopping'?'stopping':null;if(next&&next!==recordingPhase){if(next==='stopping')clearRecordingTimer();recordingPhase=next;render();}}).catch(()=>{});
+subscribe<NativeCapture>('recording-native-state',p=>{if(!['recording','paused','stopping'].includes(recordingPhase)||recordingControlPending)return;if(p.path&&nativeRecordingPath&&p.path!==nativeRecordingPath)return;if(!applyNativeCapture(p))return;if(p.state==='finished'){recordingPhase='stopping';render();void syncNativeRecording(true);return;}const next=p.state==='paused'?'paused':p.state==='recording'?'recording':p.state==='stopping'?'stopping':null;if(next&&next!==recordingPhase){recordingPhase=next;render();}}).catch(()=>{});
 type NativeRecordingResult={entry?:Entry;selection?:AudioSelection;error?:string;path?:string;stateRevision?:number};
 let lastNativeRecordingResult='';
-async function finishNativeRecording(p:NativeRecordingResult){const key=JSON.stringify(p),receipt=p.entry?`recording:${p.entry.id}`:'';if(key===lastNativeRecordingResult||(receipt&&operationHandled(receipt))){if(recordingPhase!=='idle'){resetRecorderUi();render();}return;}lastNativeRecordingResult=key;if(receipt)markOperationHandled(receipt);resetRecorderUi();pendingRecording=p.selection||null;if(p.entry){resetPlayback();active=p.entry;restoreConfiguration(p.entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;view='work';await refreshHistory();}render();if(p.error)notice(errorText(p.error),true);else notice(tr('Запись сохранена'));}
+// Every completion is reported once. The native side keeps the last one until the next recording
+// starts; without a receipt a failed save would reopen its screen on every launch, even after the
+// audio was archived or deleted from Archive.
+function recordingReceipt(p:NativeRecordingResult){return p.entry?`recording:${p.entry.id}`:p.path?`recording-result:${p.path}:${p.stateRevision??''}:${p.error??''}`:'';}
+async function finishNativeRecording(p:NativeRecordingResult){const key=JSON.stringify(p),receipt=recordingReceipt(p);if(key===lastNativeRecordingResult||(receipt&&operationHandled(receipt))){if(recordingPhase!=='idle'){resetRecorderUi();render();}return;}lastNativeRecordingResult=key;if(receipt)markOperationHandled(receipt);resetRecorderUi();pendingRecording=p.selection||null;if(p.entry){resetPlayback();active=p.entry;restoreConfiguration(p.entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;view='work';await refreshHistory();}render();if(p.error)notice(errorText(p.error),true);else notice(tr('Запись сохранена'));if(!p.entry)void refreshLoose();}
 subscribe<NativeRecordingResult>('recording-native-finished',p=>{if(nativeRecordingOrder.acceptResult(p))void finishNativeRecording(p);}).catch(()=>{});
 let quickFinishing=false;
-async function finishQuickRecording(){if(quickFinishing)return;quickFinishing=true;try{const entries=await call<Entry[]>('import_quick_recordings');externalRecording=false;recordingPhase='idle';busy=false;clearRecordingTimer();if(entries.length){const entry=entries[entries.length-1];if(!active||resultSaved||!text){resetPlayback();active=entry;restoreConfiguration(entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;}await refreshHistory();notice(tr('Запись сохранена'));}render();}catch(e){if(!String(e).includes('operationBusy')){externalRecording=false;recordingPhase='idle';busy=false;render();notice(errorText(e),true);}}finally{quickFinishing=false;}}
+async function finishQuickRecording(){if(quickFinishing)return;quickFinishing=true;try{const entries=await call<Entry[]>('import_quick_recordings');externalRecording=false;recordingPhase='idle';busy=false;if(entries.length){const entry=entries[entries.length-1];if(!active||resultSaved||!text){resetPlayback();active=entry;restoreConfiguration(entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;}await refreshHistory();notice(tr('Запись сохранена'));}render();}catch(e){if(!String(e).includes('operationBusy')){externalRecording=false;recordingPhase='idle';busy=false;render();notice(errorText(e),true);}}finally{quickFinishing=false;}}
 async function syncNativeRecording(afterControl=false){
   if((document.hidden&&!afterControl)||platform.os!=='android'||((recordingPhase==='cancelling'||recordingControlPending)&&!afterControl))return;
   return recordingSnapshotPoll.read(()=>readNativeRecordingSnapshot(),afterControl);
@@ -1001,12 +1081,12 @@ async function readNativeRecordingSnapshot(){
       if(recordingPhase!=='starting'){recordingPhase='starting';render();}
     }else if(p.state==='stopping'){
       externalRecording=Boolean(p.quick);busy=true;view='work';
-      if(recordingPhase!=='stopping'){clearRecordingTimer();recordingPhase='stopping';render();}
+      if(recordingPhase!=='stopping'){recordingPhase='stopping';render();}
     }else if(live){
       if(busy&&recordingPhase==='idle')return;
       externalRecording=Boolean(p.quick);busy=true;view='work';
       const changed=recordingPhase!==p.state;recordingPhase=p.state as 'recording'|'paused';
-      const timer=document.querySelector('#recording-duration');if(timer)timer.textContent=recordingDuration();
+      paintDuration();
       if(changed)render();
     }else if(busy&&recordingPhase==='idle')return;
     else if(externalRecording){
@@ -1018,7 +1098,8 @@ async function readNativeRecordingSnapshot(){
   }catch{/* A failed read cannot change the microphone's confirmed state. */}
 }
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)void syncNativeRecording();});
-let lastNativePoll=0;setInterval(()=>{const now=performance.now();if(now-lastNativePoll>=(recordingPhase==='idle'?1200:300)){lastNativePoll=now;void syncNativeRecording();}},150);
+// While recording the timer and the levels are read four times a second; the display clock smooths the rest.
+let lastNativePoll=0;setInterval(()=>{const now=performance.now();if(now-lastNativePoll>=(recordingPhase==='idle'?1200:240)){lastNativePoll=now;void syncNativeRecording();}},125);
 
 
 let importingQuick=false,quickImportFailed=false;
@@ -1066,7 +1147,10 @@ async function consumeNativeOperation(snapshot:OperationSnapshot){
     restorePostprocessActivity(null,false);endOperation();
     await refreshHistory();markOperationHandled(snapshot.id);
     if(snapshot.resumable&&id)resume={id,...snapshot.resumable} as CloudResume&{id:string};
-    notice(snapshot.state==='finished'?tr(snapshot.kind==='import'?'Запись сохранена':snapshot.kind==='postprocess'?'Результат сохранён':'Готово'):`${errorText(snapshot.error||'errors.operationInterrupted')}${snapshot.resumable?` ${tr('Готово частей:')} ${snapshot.resumable.done}/${snapshot.resumable.total}. ${tr('Расшифровку можно продолжить.')}`:''}`,snapshot.state!=='finished');
+    const retryable=snapshot.kind==='transcribe'&&id&&snapshot.state!=='finished'&&snapshot.state!=='cancelled';
+    if(snapshot.kind==='import'&&snapshot.state==='interrupted'){await refreshLoose();notice(tr('Сохранение записи прервалось. Аудио не потеряно — оно в разделе «Архив».'),true);return;}
+    notice(snapshot.state==='finished'?tr(snapshot.kind==='import'?'Запись сохранена':snapshot.kind==='postprocess'?'Результат сохранён':'Готово'):`${errorText(snapshot.error||'errors.operationInterrupted')}${snapshot.resumable?` ${tr('Готово частей:')} ${snapshot.resumable.done}/${snapshot.resumable.total}. ${tr('Расшифровку можно продолжить.')}`:''}`,snapshot.state!=='finished'&&snapshot.state!=='cancelled',retryable?{label:tr(snapshot.resumable?'Продолжить':'Повторить'),run:()=>{if(active?.id===id)void run();}}:undefined);
+    if(snapshot.state==='finished'&&snapshot.kind==='transcribe'&&id){const warning=incompleteNotice(id);if(warning)notice(warning,true);}
   }catch(error){notice(errorText(error),true);}finally{recoveringOperation=false;}
 }
 async function syncNativeOperation(){

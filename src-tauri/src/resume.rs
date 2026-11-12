@@ -30,6 +30,9 @@ pub struct CloudProgress {
     chunk_seconds: u32,
     total: u64,
     parts: Vec<String>,
+    /// Indexes of parts the model could not finish; reported with the result.
+    #[serde(default)]
+    incomplete: Vec<u64>,
 }
 
 fn source(input: &Path) -> Option<Source> {
@@ -93,15 +96,55 @@ impl CloudProgress {
             chunk_seconds,
             total,
             parts: Vec::new(),
+            incomplete: Vec::new(),
         })
     }
     pub fn parts(&self) -> &[String] {
         &self.parts
     }
-    pub fn commit(&mut self, root: &Path, text: String) -> Result<(), String> {
+    pub fn incomplete(&self) -> &[u64] {
+        &self.incomplete
+    }
+    pub fn commit(&mut self, root: &Path, text: String, incomplete: bool) -> Result<(), String> {
+        if incomplete {
+            self.incomplete.push(self.parts.len() as u64);
+        }
         self.parts.push(text);
         write_atomic(&path(root, &self.record_id), self)
     }
+}
+/// Every record with an attempt that stopped part-way, for the record list.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct Unfinished {
+    pub id: String,
+    pub done: u64,
+    pub total: u64,
+}
+pub fn unfinished(root: &Path) -> Vec<Unfinished> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(root.join("temp"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix("-cloud-progress.json"))
+        else {
+            continue;
+        };
+        if let Some(progress) = read(root, id).filter(still_valid) {
+            if !progress.parts.is_empty() && (progress.parts.len() as u64) < progress.total {
+                found.push(Unfinished {
+                    id: id.to_owned(),
+                    done: progress.parts.len() as u64,
+                    total: progress.total,
+                });
+            }
+        }
+    }
+    found
 }
 fn write_atomic(target: &Path, value: &CloudProgress) -> Result<(), String> {
     use std::io::Write;
@@ -170,14 +213,36 @@ mod tests {
         fs::write(&input, b"audio").unwrap();
         let mut progress = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3).unwrap();
         assert!(progress.parts().is_empty());
-        progress.commit(&root, "one".into()).unwrap();
-        progress.commit(&root, "two".into()).unwrap();
+        progress.commit(&root, "one".into(), false).unwrap();
+        progress.commit(&root, "two".into(), true).unwrap();
         assert_eq!(
             resumable(&root, "rec").unwrap(),
             serde_json::json!({"done":2,"total":3,"configuration":config("a")})
         );
+        assert_eq!(
+            unfinished(&root),
+            [Unfinished {
+                id: "rec".into(),
+                done: 2,
+                total: 3
+            }]
+        );
         let again = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3).unwrap();
         assert_eq!(again.parts(), ["one", "two"]);
+        assert_eq!(
+            again.incomplete(),
+            [1],
+            "the unfinished passage survives a restart"
+        );
+        // A progress file written before this field existed still resumes.
+        let legacy = fs::read_to_string(path(&root, "rec"))
+            .unwrap()
+            .replace(",\"incomplete\":[1]", "");
+        assert!(!legacy.contains("incomplete"));
+        fs::write(path(&root, "rec"), legacy).unwrap();
+        let legacy = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3).unwrap();
+        assert_eq!(legacy.parts(), ["one", "two"]);
+        assert!(legacy.incomplete().is_empty());
         // A different chunk count means different boundaries.
         assert!(
             CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 4)
@@ -187,7 +252,7 @@ mod tests {
         );
         assert!(resumable(&root, "rec").is_none());
         let mut progress = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3).unwrap();
-        progress.commit(&root, "one".into()).unwrap();
+        progress.commit(&root, "one".into(), false).unwrap();
         assert!(
             CloudProgress::begin(&root, "rec", &config("b"), &input, 30, 3)
                 .unwrap()
@@ -195,7 +260,7 @@ mod tests {
                 .is_empty()
         );
         let mut progress = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3).unwrap();
-        progress.commit(&root, "one".into()).unwrap();
+        progress.commit(&root, "one".into(), false).unwrap();
         fs::write(&input, b"changed audio").unwrap();
         assert!(resumable(&root, "rec").is_none());
         assert!(
@@ -205,7 +270,7 @@ mod tests {
                 .is_empty()
         );
         let mut progress = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3).unwrap();
-        progress.commit(&root, "one".into()).unwrap();
+        progress.commit(&root, "one".into(), false).unwrap();
         remove_all(&root);
         assert!(!path(&root, "rec").exists());
         fs::remove_dir_all(root).unwrap();
