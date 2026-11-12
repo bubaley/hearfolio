@@ -70,10 +70,36 @@ class TransferArgs {
     var success: Boolean = false
 }
 
+@InvokeArg
+class SecretArgs { var name: String = ""; var value: String = "" }
+@InvokeArg
+class UploadServiceArgs { var count: Int = 0; var current: Long = 0; var total: Long = 0 }
+
 @TauriPlugin(permissions = [Permission(strings = [Manifest.permission.RECORD_AUDIO], alias = "microphone"), Permission(strings = [Manifest.permission.POST_NOTIFICATIONS], alias = "notifications")])
 class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
     private var discoveryRequested = false
     private val discoveryOwner = "activity:${System.identityHashCode(this)}"
+    private fun secretName(name: String) = name.takeIf { it.isNotEmpty() && it.length <= 80 && it.all { c -> c.isLetterOrDigit() || c == '-' } }
+    @Command fun secretPut(invoke: Invoke) {
+        val args = invoke.parseArgs(SecretArgs::class.java); val name = secretName(args.name)
+        if (name == null) { invoke.reject("errors.orgSecretStore"); return }
+        try { SecretStore.put(activity.applicationContext, name, args.value); invoke.resolve() } catch (_: Exception) { invoke.reject("errors.orgSecretStore") }
+    }
+    @Command fun secretGet(invoke: Invoke) {
+        val name = secretName(invoke.parseArgs(SecretArgs::class.java).name)
+        if (name == null) { invoke.reject("errors.orgSecretStore"); return }
+        invoke.resolve(JSObject().put("value", SecretStore.get(activity.applicationContext, name)))
+    }
+    @Command fun secretDelete(invoke: Invoke) {
+        val name = secretName(invoke.parseArgs(SecretArgs::class.java).name)
+        if (name != null) SecretStore.delete(activity.applicationContext, name)
+        invoke.resolve()
+    }
+    @Command fun uploadService(invoke: Invoke) {
+        val args = invoke.parseArgs(UploadServiceArgs::class.java)
+        UploadService.update(activity.applicationContext, args.count, args.current, args.total)
+        invoke.resolve()
+    }
     @Command fun startLanDiscovery(invoke: Invoke) {discoveryRequested=true;LanDiscovery.acquire(activity,discoveryOwner);invoke.resolve()}
     override fun onResume(activity: AppCompatActivity) {if(discoveryRequested) LanDiscovery.acquire(activity,discoveryOwner)}
     override fun onStop(activity: AppCompatActivity) {LanDiscovery.release(discoveryOwner)}

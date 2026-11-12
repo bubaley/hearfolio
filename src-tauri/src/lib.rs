@@ -3,6 +3,7 @@ mod background;
 mod cloud;
 mod cloud_job;
 mod compact;
+mod org;
 mod platform;
 mod postprocess;
 mod recording;
@@ -123,6 +124,30 @@ fn bin(name: &str) -> Option<PathBuf> {
     paths
         .into_iter()
         .find(|path| path.is_file() && Command::new(path).arg("--help").output().is_ok())
+}
+/// Display title of an archive name: `Meeting.m4a` → `Meeting`.
+pub(crate) fn record_name_title(name: &str) -> String {
+    let path = Path::new(name);
+    let audio = path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        ["m4a", "mp3", "wav", "aac", "flac", "ogg", "mp4", "webm"]
+            .contains(&e.to_ascii_lowercase().as_str())
+    });
+    let title = if audio {
+        path.file_stem().and_then(|s| s.to_str()).unwrap_or(name)
+    } else {
+        name
+    };
+    let title: String = title
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    if title.is_empty() {
+        "Recording".into()
+    } else {
+        title
+    }
 }
 fn base() -> Result<PathBuf, String> {
     storage::active_root()
@@ -1439,7 +1464,16 @@ fn save_text(path: String, content: String) -> Result<(), String> {
 }
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Must be first: a second launch (Windows/Linux deep link) forwards its URL here.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+    }));
+    let builder = builder
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
@@ -1467,6 +1501,7 @@ pub fn run() {
                 app.asset_protocol_scope()
                     .allow_directory(root.join("input"), false)?;
             }
+            org::install(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1534,7 +1569,28 @@ pub fn run() {
             clear_history,
             download_model,
             transcribe,
-            save_text
+            save_text,
+            org::commands::org_state,
+            org::commands::org_connect_start,
+            org::commands::org_connect_cancel,
+            org::commands::org_disconnect,
+            org::commands::org_refresh_connection,
+            org::commands::org_set_destination,
+            org::commands::org_set_retention,
+            org::commands::org_clear_cache,
+            org::commands::org_projects,
+            org::commands::org_library,
+            org::commands::org_sync,
+            org::commands::org_recording,
+            org::commands::org_retry_recording,
+            org::commands::org_enqueue_record,
+            org::commands::org_retry_upload,
+            org::commands::org_wake,
+            org::commands::org_cancel_upload,
+            org::commands::org_keep_local,
+            org::commands::org_audio,
+            org::commands::org_cache_audio,
+            org::commands::org_prepare_native_playback
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

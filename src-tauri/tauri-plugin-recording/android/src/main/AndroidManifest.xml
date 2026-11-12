@@ -24,6 +24,7 @@
         <service android:name=".InboxService" android:exported="false" android:foregroundServiceType="connectedDevice|dataSync" android:stopWithTask="false" />
         <service android:name=".OperationService" android:exported="false" android:foregroundServiceType="dataSync" android:stopWithTask="false" />
         <service android:name=".TransferService" android:exported="false" android:foregroundServiceType="dataSync" android:stopWithTask="false" />
+        <service android:name=".UploadService" android:exported="false" android:foregroundServiceType="dataSync" android:stopWithTask="false" />
     </application>
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <application>

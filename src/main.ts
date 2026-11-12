@@ -12,11 +12,12 @@ import './transfers.css';
 import {renderSettings, initialSettingsDraft, mergeSettingsDraft, hasSettingsChanges, isSettingsSection, settingsLabel, type SettingsSection, type SettingsDraft} from './settings-ui';
 import {recordingInputLevel, call, pickAudio, startAudioRecording, stopAudioRecording, cancelAudioRecording, discardAudioRecording, exportText, subscribe, subscribeAudioDrop, registerPreviewFile, audioSource, shareAudio, shareText, saveAudio, prepareNativePlayback, nativePlaybackState, playNativePlayback, pauseNativePlayback, seekNativePlayback, releaseNativePlayback, type NativePlayerState, type PartialTextEvent, type CloudResume, openExternal, openAndroidBatterySettings, pickStorageParent, loadRuntimePlatform, previewCapabilities, appVersion, checkDesktopUpdate, latestAndroidRelease, restartApp, isNewerVersion, preview, listLooseRecordings, adoptLooseRecording, exportLooseRecording, type LooseRecording, type AudioSelection, type Entry, type Progress, type Settings, type CloudModel, type RecognitionConfig, type RuntimeCapabilities, type AndroidRelease, type AppUpdate} from './api';
 import {icon, escapeHtml as esc} from './icons';
+import {initOrg, bindOrg, sourceTabsHtml, isCloudSource, cloudListHtml, cloudDetailHtml, closeDetail as closeOrgDetail, detailTitle as orgDetailTitle, destinationChipHtml, afterImport as orgAfterImport, copyToOrganization, hasOrganizations, orgSettingsHtml} from './org';
 import {tr, locale, countLabel, errorText, setLanguage, currentLanguage, type LanguagePreference} from './i18n';
 
 import {setupPostprocess, rulesHtml, postprocessHtml, resultsHtml, textPickerHtml, textPickerOpen, bindPostprocess, ensureRules, hasRuleDraft, mayLeaveRules, restorePostprocessActivity} from './postprocess';
 
-type View = 'work' | 'history' | 'archive' | 'models' | 'settings' | 'rules' | 'devices';
+type View = 'work' | 'history' | 'archive' | 'models' | 'settings' | 'rules' | 'devices' | 'cloud';
 let settingsSection:SettingsSection|null=null, settingsSaving=false, settingsError='';
 const models = [
   {id:'whisper-tiny',name:'Whisper Tiny',detail:"Для коротких заметок. Быстрее остальных, но чаще ошибается.",size:"75 МБ",installed:false},
@@ -168,7 +169,7 @@ function paintProgress(now:number){
 }
 let recordingPausedAt=0,recordingPausedMillis=0;
 document.documentElement.dataset.theme=theme;
-const title:Record<View,string>={work:"Запись",history:"Записи",archive:"Архив",models:"Модели",settings:"Настройки",devices:"Устройства",rules:"Правила обработки"};
+const title:Record<View,string>={work:"Запись",history:"Записи",archive:"Архив",models:"Модели",settings:"Настройки",devices:"Устройства",rules:"Правила обработки",cloud:"Запись"};
 const formatTime=(seconds:number)=>{const whole=Math.floor(seconds),pad=(value:number)=>String(value).padStart(2,'0');return whole>=3600?`${Math.floor(whole/3600)}:${pad(Math.floor(whole/60)%60)}:${pad(whole%60)}`:`${Math.floor(whole/60)}:${pad(whole%60)}`;};
 const dateLabel=(timestamp:number)=>new Date(timestamp).toLocaleDateString(locale(),{day:'numeric',month:'long'});
 const audioFormats='MP3, M4A, WAV, AAC, FLAC, OGG, MP4';
@@ -276,6 +277,7 @@ function historyItems(entries:Entry[]):string {
   }).join('');
 }
 function historyResults():string {
+  if(isCloudSource())return cloudListHtml();
   const entries=history.filter(entry=>entry.name.toLocaleLowerCase().includes(search.toLocaleLowerCase()));
   if (loading) return `<div class="list-empty"><span class="spinner"></span>${tr('Загружаем записи…')}</div>`;
   if (historyError) return `<div class="list-empty">${esc(historyError)}<button class="text-button" id="retry-history">${tr('Повторить')}</button></div>`;
@@ -290,17 +292,17 @@ function archiveNavHtml():string {return `<button class="nav-item ${view==='arch
 function sidebarHtml():string {
   if(platform.mobile)return '';
   const locked=recordingPhase!=='idle'||busy||platform.os==='unknown';
-  return `<aside class="sidebar" aria-label="${tr('Записи')}"><div class="sidebar-chrome" data-tauri-drag-region><button class="icon-button" id="collapse" title="${tr('Скрыть список')} · ⌘B" aria-label="${tr('Скрыть список')}" aria-expanded="true">${icon('panel')}</button></div><div class="sidebar-body"><button class="brand" id="new" title="${tr('Новая запись')} · ⌘N" ${locked?'disabled':''}>${brandHtml()}</button><div class="sidebar-actions">${platform.audioRecording?`<button class="record-cta" id="quick-record" ${locked?'disabled':''}><span class="record-dot" aria-hidden="true"></span>${tr('Записать')}</button>`:''}<button class="secondary import-cta" data-choose title="${tr('Открыть аудиофайл')} · ⌘O" ${locked?'disabled':''}>${icon('upload')}<span>${tr('Файл')}</span></button></div>${history.length>3||search?searchFieldHtml():''}<div class="record-list" id="history-results">${historyResults()}</div><nav class="sidebar-nav" aria-label="${tr('Приложение')}">${archiveNavHtml()}${desktopModelsNav()}<button class="nav-item ${view==='devices'?'active':''}" data-view="devices">${icon('devices')}<span>${tr('Устройства')}</span></button><button class="nav-item ${view==='settings'||view==='rules'?'active':''}" data-view="settings">${icon('settings')}<span>${tr('Настройки')}</span></button><button class="icon-button" data-theme title="${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}" aria-label="${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}">${icon(theme==='dark'?'sun':'moon')}</button></nav></div></aside>`;
+  return `<aside class="sidebar" aria-label="${tr('Записи')}"><div class="sidebar-chrome" data-tauri-drag-region><button class="icon-button" id="collapse" title="${tr('Скрыть список')} · ⌘B" aria-label="${tr('Скрыть список')}" aria-expanded="true">${icon('panel')}</button></div><div class="sidebar-body"><button class="brand" id="new" title="${tr('Новая запись')} · ⌘N" ${locked?'disabled':''}>${brandHtml()}</button><div class="sidebar-actions">${platform.audioRecording?`<button class="record-cta" id="quick-record" ${locked?'disabled':''}><span class="record-dot" aria-hidden="true"></span>${tr('Записать')}</button>`:''}<button class="secondary import-cta" data-choose title="${tr('Открыть аудиофайл')} · ⌘O" ${locked?'disabled':''}>${icon('upload')}<span>${tr('Файл')}</span></button></div>${sourceTabsHtml()}${history.length>3||search||isCloudSource()?searchFieldHtml():''}<div class="record-list" id="history-results">${historyResults()}</div><nav class="sidebar-nav" aria-label="${tr('Приложение')}">${archiveNavHtml()}${desktopModelsNav()}<button class="nav-item ${view==='devices'?'active':''}" data-view="devices">${icon('devices')}<span>${tr('Устройства')}</span></button><button class="nav-item ${view==='settings'||view==='rules'?'active':''}" data-view="settings">${icon('settings')}<span>${tr('Настройки')}</span></button><button class="icon-button" data-theme title="${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}" aria-label="${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}">${icon(theme==='dark'?'sun':'moon')}</button></nav></div></aside>`;
 }
 function recordOrbHtml(id:string,label:string):string {return `<button class="record-orb" id="${id}" ${disabled()} aria-label="${label}"><span class="record-orb-core" aria-hidden="true"></span></button>`;}
 function captureHtml():string {
   if(recordingPhase!=='idle'){
     const live=['recording','paused'].includes(recordingPhase),paused=recordingPhase==='paused',locked=!live||recordingControlPending?'disabled':'';
     const label=tr(recordingPhase==='starting'?'Подключаем микрофон…':recordingPhase==='stopping'?'Сохраняем аудио…':recordingPhase==='cancelling'?'Отменяем запись…':paused?'Пауза':'Идёт запись');
-    return `<section class="recorder ${paused?'recorder-paused':''} ${live?'':'recorder-busy'}" aria-label="${tr('Диктофон')}"><div class="recorder-state"><span class="recorder-dot" aria-hidden="true"></span><span>${label}</span></div>${durationHtml()}${recordingMeterHtml()}<div class="recorder-actions"><button type="button" class="round-button" id="cancel-recording" ${locked} aria-label="${tr('Отменить запись')}" title="${tr('Отменить запись')}">${icon('close')}</button><button type="button" class="record-orb recording" id="stop-recording" ${locked} aria-label="${tr('Остановить и сохранить')}"><span class="stop-symbol" aria-hidden="true"></span></button><button type="button" class="round-button" id="pause-recording" ${locked} aria-label="${tr(paused?'Продолжить':'Пауза')}" title="${tr(paused?'Продолжить':'Пауза')}">${icon(paused?'play':'pause')}</button></div><p class="recorder-hint">${tr(platform.os==='android'?'Запись продолжится, даже если заблокировать экран.':'Нажмите ■, чтобы сохранить запись.')}</p></section>`;
+    return `<section class="recorder ${paused?'recorder-paused':''} ${live?'':'recorder-busy'}" aria-label="${tr('Диктофон')}"><div class="recorder-state"><span class="recorder-dot" aria-hidden="true"></span><span>${label}</span></div>${durationHtml()}${recordingMeterHtml()}<div class="recorder-actions"><button type="button" class="round-button" id="cancel-recording" ${locked} aria-label="${tr('Отменить запись')}" title="${tr('Отменить запись')}">${icon('close')}</button><button type="button" class="record-orb recording" id="stop-recording" ${locked} aria-label="${tr('Остановить и сохранить')}"><span class="stop-symbol" aria-hidden="true"></span></button><button type="button" class="round-button" id="pause-recording" ${locked} aria-label="${tr(paused?'Продолжить':'Пауза')}" title="${tr(paused?'Продолжить':'Пауза')}">${icon(paused?'play':'pause')}</button></div>${destinationChipHtml(true)}<p class="recorder-hint">${tr(platform.os==='android'?'Запись продолжится, даже если заблокировать экран.':'Нажмите ■, чтобы сохранить запись.')}</p></section>`;
   }
   if(pendingRecording)return `<section class="welcome"><h1>${tr('Аудио записано')}</h1><p>${tr('Сохраните запись, чтобы расшифровать её.')}</p><div class="welcome-actions"><button class="primary large" id="retry-recording" ${disabled()}>${tr('Сохранить запись')}</button><button class="text-button danger" id="discard-recording" ${disabled()}>${tr('Удалить')}</button></div></section>`;
-  return `<section class="welcome" id="drop-area">${platform.audioRecording?`${recordOrbHtml('start-recording',tr('Начать запись'))}<h1>${tr('Нажмите, чтобы записать')}</h1><p>${tr('Или')} <button class="link-button" data-choose ${disabled()}>${tr('выберите аудиофайл')}</button>${platform.mobile?'':tr(' — его можно просто перетащить сюда')}.</p>`:`<button class="drop-target" data-choose ${disabled()}>${icon('upload')}</button><h1>${tr('Добавьте аудиофайл')}</h1><p>${tr('Перетащите файл сюда или')} <button class="link-button" data-choose ${disabled()}>${tr('выберите на диске')}</button>.</p>`}<small>${audioFormats}</small></section>`;
+  return `<section class="welcome" id="drop-area">${platform.audioRecording?`${recordOrbHtml('start-recording',tr('Начать запись'))}<h1>${tr('Нажмите, чтобы записать')}</h1><p>${tr('Или')} <button class="link-button" data-choose ${disabled()}>${tr('выберите аудиофайл')}</button>${platform.mobile?'':tr(' — его можно просто перетащить сюда')}.</p>`:`<button class="drop-target" data-choose ${disabled()}>${icon('upload')}</button><h1>${tr('Добавьте аудиофайл')}</h1><p>${tr('Перетащите файл сюда или')} <button class="link-button" data-choose ${disabled()}>${tr('выберите на диске')}</button>.</p>`}<small>${audioFormats}</small>${destinationChipHtml()}</section>`;
 }
 function stageHtml():string {
   const transcribing=busy&&progress?.kind==='transcribe',percent=transcribing?progressPercent():null;
@@ -381,7 +383,7 @@ function nativePlayerHtml():string {
 function homeHtml():string {
   const job=jobRecord()?history.find(entry=>entry.id===jobRecord()):null;
   const restoreBanner=restoring?`<div class="job-banner" role="status"><span class="spinner"></span><span><strong>${tr('Восстанавливаем запись…')}</strong><small>${tr('Аудио сохранено. Это займёт немного времени.')}</small></span></div>`:'';
-  return `<section class="home">${restoreBanner}${job?`<button class="job-banner" data-history="${esc(job.id)}"><span class="spinner"></span><span><strong>${esc(displayName(job))}</strong><small>${esc(progress?.stage||'')}${progressPercent()!==null?` · ${progressPercent()}%`:''}</small></span>${icon('chevron')}</button>`:''}${history.length>5||search?searchFieldHtml():''}<div class="record-list" id="history-results">${historyResults()}</div></section><div class="home-dock"><button class="dock-side" data-choose ${disabled()}>${icon('upload')}<span>${tr('Файл')}</span></button>${platform.audioRecording?recordOrbHtml('quick-record',tr('Начать запись')):''}<span class="dock-side" aria-hidden="true"></span></div>`;
+  return `<section class="home">${restoreBanner}${job?`<button class="job-banner" data-history="${esc(job.id)}"><span class="spinner"></span><span><strong>${esc(displayName(job))}</strong><small>${esc(progress?.stage||'')}${progressPercent()!==null?` · ${progressPercent()}%`:''}</small></span>${icon('chevron')}</button>`:''}${sourceTabsHtml()}${history.length>5||search||isCloudSource()?searchFieldHtml():''}<div class="record-list" id="history-results">${historyResults()}</div></section>${hasOrganizations()?`<div class="home-destination">${destinationChipHtml(true)}</div>`:''}<div class="home-dock"><button class="dock-side" data-choose ${disabled()}>${icon('upload')}<span>${tr('Файл')}</span></button>${platform.audioRecording?recordOrbHtml('quick-record',tr('Начать запись')):''}<span class="dock-side" aria-hidden="true"></span></div>`;
 }
 function modelsHtml():string {
   const installationCommand=platform.os==='linux'?'sudo apt install ffmpeg':'brew install ffmpeg whisper.cpp';
@@ -431,10 +433,11 @@ function bindArchive(){
   document.querySelectorAll<HTMLElement>('[data-archive-save]').forEach(element=>element.onclick=()=>{const entry=saved(element.dataset.archiveSave!);if(entry)void saveAudio(entry).catch(error=>notice(errorText(error),true));});
 }
 function settingsHtml():string {
-  return renderSettings({settings,draft:settingsDraft,section:settingsSection||(!platform.mobile&&window.innerWidth>760?'general':null),mobile:platform.mobile,android:platform.os==='android',theme,busy,saving:settingsSaving,error:settingsError,customStorage:platform.customStorage,transferMvp:Boolean(platform.transferMvp),version:applicationVersion,devicesHtml:transferSettingsHtml(),updatesHtml:updatesHtml(),recordCount:history.length});
+  return renderSettings({settings,draft:settingsDraft,section:settingsSection||(!platform.mobile&&window.innerWidth>760?'general':null),mobile:platform.mobile,android:platform.os==='android',theme,busy,saving:settingsSaving,error:settingsError,customStorage:platform.customStorage,transferMvp:Boolean(platform.transferMvp),version:applicationVersion,devicesHtml:transferSettingsHtml(),cloudHtml:orgSettingsHtml(),updatesHtml:updatesHtml(),recordCount:history.length});
 }
 function headerTitle():string {
   if(view==='work')return tr(recordingPhase!=='idle'?'Диктофон':active?'Запись':'Новая запись');
+  if(view==='cloud')return platform.mobile?orgDetailTitle():tr('Запись');
   return tr(title[view]);
 }
 function mobileHeaderHtml():string {
@@ -510,6 +513,7 @@ function desktopHeaderHtml():string {
   return `<header class="main-header" data-tauri-drag-region><div class="header-title" data-tauri-drag-region><button class="icon-button" id="expand" title="${tr('Показать список')} · ⌘B" aria-label="${tr('Показать список')}" aria-expanded="false">${icon('panel')}</button><span data-tauri-drag-region>${esc(headerTitle())}</span></div><div class="header-status"><div id="update-header">${updateHeaderHtml()}</div>${activity&&view!=='work'?`<span class="header-activity"><span class="spinner"></span>${esc(activity)}</span>`:''}${preview?`<span class="preview-label">${tr('Предпросмотр')}</span>`:''}</div></header>`;
 }
 function surfaceHtml():string {
+  if(view==='cloud')return cloudDetailHtml();
   if(view==='history'&&platform.mobile)return homeHtml();
   if(view==='work'||view==='history')return workHtml();
   return `<div class="page-scroll ${view==='devices'&&!platform.mobile?'devices-scroll':''}"><div class="page-content ${view==='devices'?'devices-page':''}">${view==='archive'?archiveHtml():view==='models'?modelsHtml():view==='devices'?devicesHtml():view==='rules'?rulesHtml():settingsHtml()}${busy&&progress?`<div id="progress">${progressHtml()}</div>`:''}</div></div>`;
@@ -524,7 +528,7 @@ function render() {
   document.documentElement.dataset.platform=platform.os;
   // Dialogs live in <body>, outside the shell: the platform class on the root reaches them too.
   document.documentElement.classList.toggle('mobile-platform',platform.mobile);
-  app.innerHTML=`<div ${(platform.mobile&&catalogOpen)||textPickerOpen()?'inert':''} class="shell ${sidebarCollapsed?'sidebar-collapsed':''} ${platform.mobile?'mobile-platform':''} view-${view}">${sidebarHtml()}<main>${platform.mobile?mobileHeaderHtml():desktopHeaderHtml()}<div class="main-surface ${view==='work'||view==='history'?'work-surface':`page-surface ${view}-surface`}">${surfaceHtml()}<div id="status" class="notice ${isError?'error':''}" role="status" aria-live="polite"></div></div></main></div>${platform.mobile&&catalogOpen?`<div class="catalog-backdrop" id="catalog-backdrop">${catalogHtml()}</div>`:''}${textPickerHtml()}`;
+  app.innerHTML=`<div ${(platform.mobile&&catalogOpen)||textPickerOpen()?'inert':''} class="shell ${sidebarCollapsed?'sidebar-collapsed':''} ${platform.mobile?'mobile-platform':''} view-${view}">${sidebarHtml()}<main>${platform.mobile?mobileHeaderHtml():desktopHeaderHtml()}<div class="main-surface ${view==='work'||view==='history'||view==='cloud'?'work-surface':`page-surface ${view}-surface`}">${surfaceHtml()}<div id="status" class="notice ${isError?'error':''}" role="status" aria-live="polite"></div></div></main></div>${platform.mobile&&catalogOpen?`<div class="catalog-backdrop" id="catalog-backdrop">${catalogHtml()}</div>`:''}${textPickerHtml()}`;
   // Re-use the playing <audio> element so unrelated re-renders never interrupt playback.
   const slot=document.querySelector<HTMLAudioElement>('#audio');let reused=false;
   if(kept&&slot&&kept.getAttribute('src')===slot.getAttribute('src')){slot.replaceWith(kept);reused=true;}
@@ -577,6 +581,7 @@ async function changeView(target:View, settingsTarget?:SettingsSection):Promise<
   // Desktop keeps the record list in the sidebar, so "history" means focusing its search.
   if(target==='history'&&!platform.mobile){if(view!=='work'&&!await changeView('work'))return;if(sidebarCollapsed)setSidebar(false);document.querySelector<HTMLInputElement>('#history-search')?.focus();return;}
   if(view==='rules'&&target!=='rules'&&!await mayLeaveRules())return;
+  if(view==='cloud'&&target!=='cloud')closeOrgDetail();
   if(target==='models'&&!platform.localRecognition)return;
   if((view==='settings'||view==='devices')&&target!==view&&!await mayLeaveSettings())return;
   if(target==='settings') {
@@ -617,14 +622,14 @@ function bind() {
   document.querySelector('#record-share')?.addEventListener('click',openRecordActions);
   document.querySelectorAll<HTMLElement>('[data-download]').forEach(element=>element.onclick=()=>download(element.dataset.download!));
   bindRecordActions();
-  document.querySelector<HTMLInputElement>('#history-search')?.addEventListener('input',event=>{search=(event.target as HTMLInputElement).value;const results=document.querySelector('#history-results');if(results){results.innerHTML=historyResults();bindRecordActions();results.querySelector('#retry-history')?.addEventListener('click',()=>refreshHistory());}});
+  document.querySelector<HTMLInputElement>('#history-search')?.addEventListener('input',event=>{search=(event.target as HTMLInputElement).value;const results=document.querySelector('#history-results');if(results){results.innerHTML=historyResults();bindRecordActions();bindOrg();results.querySelector('#retry-history')?.addEventListener('click',()=>refreshHistory());}});
   document.querySelector('#clear')?.addEventListener('click',clearHistory);
   document.querySelector('#retry-history')?.addEventListener('click',()=>refreshHistory());
   document.querySelector('#retry-runtime')?.addEventListener('click',()=>refreshRuntime());
   document.querySelector('#copy-install')?.addEventListener('click',()=>copyText(platform.os==='linux'?'sudo apt install ffmpeg':'brew install ffmpeg whisper.cpp'));
   document.querySelector('#restore')?.addEventListener('click',()=>{if(previousResult){text=previousResult.text;resultSaved=previousResult.saved;previousResult=null;render();}});
   document.querySelectorAll<HTMLAnchorElement>('a[href^="https://"]').forEach(anchor=>anchor.onclick=event=>{event.preventDefault();openExternal(anchor.href).catch(error=>notice(errorText(error),true));});
-  bindSettings();bindUpdates();bindTransfers(active);bindArchive();
+  bindSettings();bindUpdates();bindTransfers(active);bindArchive();bindOrg();
 }
 function setSidebar(collapsed:boolean) {sidebarCollapsed=collapsed;localStorage.setItem('hearfolio-sidebar',collapsed?'collapsed':'expanded');render();}
 let recordActionsDialog:HTMLDialogElement|null=null;
@@ -633,9 +638,9 @@ function openRecordActions(){
   const entry=active,transcript=text,trigger=document.querySelector<HTMLElement>('#record-share');
   const dialog=document.createElement('dialog');recordActionsDialog=dialog;dialog.className='record-actions-dialog';dialog.id='record-actions-dialog';trigger?.setAttribute('aria-expanded','true');dialog.setAttribute('aria-labelledby','record-actions-title');
   const action=(name:string,label:string,glyph:string)=>`<button type="button" data-record-action="${name}">${icon(glyph)}<span>${tr(label)}</span></button>`;
-  dialog.innerHTML=`<div class="record-actions-heading"><h2 id="record-actions-title">${tr('Поделиться')}</h2><button type="button" class="icon-button" data-actions-close aria-label="${tr('Закрыть')}">${icon('close')}</button></div><div class="record-actions-group">${action('share-audio','Поделиться аудио','share')}${transcript.trim()?action('share-text','Поделиться текстом','file'):''}${!busy?action('device','На другое устройство','devices'):''}</div><div class="record-actions-group">${action('save-audio','Сохранить аудио','download')}${transcript.trim()?action('save-text','Сохранить текст','download')+action('copy-text','Копировать текст','copy'):''}</div>`;
+  dialog.innerHTML=`<div class="record-actions-heading"><h2 id="record-actions-title">${tr('Поделиться')}</h2><button type="button" class="icon-button" data-actions-close aria-label="${tr('Закрыть')}">${icon('close')}</button></div><div class="record-actions-group">${action('share-audio','Поделиться аудио','share')}${transcript.trim()?action('share-text','Поделиться текстом','file'):''}${!busy?action('device','На другое устройство','devices'):''}${hasOrganizations()?action('organization','Копировать в организацию','cloud'):''}</div><div class="record-actions-group">${action('save-audio','Сохранить аудио','download')}${transcript.trim()?action('save-text','Сохранить текст','download')+action('copy-text','Копировать текст','copy'):''}</div>`;
   dialog.querySelector('[data-actions-close]')?.addEventListener('click',()=>dialog.close());
-  dialog.querySelectorAll<HTMLElement>('[data-record-action]').forEach(button=>button.onclick=()=>{const choice=button.dataset.recordAction;dialog.close();if(choice==='device'){shareRecordingToDevice(entry);return;}const operation=choice==='share-audio'?shareAudio(entry):choice==='save-audio'?saveAudio(entry):choice==='share-text'?shareText(entry.name,transcript):choice==='save-text'?exportText(recordNameParts(entry.name,entry.inputPath).title.replace(/[\/\\:\u0000-\u001f]/g,'-')+'.txt',transcript):copyText(transcript);void operation.catch(error=>notice(errorText(error),true));});
+  dialog.querySelectorAll<HTMLElement>('[data-record-action]').forEach(button=>button.onclick=()=>{const choice=button.dataset.recordAction;dialog.close();if(choice==='device'){shareRecordingToDevice(entry);return;}if(choice==='organization'){void copyToOrganization(entry,displayName(entry));return;}const operation=choice==='share-audio'?shareAudio(entry):choice==='save-audio'?saveAudio(entry):choice==='share-text'?shareText(entry.name,transcript):choice==='save-text'?exportText(recordNameParts(entry.name,entry.inputPath).title.replace(/[\/\\:\u0000-\u001f]/g,'-')+'.txt',transcript):copyText(transcript);void operation.catch(error=>notice(errorText(error),true));});
   dialog.addEventListener('click',event=>{if(event.target===dialog){const rect=dialog.getBoundingClientRect();if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)dialog.close();}});
   dialog.addEventListener('close',()=>{dialog.remove();if(recordActionsDialog===dialog)recordActionsDialog=null;trigger?.setAttribute('aria-expanded','false');if(trigger?.isConnected)trigger.focus({preventScroll:true});});
   document.body.append(dialog);dialog.showModal();dialog.querySelector<HTMLElement>('[data-record-action]')?.focus();
@@ -830,7 +835,7 @@ async function stopRecording(){
     pendingRecording=await stopAudioRecording();recordingPhase='idle';
     if(!pendingRecording)throw new Error('errors.recordingEmpty');
     pendingRecording={...pendingRecording,name:recordingName(pendingRecording)};
-    await importSelection(pendingRecording);
+    await importSelection(pendingRecording,'recording');
   }catch(error){
     if(platform.os==='android'&&!preview){await syncNativeRecording(true);render();if(['recording','paused'].includes(recordingPhase))notice(errorText(error),true);}
     else{await cancelAudioRecording().catch(()=>{});recordingPhase='idle';busy=false;render();notice(errorText(error),true);}
@@ -847,7 +852,7 @@ async function cancelRecording(){
   }catch(error){if(platform.os==='android'&&!preview)await syncNativeRecording(true);else resetRecorderUi();if(!['idle'].includes(recordingPhase))notice(errorText(error),true);}
   finally{recordingControlPending=false;render();}
 }
-async function importSelection(selected:AudioSelection):Promise<boolean>{
+async function importSelection(selected:AudioSelection,kind:'recording'|'import'|'recovered'='import'):Promise<boolean>{
   beginOperation('import',tr('Добавляем запись'));settingsDraft=null;view='work';render();
   let imported=false;
   try{
@@ -855,6 +860,8 @@ async function importSelection(selected:AudioSelection):Promise<boolean>{
     // Native recovery can report this same archived recording after the user
     // has opened a new capture. Share its receipt with the recovery handler.
     if(platform.os==='android')markOperationHandled(`recording:${entry.id}`);
+    // Recording into an organization: the queued upload owns it from here.
+    if(kind!=='recovered'&&await orgAfterImport(entry,kind)){imported=true;pendingRecording=null;void refreshHistory();return true;}
     imported=true;pendingRecording=null;resetPlayback();active=entry;restoreConfiguration(entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;
     const refreshed=await Promise.allSettled([call<Settings>('get_settings'),call<Entry[]>('list_history')]);
     if(refreshed[0].status==='fulfilled')settings=refreshed[0].value;
@@ -1000,13 +1007,14 @@ async function initialize() {
     finally{clearTimeout(slow);if(restoring){restoring=false;render();}}
   }
   // A crash during a desktop recording leaves a repaired WAV in temp; archive it instead of losing it.
-  if(!preview&&['macos','linux','windows'].includes(platform.os)){try{const recovered=await call<AudioSelection[]>('recover_audio_recordings');for(const selection of recovered)await importSelection(selection);if(recovered.length)notice(`${tr('Восстановлено записей после сбоя:')} ${recovered.length}`);}catch(error){notice(errorText(error),true);}}
+  if(!preview&&['macos','linux','windows'].includes(platform.os)){try{const recovered=await call<AudioSelection[]>('recover_audio_recordings');for(const selection of recovered)await importSelection(selection,'recovered');if(recovered.length)notice(`${tr('Восстановлено записей после сбоя:')} ${recovered.length}`);}catch(error){notice(errorText(error),true);}}
   // A transcription cut short by a crash or a forced quit: say so once and offer to continue.
   if(!preview&&!platform.mobile){try{const snapshot=await call<OperationSnapshot>('operation_activity_snapshot');if(snapshot.state==='interrupted'&&snapshot.kind==='transcribe')await consumeNativeOperation(snapshot);}catch{/* Nothing to report. */}}
   await refreshLoose();if(loose.length&&!status)notice(`${tr('Не обработано записей:')} ${loose.length}. ${tr('Они в «Архиве».')}`,true);
   if(!preview)void checkUpdates();
 }
 void initialize();
+void initOrg({render:()=>render(),notice,confirm:(heading,message,action,danger)=>confirmAction(heading,message,action,danger),openDetail:()=>{settingsDraft=null;view='cloud';if(window.innerWidth<=760&&!platform.mobile)sidebarCollapsed=true;render();},closeDetail:()=>{closeOrgDetail();view=platform.mobile?'history':'work';render();},mobile:()=>platform.mobile,android:()=>platform.os==='android'&&!preview,busy:()=>busy||recordingPhase!=='idle',searchText:()=>search,openLocal:entry=>{history=sortHistory([entry,...history.filter(item=>item.id!==entry.id)]);void loadHistory(entry.id);}}).then(()=>render());
 void initializeTransfers({refresh:refreshAfterTransfer,busy:()=>busy,setBusy:value=>{busy=value;render();},notice,confirm:(heading,message)=>confirmAction(heading,message,tr("Отключить"))});
 subscribe<null>('hearfolio-request-restart',()=>{void restartAfterUpdate(false);}).catch(error=>notice(errorText(error),true));
 setInterval(()=>{if(!preview&&Date.now()-lastUpdateCheck>=4*60*60*1000)void checkUpdates();},4*60*60*1000);
@@ -1058,7 +1066,7 @@ let lastNativeRecordingResult='';
 // starts; without a receipt a failed save would reopen its screen on every launch, even after the
 // audio was archived or deleted from Archive.
 function recordingReceipt(p:NativeRecordingResult){return p.entry?`recording:${p.entry.id}`:p.path?`recording-result:${p.path}:${p.stateRevision??''}:${p.error??''}`:'';}
-async function finishNativeRecording(p:NativeRecordingResult){const key=JSON.stringify(p),receipt=recordingReceipt(p);if(key===lastNativeRecordingResult||(receipt&&operationHandled(receipt))){if(recordingPhase!=='idle'){resetRecorderUi();render();}return;}lastNativeRecordingResult=key;if(receipt)markOperationHandled(receipt);resetRecorderUi();pendingRecording=p.selection||null;if(p.entry){resetPlayback();active=p.entry;restoreConfiguration(p.entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;view='work';await refreshHistory();}render();if(p.error)notice(errorText(p.error),true);else notice(tr('Запись сохранена'));if(!p.entry)void refreshLoose();}
+async function finishNativeRecording(p:NativeRecordingResult){const key=JSON.stringify(p),receipt=recordingReceipt(p);if(key===lastNativeRecordingResult||(receipt&&operationHandled(receipt))){if(recordingPhase!=='idle'){resetRecorderUi();render();}return;}lastNativeRecordingResult=key;if(receipt)markOperationHandled(receipt);resetRecorderUi();pendingRecording=p.selection||null;if(p.entry&&await orgAfterImport(p.entry,"recording")){await refreshHistory();render();notice(tr("Запись сохранена"));return;}if(p.entry){resetPlayback();active=p.entry;restoreConfiguration(p.entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;view='work';await refreshHistory();}render();if(p.error)notice(errorText(p.error),true);else notice(tr('Запись сохранена'));if(!p.entry)void refreshLoose();}
 subscribe<NativeRecordingResult>('recording-native-finished',p=>{if(nativeRecordingOrder.acceptResult(p))void finishNativeRecording(p);}).catch(()=>{});
 let quickFinishing=false;
 async function finishQuickRecording(){if(quickFinishing)return;quickFinishing=true;try{const entries=await call<Entry[]>('import_quick_recordings');externalRecording=false;recordingPhase='idle';busy=false;if(entries.length){const entry=entries[entries.length-1];if(!active||resultSaved||!text){resetPlayback();active=entry;restoreConfiguration(entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;}await refreshHistory();notice(tr('Запись сохранена'));}render();}catch(e){if(!String(e).includes('operationBusy')){externalRecording=false;recordingPhase='idle';busy=false;render();notice(errorText(e),true);}}finally{quickFinishing=false;}}
