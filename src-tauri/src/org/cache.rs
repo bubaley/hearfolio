@@ -151,7 +151,9 @@ mod tests {
         );
         assert_eq!(usage(&dir), Usage::default());
         aged(&dir, "a.m4a", 0);
-        assert_eq!(clear(&dir), 1);
+        fs::write(dir.join("b.m4a.part"), b"downloading").unwrap();
+        assert_eq!(clear(&dir), 1, "an in-progress download is left alone");
+        assert!(dir.join("b.m4a.part").exists());
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -23,20 +23,25 @@ class UploadService : Service() {
         const val NOTIFICATION = 4103
         const val UPDATE = "hearfolio.upload.UPDATE"
         @Volatile var running = false
+        // A start was requested but onStartCommand has not run yet. A quick
+        // "done" right after must still reach the service, or it would stay
+        // in the foreground (notification + wake lock) with nothing to do.
+        @Volatile var starting = false
 
         fun update(context: Context, count: Int, current: Long, total: Long) {
             val app = context.applicationContext
-            if (count <= 0) {
-                if (running) app.stopService(Intent(app, UploadService::class.java))
-                return
-            }
+            if (count <= 0 && !running && !starting) return
+            // Every update, including the final count=0, goes through
+            // onStartCommand in order: it enters the foreground, then stops.
             val intent = Intent(app, UploadService::class.java).setAction(UPDATE)
                 .putExtra("count", count).putExtra("current", current).putExtra("total", total)
             try {
-                if (running) app.startService(intent) else ContextCompat.startForegroundService(app, intent)
+                if (running || starting) app.startService(intent)
+                else { starting = true; ContextCompat.startForegroundService(app, intent) }
             } catch (_: Exception) {
                 // Android 12+ forbids starting from the background: the queue
                 // simply waits until the app is opened again.
+                if (!running) starting = false
             }
         }
     }
@@ -64,21 +69,31 @@ class UploadService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val count = intent?.getIntExtra("count", 0) ?: 0
+        starting = false
         val note = notification(count.coerceAtLeast(1), intent?.getLongExtra("current", 0) ?: 0, intent?.getLongExtra("total", 0) ?: 0)
         try {
+            // startForegroundService requires this call even when the answer is "stop".
             if (Build.VERSION.SDK_INT >= 29) startForeground(NOTIFICATION, note, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
             else startForeground(NOTIFICATION, note)
-            running = true
-            if (wake == null) wake = (getSystemService(POWER_SERVICE) as PowerManager)
-                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Hearfolio:upload").apply { setReferenceCounted(false); acquire(2 * 60 * 60 * 1000L) }
-        } catch (_: Exception) { stopSelf() }
-        if (count <= 0) stopSelf()
+        } catch (_: Exception) { finish(); return START_NOT_STICKY }
+        if (count <= 0) { finish(); return START_NOT_STICKY }
+        running = true
+        if (wake == null) wake = (getSystemService(POWER_SERVICE) as PowerManager)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Hearfolio:upload").apply { setReferenceCounted(false); acquire(2 * 60 * 60 * 1000L) }
         return START_NOT_STICKY
     }
 
-    override fun onTimeout(startId: Int, fgsType: Int) { stopSelf() }
+    private fun finish() {
+        running = false; starting = false
+        if (wake?.isHeld == true) wake?.release()
+        wake = null
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    override fun onTimeout(startId: Int, fgsType: Int) { finish() }
     override fun onDestroy() {
-        running = false
+        running = false; starting = false
         if (wake?.isHeld == true) wake?.release()
         wake = null
         super.onDestroy()

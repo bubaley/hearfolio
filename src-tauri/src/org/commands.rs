@@ -3,7 +3,7 @@
 use super::{
     api::{Api, ApiError},
     auth, cache, library,
-    upload::{self, Job, Phase, Step},
+    upload::{Job, Phase, Step},
     worker, Connection, Destination,
 };
 use serde::Serialize;
@@ -95,25 +95,10 @@ pub async fn org_disconnect(connection_id: String) -> Result<OrgState, String> {
             let _ = super::api::revoke(&connection.revoke_url, &token);
         }
         super::secrets::delete(&connection.id);
-        if let Ok(dir) = super::root().map(|root| root.join("library").join(&connection.id)) {
-            let _ = fs::remove_dir_all(dir);
-        }
+        // Mirrors and cached audio of that account must not outlive it here.
+        forget_organizations(&connection.id, &[]);
         // Unsent audio is kept: its upload shows "Disconnected" with "Keep on device".
-        let ids: Vec<String> = {
-            let _lock = super::lock();
-            super::read_queue()?
-                .into_iter()
-                .filter(|job| job.connection_id == connection.id && job.active())
-                .map(|job| job.client_id)
-                .collect()
-        };
-        for id in ids {
-            worker::cancel(&id);
-            worker::transition(
-                &id,
-                Step::Failed(upload::Failure::Permanent("errors.orgDisconnected".into())),
-            );
-        }
+        worker::fail_connection(&connection.id);
         state()
     })
     .await
@@ -125,7 +110,16 @@ fn connection(connection_id: &str) -> Result<(Connection, String), String> {
         .into_iter()
         .find(|c| c.id == connection_id)
         .ok_or("errors.orgMissing")?;
-    let token = super::secrets::load(&connection.id)?;
+    let token = match super::secrets::load(&connection.id) {
+        Ok(token) => token,
+        Err(error) => {
+            // The keychain lost it (restored backup, revoked keychain access): sign in again.
+            if error == "errors.orgUnauthorized" {
+                worker::mark_reauth(connection_id);
+            }
+            return Err(error);
+        }
+    };
     Ok((connection, token))
 }
 fn organization_key(connection: &Connection, organization_id: &str) -> Result<String, String> {
@@ -157,6 +151,7 @@ pub async fn org_refresh_connection(connection_id: String) -> Result<OrgState, S
             .get("/me/organizations")
             .map_err(|e| api_error(&connection_id, e))?;
         let organizations = auth::organizations_from(&list);
+        let keep: Vec<String> = organizations.iter().map(|org| org.id.clone()).collect();
         {
             let _lock = super::lock();
             let mut connections = super::read_connections()?;
@@ -166,7 +161,8 @@ pub async fn org_refresh_connection(connection_id: String) -> Result<OrgState, S
             }
             super::write_connections(&connections)?;
         }
-        worker::kick();
+        forget_organizations(&connection_id, &keep);
+        worker::retry_connection(&connection_id);
         state()
     })
     .await
@@ -242,14 +238,45 @@ pub(crate) fn store_recording(
     organization_id: &str,
     recording: Value,
 ) -> Result<bool, String> {
-    let path = super::library_path(connection_id, organization_id)?;
-    let _lock = super::lock();
-    let mut state = library::read(&path);
-    let changed = library::upsert(&mut state, recording);
-    if changed {
-        library::write(&path, &state)?;
+    let dir = library::dir(connection_id, organization_id)?;
+    let _lock = library::lock();
+    let mut index = library::read_index(&dir);
+    let mut change = library::Change::default();
+    library::upsert(&mut index, &recording, &mut change);
+    if change.is_empty() {
+        return Ok(false);
     }
-    Ok(changed)
+    library::apply_change(&dir, &change)?;
+    library::write_index(&dir, &index)?;
+    Ok(true)
+}
+
+/// Remove everything this device keeps for organizations of a connection:
+/// mirrors and the cached audio of their recordings. `keep` lists
+/// organizations to leave alone (still present after a refresh).
+pub(crate) fn forget_organizations(connection_id: &str, keep: &[String]) {
+    let Ok(root) = super::root().map(|root| root.join("library").join(connection_id)) else {
+        return;
+    };
+    let cache = super::cache_dir().ok();
+    let _lock = library::lock();
+    for entry in fs::read_dir(&root).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if keep.contains(&name) || !entry.path().is_dir() {
+            continue;
+        }
+        if let Some(cache) = &cache {
+            for id in library::read_index(&entry.path()).items.keys() {
+                if let Some(file) = cache::find(cache, id) {
+                    let _ = fs::remove_file(file);
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(entry.path());
+    }
+    if keep.is_empty() {
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 
 #[derive(Serialize)]
@@ -259,25 +286,29 @@ pub struct LibraryView {
     synced_at: Option<u64>,
 }
 
-/// Stored recordings without the network: instant and offline.
+/// Stored recordings without the network: instant and offline. Rows carry no
+/// transcripts; those are read by `org_recording`.
 #[tauri::command]
 pub async fn org_library(
     connection_id: String,
     organization_id: String,
 ) -> Result<LibraryView, String> {
     blocking(move || {
-        let path = super::library_path(&connection_id, &organization_id)?;
-        let _lock = super::lock();
-        let state = library::read(&path);
+        let dir = library::dir(&connection_id, &organization_id)?;
+        let index = {
+            let _lock = library::lock();
+            library::read_index(&dir)
+        };
         Ok(LibraryView {
-            items: library::summaries(&state),
-            synced_at: state.synced_at,
+            items: library::summaries(&index),
+            synced_at: index.synced_at,
         })
     })
     .await
 }
 
-/// Pull changes since the stored cursor (all pages), then return the list.
+/// Pull changes since the stored cursor (all pages) without holding any lock
+/// over the network, then store them in one go and return the list.
 #[tauri::command]
 pub async fn org_sync(
     connection_id: String,
@@ -291,41 +322,56 @@ pub async fn org_sync(
             token: &token,
             organization_key: Some(&key),
         };
-        let path = super::library_path(&connection_id, &organization_id)?;
-        let mut changed = false;
+        let dir = library::dir(&connection_id, &organization_id)?;
+        let mut cursor = {
+            let _lock = library::lock();
+            library::read_index(&dir).cursor
+        };
+        let mut pages = Vec::new();
         for _ in 0..50 {
-            let cursor = {
-                let _lock = super::lock();
-                library::read(&path).cursor
-            };
             let query = match &cursor {
                 Some(cursor) => format!("/recordings/sync?limit=200&cursor={}", urlencode(cursor)),
                 None => "/recordings/sync?limit=200".to_owned(),
             };
-            let page: library::SyncPage =
-                api.get(&query).map_err(|e| api_error(&connection_id, e))?;
+            let page: library::SyncPage = match api.get(&query) {
+                Ok(page) => page,
+                // Keep what earlier pages brought; the cursor resumes from there.
+                Err(e) if !pages.is_empty() => {
+                    let _ = api_error(&connection_id, e);
+                    break;
+                }
+                Err(e) => return Err(api_error(&connection_id, e)),
+            };
             let more = page.has_more;
-            {
-                let _lock = super::lock();
-                let mut state = library::read(&path);
-                changed |= library::merge(&mut state, page, super::now_ms());
-                library::write(&path, &state)?;
+            if let Some(next) = page.next_cursor.clone().filter(|c| !c.is_empty()) {
+                cursor = Some(next);
             }
+            pages.push(page);
             if !more {
                 break;
             }
         }
-        if changed {
-            super::emit(
-                "org-library",
-                json!({"connectionId": connection_id, "organizationId": organization_id}),
-            );
-        }
-        let _lock = super::lock();
-        let state = library::read(&path);
+        let index = {
+            let _lock = library::lock();
+            let mut index = library::read_index(&dir);
+            let mut change = library::Change::default();
+            let now = super::now_ms();
+            for page in pages {
+                library::merge(&mut index, page, now, &mut change);
+            }
+            library::apply_change(&dir, &change)?;
+            library::write_index(&dir, &index)?;
+            if !change.is_empty() {
+                super::emit(
+                    "org-library",
+                    json!({"connectionId": connection_id, "organizationId": organization_id}),
+                );
+            }
+            index
+        };
         Ok(LibraryView {
-            items: library::summaries(&state),
-            synced_at: state.synced_at,
+            items: library::summaries(&index),
+            synced_at: index.synced_at,
         })
     })
     .await
@@ -346,7 +392,7 @@ pub async fn org_recording(
 ) -> Result<Value, String> {
     blocking(move || {
         super::valid_id(&recording_id)?;
-        let path = super::library_path(&connection_id, &organization_id)?;
+        let dir = library::dir(&connection_id, &organization_id)?;
         let mut error = None;
         if refresh {
             match connection(&connection_id) {
@@ -362,20 +408,32 @@ pub async fn org_recording(
                             let results = api
                                 .get::<Value>(&format!("/recordings/{recording_id}/results"))
                                 .ok();
-                            let _lock = super::lock();
-                            let mut state = library::read(&path);
-                            library::upsert(&mut state, detail);
-                            if let Some(Value::Array(results)) = results {
-                                state.results.insert(recording_id.clone(), results);
+                            let _lock = library::lock();
+                            let mut index = library::read_index(&dir);
+                            let mut change = library::Change::default();
+                            library::upsert(&mut index, &detail, &mut change);
+                            if change.is_empty() {
+                                // Same version as the list row: still store the full detail.
+                                change.upserts.push(detail.clone());
                             }
-                            library::write(&path, &state)?;
+                            library::apply_change(&dir, &change)?;
+                            if let Some(Value::Array(results)) = results {
+                                library::store_results(&dir, &mut index, &recording_id, results)?;
+                            }
+                            library::write_index(&dir, &index)?;
                         }
                         Err(ApiError::Status(404)) => {
-                            let _lock = super::lock();
-                            let mut state = library::read(&path);
-                            state.items.remove(&recording_id);
-                            state.results.remove(&recording_id);
-                            library::write(&path, &state)?;
+                            let _lock = library::lock();
+                            let mut index = library::read_index(&dir);
+                            index.items.remove(&recording_id);
+                            library::apply_change(
+                                &dir,
+                                &library::Change {
+                                    upserts: vec![],
+                                    removed: vec![recording_id.clone()],
+                                },
+                            )?;
+                            library::write_index(&dir, &index)?;
                             return Ok(Value::Null);
                         }
                         Err(e) => error = Some(api_error(&connection_id, e)),
@@ -384,18 +442,29 @@ pub async fn org_recording(
                 Err(e) => error = Some(e),
             }
         }
-        let _lock = super::lock();
-        let state = library::read(&path);
-        let Some(item) = state.items.get(&recording_id).cloned() else {
+        let (row, detail) = {
+            let _lock = library::lock();
+            (
+                library::read_index(&dir).items.get(&recording_id).cloned(),
+                library::read_detail(&dir, &recording_id),
+            )
+        };
+        let Some(row) = row else {
             return match error {
                 Some(error) => Err(error),
                 None => Ok(Value::Null),
             };
         };
+        let detail = detail.unwrap_or_default();
+        let recording = if detail.recording.is_object() {
+            detail.recording
+        } else {
+            row
+        };
         let cached = cache::find(&super::cache_dir()?, &recording_id).is_some();
         Ok(json!({
-            "recording": item,
-            "results": state.results.get(&recording_id),
+            "recording": recording,
+            "results": detail.results,
             "audioCached": cached,
             "offline": error,
         }))
@@ -490,7 +559,10 @@ pub async fn org_enqueue_record(
         let client_id = uuid::Uuid::new_v4().to_string();
         let pending = super::pending_dir()?.join(format!("{client_id}.{extension}"));
         if fs::hard_link(source_path, &pending).is_err() {
-            fs::copy(source_path, &pending).map_err(|e| format!("errors.orgStore|{e}"))?;
+            if let Err(error) = fs::copy(source_path, &pending) {
+                let _ = fs::remove_file(&pending);
+                return Err(format!("errors.orgStore|{error}"));
+            }
         }
         let display = crate::record_name_title(&entry.name);
         let job = Job {
@@ -531,6 +603,7 @@ pub async fn org_enqueue_record(
             waiting_network: false,
             created_at: super::now_ms(),
             finished_at: None,
+            omit_parts: false,
         };
         {
             let _lock = super::lock();
@@ -574,9 +647,10 @@ pub fn org_wake() {
         let _lock = super::lock();
         if let Ok(mut jobs) = super::read_queue() {
             let mut changed = false;
+            // Back online or back in the app: everything waiting tries now.
             for job in jobs
                 .iter_mut()
-                .filter(|job| job.active() && job.waiting_network)
+                .filter(|job| job.active() && job.next_attempt_at > 0)
             {
                 job.next_attempt_at = 0;
                 changed = true;
@@ -600,6 +674,38 @@ fn remove_job(client_id: &str) -> Result<Option<Job>, String> {
     Ok(Some(job))
 }
 
+/// The server already holds an empty recording waiting for this audio: delete
+/// it so the organization never sees «waiting for audio» forever.
+fn discard_remote(job: &Job) {
+    let Some(remote) = &job.remote_id else { return };
+    let Ok((connection, token)) = connection(&job.connection_id) else {
+        return;
+    };
+    let Ok(key) = organization_key(&connection, &job.organization_id) else {
+        return;
+    };
+    let api = Api {
+        base: &connection.server,
+        token: &token,
+        organization_key: Some(&key),
+    };
+    let _ = api.delete(&format!("/recordings/{remote}"));
+    if let Ok(dir) = library::dir(&job.connection_id, &job.organization_id) {
+        let _lock = library::lock();
+        let mut index = library::read_index(&dir);
+        if index.items.remove(remote).is_some() {
+            let _ = library::apply_change(
+                &dir,
+                &library::Change {
+                    upserts: vec![],
+                    removed: vec![remote.clone()],
+                },
+            );
+            let _ = library::write_index(&dir, &index);
+        }
+    }
+}
+
 /// Cancel and delete an upload together with its unsent audio.
 #[tauri::command]
 pub async fn org_cancel_upload(client_id: String) -> Result<(), String> {
@@ -609,25 +715,7 @@ pub async fn org_cancel_upload(client_id: String) -> Result<(), String> {
             return Ok(());
         };
         let _ = fs::remove_file(&job.file);
-        // The server already holds an empty recording waiting for audio: remove it.
-        if let (Some(remote), Ok((connection, token))) =
-            (&job.remote_id, connection(&job.connection_id))
-        {
-            if let Ok(key) = organization_key(&connection, &job.organization_id) {
-                let api = Api {
-                    base: &connection.server,
-                    token: &token,
-                    organization_key: Some(&key),
-                };
-                let _ = api.delete(&format!("/recordings/{remote}"));
-                let path = super::library_path(&job.connection_id, &job.organization_id)?;
-                let _lock = super::lock();
-                let mut state = library::read(&path);
-                if state.items.remove(remote).is_some() {
-                    library::write(&path, &state)?;
-                }
-            }
-        }
+        discard_remote(&job);
         super::emit(
             "org-library",
             json!({"connectionId": job.connection_id, "organizationId": job.organization_id}),
@@ -651,16 +739,18 @@ pub async fn org_keep_local(
                 .find(|job| job.client_id == client_id)
                 .ok_or("errors.recordMissing")?
         };
+        // Stop an in-flight request before anything else.
+        worker::cancel(&client_id);
         if job.local_record_id.is_some() {
             // A copy: the original is still in the archive.
             remove_job(&client_id)?;
             let _ = fs::remove_file(&job.file);
+            discard_remote(&job);
             return crate::records::read_history_at(&crate::base()?)?
                 .into_iter()
                 .find(|entry| Some(&entry.id) == job.local_record_id.as_ref())
                 .ok_or_else(|| "errors.recordMissing".into());
         }
-        worker::cancel(&client_id);
         let configuration = crate::cloud::load()?.last_configuration;
         let name = format!("{}.{}", job.display_name, extension_of(&job.file));
         let entry = crate::import_audio_with_id(
@@ -672,6 +762,7 @@ pub async fn org_keep_local(
         )?;
         remove_job(&client_id)?;
         let _ = fs::remove_file(&job.file);
+        discard_remote(&job);
         Ok(entry)
     })
     .await
@@ -747,10 +838,10 @@ pub async fn org_cache_audio(
             cache::touch(&path);
             return Ok(path.to_string_lossy().into_owned());
         }
-        let path = super::library_path(&connection_id, &organization_id)?;
+        let library_dir = library::dir(&connection_id, &organization_id)?;
         let mime = {
-            let _lock = super::lock();
-            library::read(&path)
+            let _lock = library::lock();
+            library::read_index(&library_dir)
                 .items
                 .get(&recording_id)
                 .and_then(|item| item["audio_mime"].as_str().map(str::to_owned))
@@ -787,8 +878,10 @@ pub async fn org_cache_audio(
             if read == 0 {
                 break;
             }
-            file.write_all(&buffer[..read])
-                .map_err(|e| format!("errors.orgStore|{e}"))?;
+            file.write_all(&buffer[..read]).map_err(|e| {
+                let _ = fs::remove_file(&partial);
+                format!("errors.orgStore|{e}")
+            })?;
             done += read as u64;
             if last.elapsed().as_millis() > 250 {
                 last = std::time::Instant::now();

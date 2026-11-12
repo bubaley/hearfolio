@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
+/// Only re-uploads of a rejected file give up; server and network errors retry forever.
 pub const MAX_ATTEMPTS: u32 = 8;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -74,13 +75,17 @@ pub struct Job {
     pub created_at: u64,
     #[serde(default)]
     pub finished_at: Option<u64>,
+    /// The server could not match our ETags: let it list the parts itself.
+    #[serde(default)]
+    pub omit_parts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Failure {
     /// No connection: wait without limit, retrying soon.
     Offline,
-    /// 5xx, 429, timeouts mid-transfer: retry with backoff, then give up.
+    /// 5xx, 429, timeouts mid-transfer, an incomplete object: retry with
+    /// backoff (capped at 5 minutes) without giving up.
     Transient(String),
     /// The server rejected the uploaded object (size mismatch): upload again.
     Rejected(String),
@@ -102,6 +107,10 @@ pub enum Step {
     },
     SingleUploaded,
     Completed,
+    /// `complete` said these parts never arrived: upload only them again.
+    PartsMissing(Vec<u32>),
+    /// `complete` could not use our part list: retry letting the server list them.
+    CompleteUnmatched(String),
     Failed(Failure),
     Retry,
 }
@@ -184,6 +193,7 @@ pub fn apply(job: &mut Job, step: Step, now: u64) {
                 != multipart.as_ref().map(|plan| &plan.upload_id)
             {
                 job.parts.clear();
+                job.omit_parts = false;
             }
             job.multipart = multipart;
             job.phase = if job.multipart.is_some() && job.missing_parts().is_empty()
@@ -205,6 +215,7 @@ pub fn apply(job: &mut Job, step: Step, now: u64) {
             }
         }
         Step::SingleUploaded => {
+            job.omit_parts = false;
             job.progressed();
             job.single_done = true;
             job.phase = Phase::Completing;
@@ -221,13 +232,29 @@ pub fn apply(job: &mut Job, step: Step, now: u64) {
         }
         Step::Failed(Failure::Transient(error)) => {
             job.waiting_network = false;
-            job.attempts += 1;
+            job.attempts = job.attempts.saturating_add(1);
             job.error = Some(error);
-            if job.attempts >= MAX_ATTEMPTS {
-                job.phase = Phase::Failed;
+            job.next_attempt_at = now + backoff_ms(job.attempts, false);
+        }
+        Step::CompleteUnmatched(error) => {
+            job.waiting_network = false;
+            job.attempts = job.attempts.saturating_add(1);
+            job.error = Some(error);
+            job.omit_parts = true;
+            job.next_attempt_at = now + backoff_ms(job.attempts, false);
+        }
+        Step::PartsMissing(numbers) => {
+            job.waiting_network = false;
+            job.attempts = job.attempts.saturating_add(1);
+            job.next_attempt_at = now + backoff_ms(job.attempts, false);
+            if job.multipart.is_some() {
+                for number in numbers {
+                    job.parts.remove(&number);
+                }
             } else {
-                job.next_attempt_at = now + backoff_ms(job.attempts, false);
+                job.single_done = false;
             }
+            job.phase = Phase::Uploading;
         }
         Step::Failed(Failure::Rejected(error)) => {
             job.waiting_network = false;
@@ -310,6 +337,7 @@ pub(crate) fn sample(size: u64) -> Job {
         waiting_network: false,
         created_at: 1,
         finished_at: None,
+        omit_parts: false,
     }
 }
 
@@ -475,21 +503,32 @@ mod tests {
             0,
         );
         assert!(!job.waiting_network && job.attempts == 0);
-        for attempt in 1..MAX_ATTEMPTS {
+        for attempt in 1..=30 {
             apply(
                 &mut job,
                 Step::Failed(Failure::Transient("errors.orgServer".into())),
                 1_000,
             );
-            assert_eq!(job.phase, Phase::Uploading, "attempt {attempt}");
+            assert_eq!(
+                job.phase,
+                Phase::Uploading,
+                "server errors never give up ({attempt})"
+            );
             assert_eq!(job.next_attempt_at, 1_000 + backoff_ms(attempt, false));
         }
-        apply(
-            &mut job,
-            Step::Failed(Failure::Transient("errors.orgServer".into())),
-            1_000,
+        assert_eq!(job.next_attempt_at, 1_000 + 300_000, "capped at 5 minutes");
+        for _ in 0..MAX_ATTEMPTS {
+            apply(
+                &mut job,
+                Step::Failed(Failure::Rejected("errors.orgUploadRejected".into())),
+                1_000,
+            );
+        }
+        assert_eq!(
+            job.phase,
+            Phase::Failed,
+            "a file the server keeps rejecting stops"
         );
-        assert_eq!(job.phase, Phase::Failed);
         assert!(!job.runnable(u64::MAX));
         apply(&mut job, Step::Retry, 2_000);
         assert_eq!(job.phase, Phase::Uploading);
@@ -505,6 +544,47 @@ mod tests {
         apply(&mut fresh, Step::Failed(Failure::Permanent("x".into())), 0);
         apply(&mut fresh, Step::Retry, 0);
         assert_eq!(fresh.phase, Phase::Queued);
+    }
+
+    #[test]
+    fn missing_parts_are_uploaded_again_without_touching_the_rest() {
+        let mut job = sample(20);
+        apply(
+            &mut job,
+            Step::Planned {
+                remote_id: "r".into(),
+                multipart: multipart("u1"),
+                uploaded: false,
+            },
+            0,
+        );
+        for number in 1..=3 {
+            apply(
+                &mut job,
+                Step::PartUploaded {
+                    number,
+                    etag: format!("e{number}"),
+                },
+                0,
+            );
+        }
+        assert_eq!(job.phase, Phase::Completing);
+        apply(&mut job, Step::PartsMissing(vec![2]), 100);
+        assert_eq!(job.phase, Phase::Uploading);
+        assert_eq!(job.missing_parts(), vec![2]);
+        assert_eq!(job.parts.get(&1).map(String::as_str), Some("e1"));
+        assert_eq!(job.next_attempt_at, 100 + 5_000);
+        // The same upload id after a re-plan keeps the confirmed ETags.
+        apply(
+            &mut job,
+            Step::Planned {
+                remote_id: "r".into(),
+                multipart: multipart("u1"),
+                uploaded: false,
+            },
+            0,
+        );
+        assert_eq!(job.missing_parts(), vec![2]);
     }
 
     #[test]

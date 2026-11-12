@@ -278,7 +278,7 @@ function audioHtml():string {
 export function cloudDetailHtml():string {
   if(!open)return '';
   const upload=openUpload(),recording=detail?.recording,pendingUpload=upload&&upload.phase!=='done'?upload:null;
-  const {organization:org}=organization(open.connectionId,open.organizationId);
+  const {organization:org,connection:owner}=organization(open.connectionId,open.organizationId);
   const status=pendingUpload?uploadStatus(pendingUpload,say):recording?recordingStatus(recording,say):null;
   const recordedAt=recording?Date.parse(recording.recorded_at||''):upload?.recordedAt||0;
   const meta=[dateLabel(recordedAt),timeLabel(recording?.duration_ms??upload?.durationMs??null),org?.name||'',recording?.project?`${recording.project.emoji||''} ${recording.project.name}`.trim():'',(recording?.visibility||upload?.visibility)==='personal'?say('Личная','Personal'):say('Общая','Shared')].filter(Boolean);
@@ -286,7 +286,7 @@ export function cloudDetailHtml():string {
   let banner='';
   if(status&&status.tone!=='done'){
     const actions=pendingUpload?.phase==='failed'
-      ?`${status.action==='retry-upload'?`<button type="button" class="primary" data-org-retry-upload="${esc(pendingUpload.clientId)}">${icon('history')}<span>${say('Повторить','Retry')}</span></button>`:''}<button type="button" class="secondary" data-org-keep-local="${esc(pendingUpload.clientId)}">${say(pendingUpload.localRecordId?'Отменить копирование':'Сохранить на устройстве',pendingUpload.localRecordId?'Cancel copy':'Keep on device')}</button>`
+      ?`${owner?.needsReauth?`<button type="button" class="primary" data-org-reauth="${esc(owner.id)}">${say('Войти снова','Sign in again')}</button>`:status.action==='retry-upload'?`<button type="button" class="primary" data-org-retry-upload="${esc(pendingUpload.clientId)}">${icon('history')}<span>${say('Повторить','Retry')}</span></button>`:''}<button type="button" class="secondary" data-org-keep-local="${esc(pendingUpload.clientId)}">${say(pendingUpload.localRecordId?'Отменить копирование':'Сохранить на устройстве',pendingUpload.localRecordId?'Cancel copy':'Keep on device')}</button>`
       :pendingUpload?`<button type="button" class="text-button danger" data-org-cancel-upload="${esc(pendingUpload.clientId)}">${say('Отменить','Cancel')}</button>`
       :status.action==='retry-transcription'?`<button type="button" class="primary" id="org-retry-transcription">${icon('history')}<span>${say('Повторить','Retry')}</span></button>`:'';
     const explanation=pendingUpload?.phase==='failed'?orgErrorText(pendingUpload.error||''):pendingUpload?.waitingNetwork?say('Загрузка продолжится, как только появится сеть. Аудио в безопасности на устройстве.','The upload resumes as soon as you are online. The audio is safe on this device.'):pendingUpload?say('Можно продолжать работу — загрузка идёт в фоне.','Keep working — the upload continues in the background.'):recording?.status==='failed'?(recording.error_message||''):recording?.status==='transcribing'||recording?.status==='queued'?say('Сервер расшифровывает запись. Текст появится здесь.','The server is transcribing. Text will appear here.'):'';

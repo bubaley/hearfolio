@@ -210,7 +210,16 @@ fn context(job: &Job) -> Result<Context, Failure> {
         .iter()
         .find(|organization| organization.id == job.organization_id)
         .ok_or_else(|| Failure::Permanent("errors.orgMissing".into()))?;
-    let token = super::secrets::load(&connection.id).map_err(Failure::Permanent)?;
+    let token = match super::secrets::load(&connection.id) {
+        Ok(token) => token,
+        // No token stored for this connection: the user has to sign in again.
+        Err(error) if error == "errors.orgUnauthorized" => {
+            mark_reauth(&connection.id);
+            return Err(Failure::Permanent(error));
+        }
+        // The keystore is temporarily unavailable (locked keychain, plugin not ready).
+        Err(error) => return Err(Failure::Transient(error)),
+    };
     Ok(Context {
         base: connection.server.clone(),
         token,
@@ -269,6 +278,64 @@ fn process(job: Job) {
     }
     if let Ok(mut list) = CANCELLED.lock() {
         list.retain(|id| id != &job.client_id);
+    }
+}
+
+/// After signing in again: failed uploads of this connection that were waiting
+/// for access run again, and everything waiting tries now.
+pub fn retry_connection(connection_id: &str) {
+    let ids: Vec<String> = {
+        let _lock = super::lock();
+        let Ok(mut jobs) = super::read_queue() else {
+            return;
+        };
+        let mut changed = false;
+        for job in jobs
+            .iter_mut()
+            .filter(|job| job.connection_id == connection_id && job.active())
+        {
+            job.next_attempt_at = 0;
+            changed = true;
+        }
+        if changed {
+            let _ = super::write_queue(&jobs);
+        }
+        jobs.iter()
+            .filter(|job| {
+                job.connection_id == connection_id
+                    && job.phase == Phase::Failed
+                    && matches!(
+                        job.error.as_deref(),
+                        Some("errors.orgUnauthorized" | "errors.orgSecretStore")
+                    )
+            })
+            .map(|job| job.client_id.clone())
+            .collect()
+    };
+    for id in ids {
+        transition(&id, Step::Retry);
+    }
+    kick();
+}
+
+/// The connection is gone (disconnected, or replaced by another account):
+/// its unsent recordings stop and offer «Keep on device».
+pub fn fail_connection(connection_id: &str) {
+    let ids: Vec<String> = {
+        let _lock = super::lock();
+        super::read_queue()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|job| job.connection_id == connection_id && job.active())
+            .map(|job| job.client_id)
+            .collect()
+    };
+    for id in ids {
+        cancel(&id);
+        transition(
+            &id,
+            Step::Failed(Failure::Permanent("errors.orgDisconnected".into())),
+        );
     }
 }
 
@@ -422,11 +489,11 @@ fn next_step(job: &Job, ctx: &Context) -> Result<Option<Step>, Failure> {
                     Err(ApiError::Status(404)) => {
                         Err(Failure::Permanent("errors.orgRecordingDeleted".into()))
                     }
-                    // An expired multipart upload must start over with a new one.
-                    Err(ApiError::Status(400))
-                        if job.multipart.is_some() && !job.parts.is_empty() =>
-                    {
-                        Err(Failure::Rejected("errors.orgUploadRejected".into()))
+                    // The server restarts a dead multipart upload itself (a new
+                    // upload id clears our ETags in `Planned`); any other 4xx
+                    // here is retried later rather than discarding progress.
+                    Err(ApiError::Status(400 | 422)) => {
+                        Err(Failure::Transient("errors.orgUploadIncomplete".into()))
                     }
                     Err(error) => Err(error.failure()),
                 }
@@ -470,26 +537,64 @@ fn next_step(job: &Job, ctx: &Context) -> Result<Option<Step>, Failure> {
             }
         }
         Phase::Completing => {
-            let body = if job.multipart.is_some() && !job.parts.is_empty() {
+            let body = if job.multipart.is_some() && !job.parts.is_empty() && !job.omit_parts {
                 json!({"parts": job.parts.iter().map(|(number, etag)| json!({"part_number": number, "etag": etag})).collect::<Vec<_>>()})
             } else {
                 json!({})
             };
-            match api.post::<Value>(&format!("/recordings/{remote}/upload/complete"), &body) {
+            match api
+                .post_detailed::<Value>(&format!("/recordings/{remote}/upload/complete"), &body)
+            {
                 Ok(recording) => {
                     store_recording(job, &recording);
                     Ok(Some(Step::Completed))
                 }
-                Err(ApiError::Status(400)) => {
-                    Err(Failure::Rejected("errors.orgUploadRejected".into()))
+                Err((ApiError::Status(400 | 422), details)) => {
+                    Ok(Some(complete_rejected(&details)))
                 }
-                Err(ApiError::Status(404)) => {
+                Err((ApiError::Status(404), _)) => {
                     Err(Failure::Permanent("errors.orgRecordingDeleted".into()))
                 }
-                Err(error) => Err(error.failure()),
+                Err((error, _)) => Err(error.failure()),
             }
         }
         _ => Ok(None),
+    }
+}
+
+/// What a rejected `upload/complete` means for the queue (`details.reason`).
+pub(crate) fn complete_rejected(details: &Value) -> Step {
+    let missing = |key: &str| -> Vec<u32> {
+        details[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|n| n.as_u64().map(|n| n as u32))
+            .collect()
+    };
+    match details["reason"].as_str() {
+        // The object is not visible yet; nothing changed on the server.
+        Some("upload_incomplete") => {
+            Step::Failed(Failure::Transient("errors.orgUploadIncomplete".into()))
+        }
+        Some("upload_parts_missing") => {
+            // The field name is not fixed in the contract yet: accept the likely ones.
+            let parts = ["missing_parts", "part_numbers", "missing"]
+                .into_iter()
+                .map(missing)
+                .find(|parts| !parts.is_empty())
+                .unwrap_or_default();
+            Step::PartsMissing(parts)
+        }
+        // The server deleted the object: start the upload over.
+        Some("upload_size_mismatch") => {
+            Step::Failed(Failure::Rejected("errors.orgUploadRejected".into()))
+        }
+        Some("recording_deleted") => {
+            Step::Failed(Failure::Permanent("errors.orgRecordingDeleted".into()))
+        }
+        // Unknown: keep our ETags but let the server list the parts itself.
+        _ => Step::CompleteUnmatched("errors.orgUploadIncomplete".into()),
     }
 }
 

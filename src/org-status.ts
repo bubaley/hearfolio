@@ -16,8 +16,10 @@ export function uploadPercent(upload:UploadView):number {
 /** Status of a recording that has not fully reached the server yet. */
 export function uploadStatus(upload:UploadView,say:Say):Status {
   if(upload.phase==='failed'){
-    const disconnected=upload.error==='errors.orgDisconnected'||upload.error==='errors.orgUnauthorized';
-    return {label:disconnected?say('Нет доступа к организации','No access to the organization'):say('Ошибка загрузки','Upload failed'),tone:'error',percent:null,action:disconnected?null:'retry-upload'};
+    // A removed connection cannot be retried; an expired sign-in can (it also resumes by itself after signing in again).
+    if(upload.error==='errors.orgDisconnected')return {label:say('Нет доступа к организации','No access to the organization'),tone:'error',percent:null,action:null};
+    if(upload.error==='errors.orgUnauthorized')return {label:say('Нужно войти снова','Sign in again'),tone:'error',percent:null,action:'retry-upload'};
+    return {label:say('Ошибка загрузки','Upload failed'),tone:'error',percent:null,action:'retry-upload'};
   }
   if(upload.waitingNetwork)return {label:say('Ждёт сети','Waiting for network'),tone:'queued',percent:null,action:null};
   if(upload.phase==='queued')return {label:say('В очереди','Queued'),tone:'queued',percent:null,action:null};

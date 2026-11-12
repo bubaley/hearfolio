@@ -12,10 +12,28 @@ pub fn client() -> &'static reqwest::blocking::Client {
             .connect_timeout(Duration::from_secs(15))
             .timeout(None)
             .user_agent(concat!("Hearfolio/", env!("CARGO_PKG_VERSION")))
-            .redirect(reqwest::redirect::Policy::limited(3))
+            .redirect(reqwest::redirect::Policy::custom(redirect_policy))
             .build()
             .expect("HTTP client")
     })
+}
+
+/// Redirects may only stay on the same host and never downgrade HTTPS: the
+/// `Organization-Key` header and request bodies must not reach another server.
+fn redirect_policy(attempt: reqwest::redirect::Attempt) -> reqwest::redirect::Action {
+    let allowed = attempt
+        .previous()
+        .last()
+        .is_some_and(|from| redirect_allowed(from, attempt.url()));
+    if attempt.previous().len() >= 3 || !allowed {
+        attempt.stop()
+    } else {
+        attempt.follow()
+    }
+}
+pub(crate) fn redirect_allowed(from: &url::Url, to: &url::Url) -> bool {
+    from.host_str() == to.host_str()
+        && (from.scheme() == to.scheme() || from.scheme() == "http" && to.scheme() == "https")
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,6 +118,29 @@ impl Api<'_> {
     pub fn post<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T, ApiError> {
         self.send(self.request(reqwest::Method::POST, path).json(body))
     }
+    /// POST that also returns the error envelope's `details` (e.g. `reason`).
+    pub fn post_detailed<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<T, (ApiError, Value)> {
+        let response = self
+            .request(reqwest::Method::POST, path)
+            .json(body)
+            .send()
+            .map_err(|error| (from_reqwest(&error), Value::Null))?;
+        let status = response.status();
+        if !status.is_success() {
+            let envelope: Value = response.json().unwrap_or(Value::Null);
+            return Err((
+                ApiError::Status(status.as_u16()),
+                envelope["error"]["details"].clone(),
+            ));
+        }
+        response
+            .json::<T>()
+            .map_err(|error| (from_reqwest(&error), Value::Null))
+    }
     pub fn delete(&self, path: &str) -> Result<(), ApiError> {
         self.send::<Value>(self.request(reqwest::Method::DELETE, path))
             .map(|_| ())
@@ -175,6 +216,27 @@ pub fn revoke(revoke_url: &str, token: &str) -> Result<(), ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn redirects_stay_on_the_host_and_never_downgrade() {
+        let url = |value: &str| url::Url::parse(value).unwrap();
+        assert!(redirect_allowed(
+            &url("http://a.test/x"),
+            &url("https://a.test/y")
+        ));
+        assert!(redirect_allowed(
+            &url("https://a.test/x"),
+            &url("https://a.test/y")
+        ));
+        assert!(!redirect_allowed(
+            &url("https://a.test/x"),
+            &url("http://a.test/y")
+        ));
+        assert!(!redirect_allowed(
+            &url("https://a.test/x"),
+            &url("https://evil.test/y")
+        ));
+    }
+
     #[test]
     fn statuses_map_to_queue_failures() {
         assert_eq!(ApiError::Offline.failure(), Failure::Offline);

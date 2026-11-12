@@ -13,6 +13,8 @@ test('upload states read like the product spec',()=>{
   const failed=uploadStatus(upload({phase:'failed',error:'errors.orgServer'}),say);
   assert.deepEqual([failed.label,failed.tone,failed.action],['Ошибка загрузки','error','retry-upload']);
   assert.equal(uploadStatus(upload({phase:'failed',error:'errors.orgDisconnected'}),say).action,null);
+  const expired=uploadStatus(upload({phase:'failed',error:'errors.orgUnauthorized'}),say);
+  assert.deepEqual([expired.label,expired.action],['Нужно войти снова','retry-upload']);
 });
 
 test('server statuses show transcription progress and failures',()=>{

@@ -198,13 +198,6 @@ pub fn read_queue() -> Result<Vec<upload::Job>, String> {
 pub fn write_queue(jobs: &[upload::Job]) -> Result<(), String> {
     write_private_json(&root()?.join("queue.json"), &jobs)
 }
-pub fn library_path(connection: &str, organization: &str) -> Result<PathBuf, String> {
-    valid_id(connection)?;
-    valid_id(organization)?;
-    Ok(subdir("library")?
-        .join(connection)
-        .join(format!("{organization}.json")))
-}
 
 /// Destination checks shared by the picker and the queue.
 pub fn validate_destination(
@@ -276,6 +269,33 @@ pub fn mime_for(extension: &str) -> &'static str {
     }
 }
 
+/// Remove audio in `pending/` that no queued upload owns (an interrupted copy
+/// or a crash between copying and queueing). Recent files are left alone: a
+/// copy may be about to be queued right now.
+pub(crate) fn sweep_pending(
+    dir: &Path,
+    referenced: &[PathBuf],
+    now: std::time::SystemTime,
+) -> usize {
+    let mut removed = 0;
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if referenced.contains(&path) || !path.is_file() {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(3600));
+        if old && fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Called from `setup`: remembers the app handle, allows cached audio for
 /// playback, evicts stale audio and starts the upload worker.
 pub fn install(app: &tauri::AppHandle) {
@@ -288,6 +308,10 @@ pub fn install(app: &tauri::AppHandle) {
             .map(|s| s.retention_days)
             .unwrap_or(default_retention());
         cache::evict(&dir, days, std::time::SystemTime::now());
+    }
+    if let (Ok(dir), Ok(jobs)) = (pending_dir(), read_queue()) {
+        let referenced: Vec<PathBuf> = jobs.into_iter().map(|job| job.file).collect();
+        sweep_pending(&dir, &referenced, std::time::SystemTime::now());
     }
     auth::install(app);
     worker::start();
@@ -308,6 +332,32 @@ mod tests {
         assert_eq!(settings.retention_days, Some(30));
         let forever: OrgSettings = serde_json::from_str(r#"{"retentionDays":null}"#).unwrap();
         assert_eq!(forever.retention_days, None);
+    }
+
+    #[test]
+    fn orphaned_pending_audio_is_swept_but_queued_audio_stays() {
+        let dir = std::env::temp_dir().join(format!("hearfolio-pending-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let (queued, orphan, fresh) = (dir.join("a.m4a"), dir.join("b.m4a"), dir.join("c.m4a"));
+        for path in [&queued, &orphan, &fresh] {
+            fs::write(path, b"x").unwrap();
+        }
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(7200);
+        // `fresh` is checked "now", so it is younger than an hour.
+        assert_eq!(
+            sweep_pending(
+                &dir,
+                std::slice::from_ref(&queued),
+                std::time::SystemTime::now()
+            ),
+            0
+        );
+        assert_eq!(
+            sweep_pending(&dir, &[queued.clone(), fresh.clone()], later),
+            1
+        );
+        assert!(queued.exists() && fresh.exists() && !orphan.exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

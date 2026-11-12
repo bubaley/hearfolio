@@ -184,7 +184,8 @@ fn serve_loopback(app: tauri::AppHandle, listener: TcpListener, expected: String
         let mut line = String::new();
         let _ = BufReader::new(&stream).take_line(&mut line);
         let target = line.split_whitespace().nth(1).unwrap_or("").to_owned();
-        match pkce::parse_callback(&target) {
+        match pkce::parse_callback(&target).filter(|callback| loopback_accepts(callback, &expected))
+        {
             Some(callback) => {
                 let _ = stream.write_all(
                     format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PAGE}", PAGE.len()).as_bytes(),
@@ -193,6 +194,8 @@ fn serve_loopback(app: tauri::AppHandle, listener: TcpListener, expected: String
                 handle(&app, callback);
                 return;
             }
+            // Anything else (a favicon, a stale tab, a foreign state) is refused
+            // and the listener keeps waiting for this sign-in.
             None => {
                 let _ = stream.write_all(
                     b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -205,6 +208,16 @@ fn serve_loopback(app: tauri::AppHandle, listener: TcpListener, expected: String
             "org-connection",
             json!({"state":"failed","flow":flow.state,"error":"errors.orgAuthExpired"}),
         );
+    }
+}
+
+/// The loopback answers only the callback of its own sign-in.
+pub(crate) fn loopback_accepts(callback: &pkce::Callback, expected: &str) -> bool {
+    match callback {
+        pkce::Callback::Code { state, .. } => !expected.is_empty() && state == expected,
+        pkce::Callback::Denied { state } => {
+            state.as_deref() == Some(expected) && !expected.is_empty()
+        }
     }
 }
 
@@ -284,6 +297,47 @@ pub fn organizations_from(value: &Value) -> Vec<Organization> {
         .collect()
 }
 
+/// Which stored connections a successful sign-in replaces.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Replacement {
+    /// Connection id to store the new token under.
+    pub id: String,
+    /// Same account (same server and user): replaced in place.
+    pub same: Vec<String>,
+    /// The connection being re-authorized, but signed in as someone else: it
+    /// is removed with everything this device kept for it.
+    pub other_account: Vec<String>,
+}
+
+pub(crate) fn plan_replacement(
+    connections: &[Connection],
+    server: &str,
+    user_id: &str,
+    replaces: Option<&str>,
+) -> Replacement {
+    let same_account =
+        |c: &Connection| !user_id.is_empty() && c.server == server && c.user.id == user_id;
+    let same: Vec<String> = connections
+        .iter()
+        .filter(|c| same_account(c))
+        .map(|c| c.id.clone())
+        .collect();
+    let other_account: Vec<String> = connections
+        .iter()
+        .filter(|c| Some(c.id.as_str()) == replaces && !same_account(c))
+        .map(|c| c.id.clone())
+        .collect();
+    let id = same
+        .first()
+        .cloned()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    Replacement {
+        id,
+        same,
+        other_account,
+    }
+}
+
 fn finish(flow: &Flow, code: &str) -> Result<Connection, String> {
     let body = api::exchange_code(
         &flow.discovery.oauth.token_url,
@@ -316,32 +370,44 @@ fn finish(flow: &Flow, code: &str) -> Result<Connection, String> {
             organizations = organizations_from(&list);
         }
     }
-    let _lock = super::lock();
-    let mut connections = super::read_connections()?;
-    // Re-authorizing (or connecting the same account again) replaces the old connection.
-    let previous: Vec<Connection> = connections
-        .iter()
-        .filter(|c| {
-            Some(&c.id) == flow.replaces.as_ref()
-                || c.server == flow.server && c.user.id == user.id && !user.id.is_empty()
+    // Decide under the lock, but never hold it over the keychain or the network.
+    let (plan, previous) = {
+        let _lock = super::lock();
+        let connections = super::read_connections()?;
+        let plan = plan_replacement(
+            &connections,
+            &flow.server,
+            &user.id,
+            flow.replaces.as_deref(),
+        );
+        let previous: Vec<Connection> = connections
+            .into_iter()
+            .filter(|c| plan.same.contains(&c.id) || plan.other_account.contains(&c.id))
+            .collect();
+        (plan, previous)
+    };
+    let old_tokens: Vec<(Connection, Option<String>)> = previous
+        .into_iter()
+        .map(|c| {
+            let token = super::secrets::load(&c.id).ok();
+            (c, token)
         })
-        .cloned()
         .collect();
-    let id = previous
-        .first()
-        .map(|c| c.id.clone())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    if let Some(old) = previous.first() {
-        if let Ok(old_token) = super::secrets::load(&old.id) {
-            if old_token != token {
-                let _ = api::revoke(&old.revoke_url, &old_token);
-            }
+    let secure = match super::secrets::store(&plan.id, &token) {
+        Ok(secure) => secure,
+        Err(error) => {
+            // Nothing on this device can use it: do not leave a live token behind.
+            let _ = api::revoke(&flow.discovery.oauth.revoke_url, &token);
+            return Err(error);
+        }
+    };
+    for (old, old_token) in &old_tokens {
+        if let Some(old_token) = old_token.as_ref().filter(|t| **t != token) {
+            let _ = api::revoke(&old.revoke_url, old_token);
         }
     }
-    let secure = super::secrets::store(&id, &token)?;
-    connections.retain(|c| !previous.iter().any(|old| old.id == c.id));
     let connection = Connection {
-        id,
+        id: plan.id.clone(),
         server: flow.server.clone(),
         server_name: flow.discovery.name.clone(),
         server_version: flow.discovery.server_version.clone(),
@@ -352,8 +418,32 @@ fn finish(flow: &Flow, code: &str) -> Result<Connection, String> {
         secure,
         needs_reauth: false,
     };
-    connections.push(connection.clone());
-    super::write_connections(&connections)?;
+    {
+        let _lock = super::lock();
+        let mut connections = super::read_connections()?;
+        connections.retain(|c| !plan.same.contains(&c.id) && !plan.other_account.contains(&c.id));
+        connections.push(connection.clone());
+        super::write_connections(&connections)?;
+        let mut settings = super::read_settings()?;
+        if settings
+            .destination
+            .as_ref()
+            .is_some_and(|d| plan.other_account.contains(&d.connection_id))
+        {
+            settings.destination = None;
+            super::write_settings(&settings)?;
+        }
+    }
+    // Another account signed in: the previous user's mirror, cached audio and
+    // queued uploads must never reach the new one.
+    for old in &plan.other_account {
+        if *old != plan.id {
+            super::secrets::delete(old);
+        }
+        super::commands::forget_organizations(old, &[]);
+        super::worker::fail_connection(old);
+    }
+    super::worker::retry_connection(&plan.id);
     Ok(connection)
 }
 
@@ -370,5 +460,84 @@ pub fn install(app: &tauri::AppHandle) {
         for url in urls {
             handle_url(app, url.as_str());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::org::Organization;
+
+    fn connection(id: &str, user: &str) -> Connection {
+        Connection {
+            id: id.into(),
+            server: "https://cloud.example.com".into(),
+            server_name: "X".into(),
+            server_version: String::new(),
+            revoke_url: String::new(),
+            user: UserBrief {
+                id: user.into(),
+                email: String::new(),
+                name: String::new(),
+            },
+            organizations: vec![Organization {
+                id: "o".into(),
+                name: "O".into(),
+                key: "k".into(),
+                role: "member".into(),
+            }],
+            created_at: 0,
+            secure: true,
+            needs_reauth: true,
+        }
+    }
+
+    #[test]
+    fn signing_in_again_as_someone_else_never_reuses_the_old_connection() {
+        let stored = [connection("c-anna", "anna"), connection("c-boris", "boris")];
+        let server = "https://cloud.example.com";
+        // Same account re-authorizes: the connection keeps its id.
+        let same = plan_replacement(&stored, server, "anna", Some("c-anna"));
+        assert_eq!(same.id, "c-anna");
+        assert_eq!(same.same, vec!["c-anna".to_string()]);
+        assert!(same.other_account.is_empty());
+        // Anna's expired connection is re-authorized as a new user: new id, Anna's removed.
+        let other = plan_replacement(&stored, server, "vera", Some("c-anna"));
+        assert_ne!(other.id, "c-anna");
+        assert!(other.same.is_empty());
+        assert_eq!(other.other_account, vec!["c-anna".to_string()]);
+        // …as Boris, who is already connected: Boris keeps his connection.
+        let boris = plan_replacement(&stored, server, "boris", Some("c-anna"));
+        assert_eq!(boris.id, "c-boris");
+        assert_eq!(boris.other_account, vec!["c-anna".to_string()]);
+        // A missing user id never matches anyone.
+        assert!(plan_replacement(&stored, server, "", None).same.is_empty());
+        // Another server is another account.
+        assert!(
+            plan_replacement(&stored, "https://other.example.com", "anna", None)
+                .same
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_loopback_listener_ignores_foreign_callbacks() {
+        let code = |state: &str| pkce::Callback::Code {
+            code: "c".into(),
+            state: state.into(),
+        };
+        assert!(loopback_accepts(&code("s1"), "s1"));
+        assert!(!loopback_accepts(&code("other"), "s1"));
+        assert!(!loopback_accepts(&code(""), ""));
+        assert!(loopback_accepts(
+            &pkce::Callback::Denied {
+                state: Some("s1".into())
+            },
+            "s1"
+        ));
+        assert!(!loopback_accepts(
+            &pkce::Callback::Denied { state: None },
+            "s1"
+        ));
     }
 }

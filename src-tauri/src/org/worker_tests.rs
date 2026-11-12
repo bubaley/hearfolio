@@ -3,6 +3,54 @@ use super::*;
 use crate::org::{Connection, Organization, UserBrief};
 use std::sync::atomic::AtomicUsize;
 
+#[test]
+fn complete_rejections_keep_confirmed_parts_unless_the_object_is_gone() {
+    assert_eq!(
+        complete_rejected(&json!({"reason": "upload_parts_missing", "missing_parts": [2, 5]})),
+        Step::PartsMissing(vec![2, 5])
+    );
+    assert_eq!(
+        complete_rejected(&json!({"reason": "upload_incomplete"})),
+        Step::Failed(Failure::Transient("errors.orgUploadIncomplete".into()))
+    );
+    assert_eq!(
+        complete_rejected(&json!({"reason": "upload_size_mismatch"})),
+        Step::Failed(Failure::Rejected("errors.orgUploadRejected".into()))
+    );
+    assert_eq!(
+        complete_rejected(&Value::Null),
+        Step::CompleteUnmatched("errors.orgUploadIncomplete".into())
+    );
+    let mut job = upload::sample(20);
+    let multipart = Some(upload::Multipart {
+        upload_id: "u".into(),
+        part_size: 8,
+        parts_count: 3,
+    });
+    upload::apply(
+        &mut job,
+        Step::Planned {
+            remote_id: "r".into(),
+            multipart,
+            uploaded: false,
+        },
+        0,
+    );
+    for number in 1..=3 {
+        upload::apply(
+            &mut job,
+            Step::PartUploaded {
+                number,
+                etag: format!("e{number}"),
+            },
+            0,
+        );
+    }
+    upload::apply(&mut job, complete_rejected(&Value::Null), 0);
+    assert_eq!(job.parts.len(), 3, "ETags survive an unexplained rejection");
+    assert!(job.omit_parts && job.phase == Phase::Completing);
+}
+
 /// Multipart plan with 3 parts of 8 bytes; part 2 fails once with 500;
 /// `complete` checks every ETag.
 fn fake_cloud(
@@ -193,6 +241,7 @@ fn multipart_upload_resumes_after_a_failed_part_and_lands_in_the_cache() {
     assert!(!pending.exists());
     let cached = super::super::cache::find(&super::super::cache_dir().unwrap(), "rec-1").unwrap();
     assert_eq!(fs::read(cached).unwrap(), b"0123456789abcdefghij");
-    let library = super::super::library::read(&super::super::library_path("conn", "org").unwrap());
+    let library =
+        super::super::library::read_index(&super::super::library::dir("conn", "org").unwrap());
     assert_eq!(library.items["rec-1"]["status"], "queued");
 }
