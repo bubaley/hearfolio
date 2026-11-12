@@ -614,6 +614,7 @@ fn import_audio_with_id(
         duration_seconds: audio_duration(&target)
             .or_else(|| platform::native_audio_duration(app, &target)),
         results: vec![],
+        incomplete_ranges: vec![],
     };
     let _lock = history_lock()?;
     let dir = base()?;
@@ -733,11 +734,15 @@ fn clear_history() -> Result<(), String> {
 /// or null. Starting `transcribe` with that configuration skips them.
 #[tauri::command]
 fn unfinished_transcriptions() -> Result<Vec<resume::Unfinished>, String> {
-    Ok(resume::unfinished(&base()?))
+    Ok(resume::unfinished(&base()?, cloud::load()?.chunk_seconds))
 }
 #[tauri::command]
 fn cloud_resume_state(id: String) -> Result<Option<serde_json::Value>, String> {
-    Ok(resume::resumable(&base()?, &id))
+    Ok(resume::resumable(
+        &base()?,
+        &id,
+        cloud::load()?.chunk_seconds,
+    ))
 }
 #[tauri::command]
 async fn download_model(app: tauri::AppHandle, id: String) -> Result<(), String> {
@@ -1028,10 +1033,13 @@ fn is_cloud_scratch(name: &str) -> bool {
 }
 /// A process killed in the middle of a job never runs its own cleanup. Its
 /// prepared audio pieces (hundreds of megabytes for a long recording) and
-/// half-written archive copies are removed at the next start, when no job can
-/// be using them. Recordings, their journals and committed transcription
-/// progress are never touched.
-fn remove_interrupted_scratch(root: &Path) {
+/// half-written archive copies are removed at a later start. Only files old
+/// enough that no job can still own them are touched: a second window of the
+/// app, or an activity recreated next to a running job, shares this folder.
+/// Recordings, their journals and committed transcription progress are never
+/// removed.
+const SCRATCH_AGE: Duration = Duration::from_secs(13 * 60 * 60);
+fn remove_interrupted_scratch(root: &Path, now: SystemTime) {
     for entry in fs::read_dir(root.join("temp"))
         .into_iter()
         .flatten()
@@ -1039,10 +1047,21 @@ fn remove_interrupted_scratch(root: &Path) {
     {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let directory = entry.file_type().is_ok_and(|kind| kind.is_dir());
-        if directory && is_cloud_scratch(name) {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        // No job runs longer than twelve hours (`background::MAX_OPERATION`).
+        let abandoned = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= SCRATCH_AGE);
+        if !abandoned {
+            continue;
+        }
+        if metadata.is_dir() && is_cloud_scratch(name) {
             let _ = fs::remove_dir_all(entry.path());
-        } else if !directory
+        } else if metadata.is_file()
             && name.starts_with("hearing-")
             && (name.contains("-compact-") || name.ends_with("-import.audio"))
         {
@@ -1066,6 +1085,8 @@ struct CloudBackend<'a> {
     settings: &'a cloud::Settings,
     configuration: &'a RecognitionConfig,
     promoted: &'a mut bool,
+    /// The model's own output limit, when the catalog states one.
+    output_limit: Option<u64>,
     index: u64,
     total: u64,
     start: Instant,
@@ -1080,20 +1101,27 @@ impl cloud_job::Backend for CloudBackend<'_> {
     ) -> Result<cloud::Recognized, String> {
         background::check_current()?;
         let seconds = audio::wav_seconds(audio).unwrap_or(f64::from(self.settings.chunk_seconds));
-        cloud::transcribe(self.settings, self.configuration, audio, seconds, |text| {
-            if !*self.promoted && !text.trim().is_empty() {
-                *self.promoted = cloud::mark_working(self.configuration).is_ok();
-            }
-            live(text);
-            emit(
-                self.app,
-                "transcribe",
-                "progress.recognizeCloud",
-                self.index,
-                self.total,
-                self.start.elapsed().as_secs(),
-            );
-        })
+        let budget = cloud::completion_budget(seconds, self.output_limit);
+        cloud::transcribe(
+            self.settings,
+            self.configuration,
+            audio,
+            Some(budget),
+            |text| {
+                if !*self.promoted && !text.trim().is_empty() {
+                    *self.promoted = cloud::mark_working(self.configuration).is_ok();
+                }
+                live(text);
+                emit(
+                    self.app,
+                    "transcribe",
+                    "progress.recognizeCloud",
+                    self.index,
+                    self.total,
+                    self.start.elapsed().as_secs(),
+                );
+            },
+        )
     }
     fn wait(&mut self, delay: Duration) -> Result<(), String> {
         let until = Instant::now() + delay;
@@ -1105,6 +1133,9 @@ impl cloud_job::Backend for CloudBackend<'_> {
     }
     fn split(&mut self, audio: &Path) -> Result<Option<(PathBuf, PathBuf)>, String> {
         audio::split_wav(audio, SHORTEST_PIECE_SECONDS)
+    }
+    fn silent(&mut self, audio: &Path) -> bool {
+        audio::wav_is_silent(audio)
     }
     fn stage(&mut self, stage: &'static str) {
         emit(
@@ -1154,7 +1185,7 @@ async fn transcribe(
                     settings.last_configuration.clone()
                 });
             platform::validate_configuration(&configuration)?;
-            cloud::normalize_configuration(&settings, &mut configuration)?;
+            let output_limit = cloud::normalize_configuration(&settings, &mut configuration)?;
             {
                 let _lock = history_lock()?;
                 update_configuration_at(&base()?, &id, configuration.clone())?;
@@ -1171,10 +1202,20 @@ async fn transcribe(
                 fs::create_dir_all(&chunk_dir).map_err(|_| "errors.audioPrepare")?;
                 let result = (|| {
                     emit(&app, "transcribe", "progress.prepareAudio", 0, 0, 0);
-                    let chunks = audio::prepare_cloud_chunks(
+                    // Parts finished by an earlier attempt are continued with the
+                    // cut that produced them, also across an app update.
+                    let slicing = resume::slicing(
+                        &base()?,
+                        &id,
+                        &configuration,
+                        &input,
+                        settings.chunk_seconds,
+                    );
+                    let chunks = audio::prepare_cloud_chunks_sliced(
                         &input,
                         &chunk_dir,
                         settings.chunk_seconds,
+                        slicing,
                         |current, total| {
                             emit(
                                 &app,
@@ -1197,7 +1238,15 @@ async fn transcribe(
                         &input,
                         settings.chunk_seconds,
                         chunks.len() as u64,
+                        slicing,
                     )?;
+                    let lengths: Vec<f64> = chunks
+                        .iter()
+                        .map(|chunk| {
+                            audio::wav_seconds(chunk)
+                                .unwrap_or(f64::from(settings.chunk_seconds))
+                        })
+                        .collect();
                     let mut parts = progress.parts().to_vec();
                     let total = chunks.len() as u64;
                     if !parts.is_empty() {
@@ -1228,6 +1277,7 @@ async fn transcribe(
                             settings: &settings,
                             configuration: &configuration,
                             promoted: &mut promoted,
+                            output_limit,
                             index: index as u64,
                             total,
                             start,
@@ -1250,6 +1300,7 @@ async fn transcribe(
                         // Paid work is durable before the next request starts.
                         progress.commit(&root, outcome.text.clone(), outcome.incomplete)?;
                         parts.push(outcome.text);
+                        cloud_job::verdict(&parts, progress.incomplete(), false)?;
                         emit(
                             &app,
                             "transcribe",
@@ -1259,31 +1310,30 @@ async fn transcribe(
                             start.elapsed().as_secs(),
                         );
                     }
-                    let text = join_parts(&parts);
-                    if text.trim().is_empty() {
-                        return Err("errors.emptyTranscript".into());
-                    }
-                    Ok::<(String, Vec<u64>), String>((text, progress.incomplete().to_vec()))
+                    cloud_job::verdict(&parts, progress.incomplete(), true)?;
+                    Ok::<(String, Vec<[u64; 2]>), String>((
+                        join_parts(&parts),
+                        cloud_job::passages(progress.incomplete(), &lengths),
+                    ))
                 })();
                 let _ = fs::remove_dir_all(chunk_dir);
-                let (text, incomplete) = result?;
+                // Nothing was recognised and repeating the same requests cannot
+                // change that: the next attempt (another model) starts clean
+                // instead of failing at once on the stored empty parts.
+                if matches!(&result, Err(error) if error == "errors.emptyTranscript" || error == "errors.cloudNoText")
+                {
+                    resume::remove(&base()?, &id);
+                }
+                let (text, passages) = result?;
                 cloud::mark_working(&configuration)?;
                 background::check_current()?;
                 save_transcript(&id, format!("openrouter/{}", configuration.model), &text)?;
                 resume::remove(&base()?, &id);
-                if !incomplete.is_empty() {
-                    // The transcript is saved; say which passages to check by ear.
-                    let seconds = u64::from(settings.chunk_seconds);
-                    let _ = app.emit(
-                        "transcribe-incomplete",
-                        serde_json::json!({
-                            "recordId": id,
-                            "ranges": incomplete
-                                .iter()
-                                .map(|index| [index * seconds, (index + 1) * seconds])
-                                .collect::<Vec<_>>(),
-                        }),
-                    );
+                if !passages.is_empty() {
+                    // Stored with the record: the hint reaches the user even if
+                    // the interface was not alive when the run ended.
+                    let _lock = history_lock()?;
+                    let _ = records::set_incomplete_ranges_at(&base()?, &id, passages);
                 }
                 emit(
                     &app,
@@ -1411,7 +1461,7 @@ pub fn run() {
                 // Android may recreate the activity inside a living process:
                 // a job that is running owns its scratch files.
                 if !JOB_ACTIVE.load(Ordering::Acquire) {
-                    remove_interrupted_scratch(&root);
+                    remove_interrupted_scratch(&root, SystemTime::now());
                 }
                 transfer::cleanup_partial_files(&root);
                 app.asset_protocol_scope()
@@ -1519,7 +1569,15 @@ mod tests {
         for name in scratch.iter().chain(&kept) {
             fs::write(temp.join(name), b"data").unwrap();
         }
-        remove_interrupted_scratch(&root);
+        // Fresh files may belong to a job in another window of the app.
+        remove_interrupted_scratch(&root, SystemTime::now());
+        assert!(temp
+            .join("hearing-recording-17-cloud-1731400000000")
+            .is_dir());
+        for name in scratch {
+            assert!(temp.join(name).exists(), "{name}");
+        }
+        remove_interrupted_scratch(&root, SystemTime::now() + Duration::from_secs(14 * 60 * 60));
         assert!(!temp
             .join("hearing-recording-17-cloud-1731400000000")
             .exists());

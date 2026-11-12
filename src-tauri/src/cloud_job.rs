@@ -1,7 +1,8 @@
 //! One prepared piece of audio becomes text, whatever the request does on the
 //! way: a dropped connection is retried with a pause, a model that runs into
-//! its output limit gets the same audio in two shorter pieces, and silence is
-//! simply empty. Only a failure that repeating cannot fix reaches the user, and
+//! its output limit gets the same audio in two shorter pieces, and measured
+//! silence is simply empty. An empty answer for audible audio is not silence:
+//! it is kept as a gap the user is told about. Only a failure that repeating cannot fix reaches the user, and
 //! it never costs the pieces that are already done.
 use crate::cloud::{transient, Recognized};
 use std::{
@@ -30,6 +31,9 @@ pub trait Backend {
     fn wait(&mut self, delay: Duration) -> Result<(), String>;
     /// Two halves of `audio`, or `None` when it is too short to divide.
     fn split(&mut self, audio: &Path) -> Result<Option<(PathBuf, PathBuf)>, String>;
+    /// Whether the audio itself is silent, measured on its samples. An empty
+    /// answer is believed only for such a piece.
+    fn silent(&mut self, audio: &Path) -> bool;
     /// The job repeats a request or divides a piece; shown as the current stage.
     fn stage(&mut self, _stage: &'static str) {}
 }
@@ -37,8 +41,9 @@ pub trait Backend {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Outcome {
     pub text: String,
-    /// The model could not finish even the shortest piece; `text` is what it
-    /// did write. The transcript continues, the passage is reported.
+    /// The model could not finish even the shortest piece, or returned nothing
+    /// for audible audio; `text` is what it did write. The transcript
+    /// continues, the passage is reported.
     pub incomplete: bool,
 }
 
@@ -67,7 +72,7 @@ fn piece(
     live: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
     let mut failures = 0;
-    let mut silent = false;
+    let mut unanswered = false;
     loop {
         let result = backend.recognize(audio, &mut |text| live(&join(before, text)));
         match result {
@@ -96,13 +101,21 @@ fn piece(
                     incomplete: head.incomplete || tail.incomplete,
                 });
             }
-            // No speech in this piece: a pause in a meeting, a recorder left
-            // running. One more request rules out a hiccup.
+            // Nothing came back. For a pause in a meeting or a recorder left
+            // running that is the right answer, and the samples prove it. For
+            // audible audio it is the model failing (a refusal, an empty
+            // body): one more request, then a reported gap — never a silent one.
             Err(error) if error == "errors.emptyTranscript" => {
-                if silent {
+                if backend.silent(audio) {
                     return Ok(Outcome::default());
                 }
-                silent = true;
+                if unanswered {
+                    return Ok(Outcome {
+                        text: String::new(),
+                        incomplete: true,
+                    });
+                }
+                unanswered = true;
             }
             Err(error) if transient(&error) && failures + 1 < ATTEMPTS => {
                 failures += 1;
@@ -114,6 +127,57 @@ fn piece(
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Unanswered pieces after which a run that has not heard a word gives up.
+pub const UNANSWERED_LIMIT: usize = 2;
+/// Judges the pieces finished so far (`incomplete` holds the indexes of
+/// reported gaps). A model that cannot take audio answers every piece with
+/// nothing: that must end after a couple of requests, not after two per piece
+/// of a long recording. Returns the error to stop with.
+pub fn verdict(parts: &[String], incomplete: &[u64], finished: bool) -> Result<(), &'static str> {
+    if parts.iter().any(|part| !part.trim().is_empty()) {
+        return Ok(());
+    }
+    let unanswered = incomplete.len();
+    if unanswered >= UNANSWERED_LIMIT || (finished && unanswered > 0) {
+        return Err("errors.cloudNoText");
+    }
+    if finished {
+        // Every piece was measured silence.
+        return Err("errors.emptyTranscript");
+    }
+    Ok(())
+}
+/// Passages to check by ear, in whole seconds of the recording, from the real
+/// length of every piece. Neighbouring gaps become one passage.
+pub fn passages(incomplete: &[u64], seconds: &[f64]) -> Vec<[u64; 2]> {
+    let mut starts = Vec::with_capacity(seconds.len() + 1);
+    let mut offset = 0.0;
+    for length in seconds {
+        starts.push(offset);
+        offset += length.max(0.0);
+    }
+    starts.push(offset);
+    let mut passages: Vec<[u64; 2]> = Vec::new();
+    let mut indexes: Vec<usize> = incomplete
+        .iter()
+        .map(|index| *index as usize)
+        .filter(|index| *index < seconds.len())
+        .collect();
+    indexes.sort_unstable();
+    indexes.dedup();
+    for index in indexes {
+        let range = [
+            starts[index].floor() as u64,
+            starts[index + 1].ceil() as u64,
+        ];
+        match passages.last_mut() {
+            Some(last) if last[1] >= range[0] => last[1] = range[1],
+            _ => passages.push(range),
+        }
+    }
+    passages
 }
 
 /// A model that reached its output limit by repeating itself leaves the same
@@ -137,9 +201,15 @@ pub fn collapse_repetition(text: &str) -> String {
             {
                 repeats += 1;
             }
-            // A short phrase must repeat often to count; a long one is
-            // conclusive after three copies.
-            if repeats >= 3 && repeats * period >= 8 {
+            // People do repeat themselves ("да, да, да", a refrain). Only a
+            // run no speaker produces counts: one word a dozen times, a
+            // short phrase half a dozen, a long one from three copies.
+            let looped = match period {
+                1 => repeats >= 12,
+                2 | 3 => repeats >= 6,
+                _ => repeats >= 3 && repeats * period >= 16,
+            };
+            if looped {
                 keep = keep.min(end - period * (repeats - 1));
             }
         }
@@ -163,6 +233,7 @@ mod tests {
         stages: Vec<&'static str>,
         cancel_during_wait: bool,
         splittable: bool,
+        quiet: bool,
     }
     impl Script {
         fn new(replies: Vec<Result<Recognized, String>>) -> Self {
@@ -203,6 +274,9 @@ mod tests {
                 PathBuf::from(format!("{name}-a")),
                 PathBuf::from(format!("{name}-b")),
             )))
+        }
+        fn silent(&mut self, _audio: &Path) -> bool {
+            self.quiet
         }
         fn stage(&mut self, stage: &'static str) {
             self.stages.push(stage);
@@ -337,22 +411,33 @@ mod tests {
     }
 
     #[test]
-    fn silence_is_an_empty_piece_after_one_confirmation_not_a_failure() {
+    fn measured_silence_is_empty_at_once_but_an_empty_answer_for_speech_is_a_reported_gap() {
+        // The samples are silent: the empty answer is believed, nothing is repeated.
+        let mut script = Script::new(vec![fail("errors.emptyTranscript")]);
+        script.quiet = true;
+        let outcome = recognize(&mut script, Path::new("chunk"), &mut |_| {}).unwrap();
+        assert_eq!(outcome, Outcome::default());
+        assert_eq!(script.requests.len(), 1);
+        // Audible audio and two empty answers (a refusal, a null body): the
+        // piece is kept as an explicit gap.
         let mut script = Script::new(vec![
             fail("errors.emptyTranscript"),
             fail("errors.emptyTranscript"),
         ]);
         let outcome = recognize(&mut script, Path::new("chunk"), &mut |_| {}).unwrap();
-        assert_eq!(outcome, Outcome::default());
+        assert_eq!(
+            outcome,
+            Outcome {
+                text: String::new(),
+                incomplete: true
+            }
+        );
         assert!(script.waits.is_empty());
         // A hiccup: the second request does hear speech.
         let mut script = Script::new(vec![fail("errors.emptyTranscript"), full("speech")]);
-        assert_eq!(
-            recognize(&mut script, Path::new("chunk"), &mut |_| {})
-                .unwrap()
-                .text,
-            "speech"
-        );
+        let outcome = recognize(&mut script, Path::new("chunk"), &mut |_| {}).unwrap();
+        assert_eq!(outcome.text, "speech");
+        assert!(!outcome.incomplete);
     }
 
     #[test]
@@ -373,7 +458,52 @@ mod tests {
             refrain,
             "two copies are not a loop"
         );
+        for spoken in [
+            "ну да да да да да да да да",
+            "так и было, нет нет нет нет нет",
+            "раз два раз два раз два раз два",
+        ] {
+            assert_eq!(
+                collapse_repetition(spoken),
+                spoken,
+                "people repeat themselves"
+            );
+        }
         assert_eq!(collapse_repetition("  kept\nas is  "), "kept\nas is");
         assert_eq!(collapse_repetition(""), "");
+    }
+
+    #[test]
+    fn a_model_that_hears_nothing_fails_fast_and_silence_is_told_apart() {
+        let empty = String::new;
+        // Two audible pieces answered with nothing, not a word so far: stop.
+        assert_eq!(verdict(&[empty()], &[0], false), Ok(()));
+        assert_eq!(
+            verdict(&[empty(), empty()], &[0, 1], false),
+            Err("errors.cloudNoText")
+        );
+        // Measured silence at the start of a recording is not the model's fault.
+        assert_eq!(verdict(&[empty(), empty(), empty()], &[], false), Ok(()));
+        assert_eq!(verdict(&[empty(), empty()], &[1], false), Ok(()));
+        // Once anything was heard, gaps are reported, never fatal.
+        let heard = ["speech".to_owned(), empty(), empty(), empty()];
+        assert_eq!(verdict(&heard, &[1, 2, 3], true), Ok(()));
+        // At the end: nothing but silence, or a single unanswered piece.
+        assert_eq!(
+            verdict(&[empty(), empty()], &[], true),
+            Err("errors.emptyTranscript")
+        );
+        assert_eq!(verdict(&[empty()], &[0], true), Err("errors.cloudNoText"));
+    }
+
+    #[test]
+    fn passages_use_the_real_length_of_each_piece_and_join_neighbours() {
+        // Three pieces of 120 s and a last one of 127.4 s (a short remainder joined to it).
+        let seconds = [120.0, 120.0, 120.0, 127.4];
+        assert_eq!(passages(&[3], &seconds), [[360, 488]]);
+        assert_eq!(passages(&[0, 2], &seconds), [[0, 120], [240, 360]]);
+        assert_eq!(passages(&[2, 1, 1], &seconds), [[120, 360]]);
+        assert!(passages(&[9], &seconds).is_empty());
+        assert!(passages(&[], &seconds).is_empty());
     }
 }

@@ -133,6 +133,8 @@ button.brand:disabled { opacity: 1; }
 .record-state.done { color: var(--done); }
 .record-state.done::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .record-state.live { color: var(--work); }
+.record-gaps { display: inline-flex; align-items: center; gap: 4px; color: var(--error); }
+.record-gaps svg { width: 13px; height: 13px; flex: none; }
 .record-state.paused { color: var(--work); }
 .record-state.paused::before { content: ''; width: 6px; height: 6px; border-radius: 50%; border: 1.5px solid currentColor; box-sizing: border-box; }
 .record-state.live i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: pulse 1.2s ease-in-out infinite; }

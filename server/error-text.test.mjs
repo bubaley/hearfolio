@@ -10,6 +10,8 @@ test('a service status becomes advice; its raw message never reaches the screen'
   setLanguage('ru');
   assert.match(errorText('errors.cloudHttp|HTTP 401: No auth credentials found sk-or-secret'),/API token/);
   assert.match(errorText('errors.cloudHttp|HTTP 402: Insufficient credits'),/баланс/i);
+  assert.match(errorText('errors.cloudHttp|HTTP 403: Input flagged'),/модерац/);
+  assert.match(errorText('errors.cloudNoText'),/другую модель/);
   assert.match(errorText('errors.cloudHttp|HTTP 429: Rate limit exceeded'),/Подождите/);
   assert.match(errorText('errors.cloudHttp|HTTP 503: upstream connect error'),/временно недоступен/);
   assert.match(errorText('errors.cloudHttp|HTTP 404: No endpoints found'),/модель/i);

@@ -215,6 +215,7 @@ const messages: Record<string,string> = {
   'Не обработано записей:':'Unprocessed recordings:','Они в «Архиве».':'Find them in Archive.',
   'Аудио сохранено в разделе «Архив».':'The audio is kept in Archive.',
   'Сохранение записи прервалось. Аудио не потеряно — оно в разделе «Архив».':'Saving the recording was interrupted. The audio is safe — find it in Archive.',
+  'Сверьте с аудио:':'Check against the audio:',
   'Расшифровка не завершена':'Transcription is unfinished','Не завершена':'Unfinished','Восстанавливаем запись…':'Restoring the recording…','Аудио сохранено. Это займёт немного времени.':'The audio is safe. This will take a moment.',
   'Часть записи распознана не полностью:':'Part of the recording was not fully transcribed:','Сверьте эти места с аудио.':'Check these passages against the audio.',
   'выберите аудиофайл':'choose an audio file','выберите на диске':'choose one on disk','потоковый текст':'streaming text','файл целиком':'whole file',
@@ -288,13 +289,15 @@ const errorMessages:Record<string,[string,string]>={
   "catalogLoad":["Не удалось загрузить каталог. Проверьте подключение и повторите.", "Could not load the catalog. Check your connection and try again."],
   "cloudConnect":["Не удалось подключиться к сервису распознавания. Проверьте интернет и повторите — готовые части сохранены.", "Could not connect to the transcription service. Check your connection and retry — finished parts are kept."],
   "cloudAuth":["OpenRouter не принял API token. Проверьте его в настройках.", "OpenRouter rejected the API token. Check it in Settings."],
+  "cloudForbidden":["OpenRouter отказал в доступе: запрос отклонён модерацией, либо у ключа нет прав на эту модель. Попробуйте другую модель или проверьте ограничения ключа.", "OpenRouter denied the request: it was blocked by moderation, or the key may not use this model. Try another model or check the key's limits."],
+  "cloudNoText":["Модель не вернула текст для этой записи. Возможно, она не умеет распознавать аудио — выберите другую модель.", "The model returned no text for this recording. It may not transcribe audio — choose another model."],
   "cloudBalance":["На балансе OpenRouter недостаточно средств. Пополните баланс и продолжите — готовые части сохранены.", "Your OpenRouter balance is too low. Top up and continue — finished parts are kept."],
   "cloudRateLimit":["Сервис ограничил частоту запросов. Подождите минуту и продолжите — готовые части сохранены.", "The service is limiting requests. Wait a minute and continue — finished parts are kept."],
   "cloudUnavailable":["Сервис распознавания временно недоступен. Повторите позже — готовые части сохранены.", "The transcription service is temporarily unavailable. Try again later — finished parts are kept."],
   "cloudModelGone":["Эта модель сейчас недоступна. Выберите другую модель.", "This model is currently unavailable. Choose another model."],
   "cloudRejectedAudio":["Сервис не принял аудио. Выберите другую модель или уменьшите длину фрагмента в настройках.", "The service did not accept the audio. Choose another model or a shorter segment length in Settings."],
   "cloudHttp":["Сервис отклонил запрос. Проверьте токен, модель и баланс.", "The service rejected the request. Check your token, model and balance."],
-  "cloudIncomplete":["Сервис вернул неполный текст. Доступную часть можно скопировать.", "The service returned partial text. You can copy the available part."],
+  "cloudIncomplete":["Модель не уместила ответ в лимит, результат не сохранён. Выберите модель с большим лимитом или сократите инструкцию.", "The model ran out of output space, so nothing was saved. Choose a model with a larger limit or shorten the instruction."],
   "cloudInterrupted":["Подключение прервалось. Повторите — готовые части сохранены.", "The connection was interrupted. Retry — finished parts are kept."],
   "cloudModelRequired":["Выберите модель OpenRouter.", "Choose an OpenRouter model."],
   "cloudModelUnsupported":["Эта модель недоступна для выбранного способа распознавания. Обновите каталог.", "This model is unavailable for the selected transcription mode. Refresh the catalog."],
@@ -374,7 +377,7 @@ const errorMessages:Record<string,[string,string]>={
 function cloudStatusCode(value:string):string|null {
   const status=Number(/^errors\.cloudHttp\|HTTP (\d{3})/.exec(value)?.[1]);
   if(!status)return null;
-  return status===401||status===403?'cloudAuth':status===402?'cloudBalance':status===429?'cloudRateLimit':status===404?'cloudModelGone':status===400||status===413||status===415||status===422?'cloudRejectedAudio':status===408||status>=500?'cloudUnavailable':null;
+  return status===401?'cloudAuth':status===403?'cloudForbidden':status===402?'cloudBalance':status===429?'cloudRateLimit':status===404?'cloudModelGone':status===400||status===413||status===415||status===422?'cloudRejectedAudio':status===408||status>=500?'cloudUnavailable':null;
 }
 export function errorText(error:unknown):string {
   const value=error instanceof Error?error.message:String(error);
@@ -408,7 +411,7 @@ export function stageText(key:string):string {
     "progress.recognizedChunks":["Обрабатываем части записи", "Processing recording segments"],
     "progress.sendCloudAudio":["Отправляем аудио", "Sending audio"],
     "progress.sendCloudChunk":["Отправляем часть записи", "Sending recording segment"],
-    "progress.retryCloudChunk":["Связь прервалась — повторяем часть записи", "Connection lost — retrying this segment"],
+    "progress.retryCloudChunk":["Сервис не ответил — повторяем часть записи", "The service did not answer — retrying this segment"],
     "progress.splitCloudChunk":["Уточняем сложный фрагмент", "Refining a difficult segment"],
     "progress.streamRecognition":["Получаем текст", "Receiving text"],
     'progress.download':['Скачиваем модель','Downloading model'],

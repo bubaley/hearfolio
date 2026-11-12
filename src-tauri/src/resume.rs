@@ -9,8 +9,10 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-// Bump when chunk boundaries change so stale parts are never stitched together.
-const VERSION: u32 = 1;
+// The version is the slicing (`audio::SLICING`) the parts were cut with. An
+// attempt started by an older build is continued with its own slicing, so an
+// update never throws away finished, paid parts.
+const VERSIONS: std::ops::RangeInclusive<u32> = 1..=crate::audio::SLICING;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -59,11 +61,35 @@ fn read(root: &Path, record_id: &str) -> Option<CloudProgress> {
         return None;
     }
     let progress: CloudProgress = serde_json::from_slice(&bytes).ok()?;
-    (progress.version == VERSION && progress.record_id == record_id).then_some(progress)
+    (VERSIONS.contains(&progress.version) && progress.record_id == record_id).then_some(progress)
 }
 fn still_valid(progress: &CloudProgress) -> bool {
     source(Path::new(&progress.source.path)).is_some_and(|current| current == progress.source)
         && progress.parts.len() as u64 <= progress.total
+}
+/// Parts that a new attempt with this segment length would really continue.
+fn continuable(progress: &CloudProgress, chunk_seconds: u32) -> bool {
+    still_valid(progress)
+        && progress.chunk_seconds == chunk_seconds
+        && !progress.parts.is_empty()
+        && (progress.parts.len() as u64) < progress.total
+}
+/// The slicing a new attempt must use: the one its unfinished parts were cut
+/// with, otherwise the current one.
+pub fn slicing(
+    root: &Path,
+    record_id: &str,
+    configuration: &RecognitionConfig,
+    input: &Path,
+    chunk_seconds: u32,
+) -> u32 {
+    read(root, record_id)
+        .filter(|previous| {
+            previous.configuration == *configuration
+                && source(input).is_some_and(|current| current == previous.source)
+                && continuable(previous, chunk_seconds)
+        })
+        .map_or(crate::audio::SLICING, |previous| previous.version)
 }
 impl CloudProgress {
     /// Starts a new attempt, reusing committed parts only when every input that
@@ -75,10 +101,12 @@ impl CloudProgress {
         input: &Path,
         chunk_seconds: u32,
         total: u64,
+        slicing: u32,
     ) -> Result<Self, String> {
         let source = source(input).ok_or("errors.audioMissing")?;
         if let Some(previous) = read(root, record_id) {
-            if previous.configuration == *configuration
+            if previous.version == slicing
+                && previous.configuration == *configuration
                 && previous.source == source
                 && previous.chunk_seconds == chunk_seconds
                 && previous.total == total
@@ -89,7 +117,7 @@ impl CloudProgress {
         }
         let _ = fs::remove_file(path(root, record_id));
         Ok(Self {
-            version: VERSION,
+            version: slicing,
             record_id: record_id.into(),
             configuration: configuration.clone(),
             source,
@@ -120,7 +148,7 @@ pub struct Unfinished {
     pub done: u64,
     pub total: u64,
 }
-pub fn unfinished(root: &Path) -> Vec<Unfinished> {
+pub fn unfinished(root: &Path, chunk_seconds: u32) -> Vec<Unfinished> {
     let mut found = Vec::new();
     for entry in fs::read_dir(root.join("temp"))
         .into_iter()
@@ -134,14 +162,14 @@ pub fn unfinished(root: &Path) -> Vec<Unfinished> {
         else {
             continue;
         };
-        if let Some(progress) = read(root, id).filter(still_valid) {
-            if !progress.parts.is_empty() && (progress.parts.len() as u64) < progress.total {
-                found.push(Unfinished {
-                    id: id.to_owned(),
-                    done: progress.parts.len() as u64,
-                    total: progress.total,
-                });
-            }
+        if let Some(progress) =
+            read(root, id).filter(|progress| continuable(progress, chunk_seconds))
+        {
+            found.push(Unfinished {
+                id: id.to_owned(),
+                done: progress.parts.len() as u64,
+                total: progress.total,
+            });
         }
     }
     found
@@ -163,16 +191,15 @@ fn write_atomic(target: &Path, value: &CloudProgress) -> Result<(), String> {
         .map_err(|_| "errors.operationFailed")?;
     fs::rename(temp, target).map_err(|_| "errors.operationFailed".into())
 }
-/// `{done,total}` for an unfinished attempt whose source audio is unchanged.
-pub fn resumable(root: &Path, record_id: &str) -> Option<serde_json::Value> {
-    let progress = read(root, record_id).filter(still_valid)?;
-    (!progress.parts.is_empty()).then(|| {
-        serde_json::json!({
-            "done": progress.parts.len(),
-            "total": progress.total,
-            "configuration": progress.configuration,
-        })
-    })
+/// `{done,total}` for an unfinished attempt that a retry would continue: the
+/// source audio and the segment length are unchanged and parts remain.
+pub fn resumable(root: &Path, record_id: &str, chunk_seconds: u32) -> Option<serde_json::Value> {
+    let progress = read(root, record_id).filter(|progress| continuable(progress, chunk_seconds))?;
+    Some(serde_json::json!({
+        "done": progress.parts.len(),
+        "total": progress.total,
+        "configuration": progress.configuration,
+    }))
 }
 pub fn remove(root: &Path, record_id: &str) {
     let _ = fs::remove_file(path(root, record_id));
@@ -211,23 +238,24 @@ mod tests {
         let root = root();
         let input = root.join("audio.wav");
         fs::write(&input, b"audio").unwrap();
-        let mut progress = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3).unwrap();
+        let mut progress =
+            CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3, 2).unwrap();
         assert!(progress.parts().is_empty());
         progress.commit(&root, "one".into(), false).unwrap();
         progress.commit(&root, "two".into(), true).unwrap();
         assert_eq!(
-            resumable(&root, "rec").unwrap(),
+            resumable(&root, "rec", 30).unwrap(),
             serde_json::json!({"done":2,"total":3,"configuration":config("a")})
         );
         assert_eq!(
-            unfinished(&root),
+            unfinished(&root, 30),
             [Unfinished {
                 id: "rec".into(),
                 done: 2,
                 total: 3
             }]
         );
-        let again = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3).unwrap();
+        let again = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3, 2).unwrap();
         assert_eq!(again.parts(), ["one", "two"]);
         assert_eq!(
             again.incomplete(),
@@ -240,39 +268,69 @@ mod tests {
             .replace(",\"incomplete\":[1]", "");
         assert!(!legacy.contains("incomplete"));
         fs::write(path(&root, "rec"), legacy).unwrap();
-        let legacy = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3).unwrap();
+        let legacy = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3, 2).unwrap();
         assert_eq!(legacy.parts(), ["one", "two"]);
         assert!(legacy.incomplete().is_empty());
         // A different chunk count means different boundaries.
         assert!(
-            CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 4)
+            CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 4, 2)
                 .unwrap()
                 .parts()
                 .is_empty()
         );
-        assert!(resumable(&root, "rec").is_none());
-        let mut progress = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3).unwrap();
+        assert!(resumable(&root, "rec", 30).is_none());
+        let mut progress =
+            CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3, 2).unwrap();
         progress.commit(&root, "one".into(), false).unwrap();
         assert!(
-            CloudProgress::begin(&root, "rec", &config("b"), &input, 30, 3)
+            CloudProgress::begin(&root, "rec", &config("b"), &input, 30, 3, 2)
                 .unwrap()
                 .parts()
                 .is_empty()
         );
-        let mut progress = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3).unwrap();
+        let mut progress =
+            CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3, 2).unwrap();
         progress.commit(&root, "one".into(), false).unwrap();
         fs::write(&input, b"changed audio").unwrap();
-        assert!(resumable(&root, "rec").is_none());
+        assert!(resumable(&root, "rec", 30).is_none());
         assert!(
-            CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3)
+            CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3, 2)
                 .unwrap()
                 .parts()
                 .is_empty()
         );
-        let mut progress = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3).unwrap();
+        let mut progress =
+            CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 3, 2).unwrap();
         progress.commit(&root, "one".into(), false).unwrap();
         remove_all(&root);
         assert!(!path(&root, "rec").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn parts_paid_for_before_an_update_resume_with_the_slicing_that_cut_them() {
+        let root = root();
+        let input = root.join("audio.wav");
+        fs::write(&input, b"audio").unwrap();
+        // The old build cut five pieces (the last a short remainder) and failed on the fifth.
+        let mut old = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 5, 1).unwrap();
+        for part in ["one", "two", "three", "four"] {
+            old.commit(&root, part.into(), false).unwrap();
+        }
+        assert_eq!(slicing(&root, "rec", &config("a"), &input, 30), 1);
+        assert_eq!(resumable(&root, "rec", 30).unwrap()["done"], 4);
+        let resumed = CloudProgress::begin(&root, "rec", &config("a"), &input, 30, 5, 1).unwrap();
+        assert_eq!(resumed.parts().len(), 4, "nothing paid for is thrown away");
+        // What is offered is what a retry would do: another segment length or
+        // model starts over with the current slicing, and says so.
+        assert!(resumable(&root, "rec", 120).is_none());
+        assert!(unfinished(&root, 120).is_empty());
+        assert_eq!(slicing(&root, "rec", &config("a"), &input, 120), 2);
+        assert_eq!(slicing(&root, "rec", &config("b"), &input, 30), 2);
+        // A run with every part done is finished or failed for good, never "resumable".
+        let mut done = CloudProgress::begin(&root, "full", &config("a"), &input, 30, 1, 2).unwrap();
+        done.commit(&root, String::new(), true).unwrap();
+        assert!(resumable(&root, "full", 30).is_none());
+        assert_eq!(slicing(&root, "full", &config("a"), &input, 30), 2);
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -576,7 +576,11 @@ fn with_resume(mut snapshot: OperationSnapshot) -> OperationSnapshot {
     if snapshot.kind == "transcribe" && snapshot.state != "running" && snapshot.state != "finished"
     {
         if let (Some(record), Ok(root)) = (snapshot.record_id.as_deref(), crate::base()) {
-            snapshot.resumable = crate::resume::resumable(&root, record);
+            let seconds = crate::cloud::load()
+                .map_or(crate::cloud::DEFAULT_CHUNK_SECONDS, |settings| {
+                    settings.chunk_seconds
+                });
+            snapshot.resumable = crate::resume::resumable(&root, record, seconds);
         }
     }
     snapshot

@@ -316,7 +316,8 @@ function outputHtml():string {
 function resultMeta():string {return busy&&progress?.kind==='transcribe'?tr("Расшифровываем…"):text?`${countLabel(words(),'word')}${resultSaved?'':tr(" · не сохранено")}`:tr("Без текста");}
 function recordMetaHtml():string {
   if(!active)return '';
-  return [dateLabel(active.createdAt),active.durationSeconds?formatTime(active.durationSeconds):'',active.sizeBytes?sizeLabel(active.sizeBytes):'',resultMeta()].filter(Boolean).map(part=>`<span>${esc(part)}</span>`).join('');
+  const gaps=active.incompleteRanges?.length&&!(busy&&progress?.kind==='transcribe')?`<span class="record-gaps" title="${tr('Часть записи распознана не полностью:')} ${esc(passagesLabel(active))}">${icon('alert')}${tr('Сверьте с аудио:')} ${esc(passagesLabel(active))}</span>`:'';
+  return [dateLabel(active.createdAt),active.durationSeconds?formatTime(active.durationSeconds):'',active.sizeBytes?sizeLabel(active.sizeBytes):'',resultMeta()].filter(Boolean).map(part=>`<span>${esc(part)}</span>`).join('')+gaps;
 }
 function providerControlsHtml():string {
   if(!platform.localRecognition)return cloudControlsHtml();
@@ -938,21 +939,17 @@ async function download(id:string) {
   catch(error){endOperation();notice(`${tr("Не удалось скачать модель: ")}${errorText(error)}`,true);}
   finally{endOperation();render();}
 }
-// Passages the model could not finish even in short pieces; the transcript is saved, the user is told where to listen.
-let incomplete:{recordId:string;ranges:[number,number][]}|null=null;
-subscribe<{recordId:string;ranges:[number,number][]}>('transcribe-incomplete',payload=>{incomplete=payload;}).catch(()=>{});
-function incompleteNotice(id:string):string {
-  if(incomplete?.recordId!==id||!incomplete.ranges.length)return '';
-  const limit=active?.id===id&&active.durationSeconds?active.durationSeconds:Infinity;
-  const ranges=incomplete.ranges.map(([from,to])=>`${formatTime(from)}–${formatTime(Math.min(to,limit))}`).join(', ');
-  incomplete=null;
-  return `${tr('Часть записи распознана не полностью:')} ${ranges}. ${tr('Сверьте эти места с аудио.')}`;
+// Passages the model could not finish (or left unanswered). They are stored with the record, so the
+// hint is shown when the run ends and stays in the record's details afterwards.
+const passagesLabel=(entry:Entry)=>(entry.incompleteRanges||[]).map(([from,to])=>`${formatTime(from)}–${formatTime(entry.durationSeconds?Math.min(to,Math.ceil(entry.durationSeconds)):to)}`).join(', ');
+function incompleteNotice(entry:Entry|null):string {
+  return entry?.incompleteRanges?.length?`${tr('Часть записи распознана не полностью:')} ${passagesLabel(entry)}. ${tr('Сверьте эти места с аудио.')}`:'';
 }
 async function run() {
   if(!active||busy||readiness())return;
   const id=active.id,beforeAttempt={text,saved:resultSaved};
   if(text&&resultSaved)previousResult={text,saved:true};
-  receivedPartial=false;outputTab='transcript';incomplete=null;
+  receivedPartial=false;outputTab='transcript';
   beginOperation('transcribe',tr("Подготавливаем запись"));startReveal(0);render();
   try {
     await settingsSaveQueue;await configurationSaveQueue;
@@ -960,7 +957,7 @@ async function run() {
     const detail=await call<{entry:Entry;text:string;warning?:string|null}>('get_history',{id});active=detail.entry;resultSaved=Boolean(detail.entry.outputPath&&detail.text);previousResult=null;
     settings=await call<Settings>('get_settings');
     history=sortHistory(await call<Entry[]>('list_history'));resume=null;unfinished.delete(id);
-    const warning=incompleteNotice(id);if(warning){status=warning;isError=true;noticeAction=null;}
+    const warning=incompleteNotice(detail.entry);if(warning){status=warning;isError=true;noticeAction=null;}
   } catch(error) {
     void refreshResume(id);
     if(!receivedPartial){text=beforeAttempt.text;resultSaved=beforeAttempt.saved;if(resultSaved)previousResult=null;stopReveal();}else finishReveal();
@@ -1149,8 +1146,8 @@ async function consumeNativeOperation(snapshot:OperationSnapshot){
     if(snapshot.resumable&&id)resume={id,...snapshot.resumable} as CloudResume&{id:string};
     const retryable=snapshot.kind==='transcribe'&&id&&snapshot.state!=='finished'&&snapshot.state!=='cancelled';
     if(snapshot.kind==='import'&&snapshot.state==='interrupted'){await refreshLoose();notice(tr('Сохранение записи прервалось. Аудио не потеряно — оно в разделе «Архив».'),true);return;}
-    notice(snapshot.state==='finished'?tr(snapshot.kind==='import'?'Запись сохранена':snapshot.kind==='postprocess'?'Результат сохранён':'Готово'):`${errorText(snapshot.error||'errors.operationInterrupted')}${snapshot.resumable?` ${tr('Готово частей:')} ${snapshot.resumable.done}/${snapshot.resumable.total}. ${tr('Расшифровку можно продолжить.')}`:''}`,snapshot.state!=='finished'&&snapshot.state!=='cancelled',retryable?{label:tr(snapshot.resumable?'Продолжить':'Повторить'),run:()=>{if(active?.id===id)void run();}}:undefined);
-    if(snapshot.state==='finished'&&snapshot.kind==='transcribe'&&id){const warning=incompleteNotice(id);if(warning)notice(warning,true);}
+    notice(snapshot.state==='finished'?tr(snapshot.kind==='import'?'Запись сохранена':snapshot.kind==='postprocess'?'Результат сохранён':'Готово'):`${errorText(snapshot.error||'errors.operationInterrupted')}${snapshot.resumable?` ${tr('Готово частей:')} ${snapshot.resumable.done}/${snapshot.resumable.total}. ${tr('Расшифровку можно продолжить.')}`:''}`,snapshot.state!=='finished'&&snapshot.state!=='cancelled',retryable?{label:tr(snapshot.resumable?'Продолжить':'Повторить'),run:()=>{void (async()=>{if(active?.id!==id)await loadHistory(id!);if(active?.id===id&&view==='work')await run();})();}}:undefined);
+    if(snapshot.state==='finished'&&snapshot.kind==='transcribe'&&active?.id===id){const warning=incompleteNotice(active);if(warning)notice(warning,true);}
   }catch(error){notice(errorText(error),true);}finally{recoveringOperation=false;}
 }
 async function syncNativeOperation(){

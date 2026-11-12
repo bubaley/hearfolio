@@ -16,6 +16,8 @@ export type PostprocessResult = {id:string;ruleId:string;ruleName:string;instruc
 export type Entry = {
   id: string; name: string; inputPath: string; outputPath: string | null;
   configuration?: RecognitionConfig | null; model: string | null; createdAt: number; sizeBytes?: number | null; durationSeconds?: number | null; results?:PostprocessResult[];
+  /** Passages `[fromSeconds,toSeconds]` the model could not transcribe in full. */
+  incompleteRanges?:[number,number][];
 };
 export type Progress = { kind: 'download' | 'transcribe' | 'postprocess' | 'import' | 'storage' | 'update'; stage: string; current: number; total: number; elapsed: number };
 export type Settings = {language:LanguagePreference;systemLanguage:'ru'|'en';openrouterUrl:string;hasToken:boolean;storageParent:string;storagePath:string;lastConfiguration:RecognitionConfig;chunkSeconds?:number};

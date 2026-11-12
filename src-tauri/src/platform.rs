@@ -518,6 +518,7 @@ mod tests {
             size_bytes: None,
             duration_seconds: None,
             results: vec![],
+            incomplete_ranges: vec![],
         };
         assert_eq!(
             tracked_audio_at(&dir, &[entry.clone()], id).unwrap(),

@@ -330,10 +330,26 @@ impl ChunkWriter<'_> {
 // most 16 kHz and written directly to disk in `seconds`-long pieces; an hour-long
 // recording never becomes an hour-long memory buffer. A corrupt packet is
 // skipped (as players do) instead of discarding the whole recording.
+#[cfg(test)]
 pub fn prepare_cloud_chunks(
     input: &Path,
     destination: &Path,
     seconds: u32,
+    progress: impl FnMut(u64, u64),
+) -> Result<Vec<PathBuf>, String> {
+    prepare_cloud_chunks_sliced(input, destination, seconds, SLICING, progress)
+}
+
+/// How a recording is cut into pieces. Finished pieces of an interrupted run
+/// are only valid for the cut that produced them, so a run that resumes keeps
+/// the version it started with.
+/// 1: a piece every `seconds`. 2: a last piece of a few seconds joins the one before.
+pub const SLICING: u32 = 2;
+pub fn prepare_cloud_chunks_sliced(
+    input: &Path,
+    destination: &Path,
+    seconds: u32,
+    slicing: u32,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<Vec<PathBuf>, String> {
     let mut probed = probe(input)?;
@@ -427,7 +443,9 @@ pub fn prepare_cloud_chunks(
     if chunks.is_empty() {
         return Err("errors.audioEmpty".into());
     }
-    merge_short_tail(&mut chunks)?;
+    if slicing >= 2 {
+        merge_short_tail(&mut chunks)?;
+    }
     Ok(chunks)
 }
 
@@ -465,6 +483,36 @@ fn merge_short_tail(chunks: &mut Vec<PathBuf>) -> Result<(), String> {
 pub fn wav_seconds(path: &Path) -> Option<f64> {
     let reader = hound::WavReader::open(path).ok()?;
     Some(f64::from(reader.duration()) / f64::from(reader.spec().sample_rate.max(1)))
+}
+
+/// Whether a prepared piece holds no sound a person could be speaking in: its
+/// loudest 50 ms stays under −40 dBFS. Room tone and microphone hiss pass as
+/// silence; a quiet voice does not.
+pub fn wav_is_silent(path: &Path) -> bool {
+    let Ok(mut reader) = hound::WavReader::open(path) else {
+        return false;
+    };
+    let spec = reader.spec();
+    if spec.bits_per_sample != 16 || spec.sample_format != hound::SampleFormat::Int {
+        return false;
+    }
+    let window = (spec.sample_rate as usize * spec.channels as usize / 20).max(1);
+    // −40 dBFS as mean square of 16-bit samples.
+    let limit = (32768.0f64 * 0.01).powi(2) * window as f64;
+    let (mut energy, mut count) = (0.0f64, 0usize);
+    for sample in reader.samples::<i16>() {
+        let Ok(sample) = sample else { return false };
+        energy += f64::from(sample) * f64::from(sample);
+        count += 1;
+        if count == window {
+            if energy > limit {
+                return false;
+            }
+            energy = 0.0;
+            count = 0;
+        }
+    }
+    true
 }
 
 /// Divides a prepared piece in two at the quietest moment near its middle, so
@@ -562,6 +610,12 @@ mod tests {
         assert_eq!(first.samples::<i16>().next().unwrap().unwrap(), 2000);
         assert!(!dir.join("chunk-000001.wav").exists());
         assert_eq!(wav_seconds(&chunks[0]), Some(31.0));
+        // Pieces of a run started before the remainder was joined keep their cut.
+        let legacy = dir.join("legacy");
+        fs::create_dir_all(&legacy).unwrap();
+        let old = prepare_cloud_chunks_sliced(&input, &legacy, 30, 1, |_, _| {}).unwrap();
+        assert_eq!(old.len(), 2);
+        assert_eq!(hound::WavReader::open(&old[1]).unwrap().duration(), 16000);
         // A remainder long enough to carry speech stays a piece of its own.
         let shorter = dir.join("shorter");
         fs::create_dir_all(&shorter).unwrap();
@@ -581,6 +635,49 @@ mod tests {
             16000 * 31
         );
         assert_eq!(detect_extension(&input).unwrap(), "wav");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn silence_is_measured_on_the_samples_and_a_quiet_voice_is_not_silence() {
+        let dir = fixture();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let write = |name: &str, sample: &dyn Fn(usize) -> i16| {
+            let path = dir.join(name);
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            for index in 0..16000 * 10 {
+                writer.write_sample(sample(index)).unwrap();
+            }
+            writer.finalize().unwrap();
+            path
+        };
+        assert!(wav_is_silent(&write("zero.wav", &|_| 0)));
+        // Hiss around −56 dBFS.
+        assert!(wav_is_silent(&write(
+            "hiss.wav",
+            &|index| if index % 2 == 0 { 50 } else { -50 }
+        )));
+        // One quiet word (−30 dBFS for a third of a second) in ten seconds.
+        let word = 16000 * 4..16000 * 4 + 5000;
+        assert!(!wav_is_silent(&write("word.wav", &|index| {
+            if word.contains(&index) {
+                if index % 2 == 0 {
+                    1000
+                } else {
+                    -1000
+                }
+            } else {
+                0
+            }
+        })));
+        assert!(
+            !wav_is_silent(&dir.join("missing.wav")),
+            "unreadable is not proof of silence"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
