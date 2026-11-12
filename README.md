@@ -120,6 +120,12 @@ On a phone, Settings opens a list of categories with a back button inside each c
 
 Open **Devices**, enter your own relay URL and this device's name, and connect to the server. There is no preset relay domain. Use **Pair a device** to show a short-lived invitation QR/code, then scan or enter it on your other device and confirm the request. Both devices must use the same relay. Incoming recordings show the sender and file size; sending shows the recipient, progress, and cancellation. Pausing transfers retains the saved connection and archive.
 
+## Organizations (Hearfolio Cloud)
+
+Open **Settings → Cloud**, enter your team's Hearfolio Cloud address (any domain, self-hosted), and sign in in the browser. Hearfolio checks that the server is compatible first and signs in with OAuth and PKCE; the access key is kept in the system keychain (Android Keystore on Android) and is revoked when you disconnect. Several servers and accounts can be connected; each shows its organizations.
+
+Choose **To** on the start screen or in the recorder: this device, or an organization with an optional project and shared/personal visibility. Recordings for an organization are uploaded in the background with resumable multipart uploads that survive restarts and wait for the network; the server transcribes them. **Share → Copy to organization** sends an existing recording, with its transcript if it has one. Tabs above the recording list show each organization's recordings with upload and transcription status, transcripts and summaries. Cloud audio stays on the device after upload or playback and is removed after the period set in **Keep audio on device** (30 days by default); text is kept. Details: [Organizations](docs/organizations.md) (in Russian).
+
 ## Microphone recording
 
 Select **Record audio** on the new recording screen. Allow microphone access when the operating system asks, then use **Pause**, **Resume**, or **Save recording**. Cancel discards the capture after you confirm it; stopping a recording longer than five minutes also asks first, and the microphone keeps recording while the question is open. A failed archive save keeps the recording available for another attempt. Open **Share** on a saved recording to send its audio or text, transfer it to another device, save a copy, or copy the transcript. Text actions appear once a transcript is available.

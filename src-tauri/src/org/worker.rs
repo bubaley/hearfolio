@@ -653,3 +653,8 @@ fn android_service(_jobs: &[Job]) {
 #[cfg(test)]
 #[path = "worker_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn process_for_test(job: Job) {
+    process(job);
+}

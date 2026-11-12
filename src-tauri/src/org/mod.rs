@@ -10,6 +10,8 @@ pub mod api;
 mod auth;
 pub mod cache;
 pub mod commands;
+#[cfg(test)]
+mod e2e_tests;
 pub mod library;
 pub mod pkce;
 pub mod secrets;
