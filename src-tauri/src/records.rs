@@ -28,6 +28,10 @@ pub struct HistoryEntry {
     pub duration_seconds: Option<f64>,
     #[serde(default)]
     pub results: Vec<crate::postprocess::PostprocessResult>,
+    /// Passages (seconds from, to) the model could not transcribe in full.
+    /// Kept with the transcript so the hint survives a dead interface.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete_ranges: Vec<[u64; 2]>,
 }
 
 pub fn read_history_at(dir: &Path) -> Result<Vec<HistoryEntry>, String> {
@@ -52,7 +56,8 @@ pub fn read_history_at(dir: &Path) -> Result<Vec<HistoryEntry>, String> {
 pub fn write_history_at(dir: &Path, entries: &[HistoryEntry]) -> Result<(), String> {
     let path = dir.join("history.json");
     let temp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(entries).map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec_pretty(entries)
+        .map_err(|error| format!("errors.historySave|{error}"))?;
     let mut file =
         fs::File::create(&temp).map_err(|error| format!("errors.historySave|{error}"))?;
     file.write_all(&bytes)
@@ -111,7 +116,18 @@ pub fn save_transcript_at(dir: &Path, id: &str, model: String, text: &str) -> Re
         .ok_or("errors.recordMissing")?;
     entry.model = Some(model);
     entry.completed_at = Some(crate::clock());
+    // A new transcript starts without the gaps of the previous one.
+    entry.incomplete_ranges.clear();
     replace_transcript_at(dir, entry.clone(), text)
+}
+pub fn set_incomplete_ranges_at(dir: &Path, id: &str, ranges: Vec<[u64; 2]>) -> Result<(), String> {
+    let mut entries = read_history_at(dir)?;
+    let entry = entries
+        .iter_mut()
+        .find(|entry| entry.id == id)
+        .ok_or("errors.recordMissing")?;
+    entry.incomplete_ranges = ranges;
+    write_history_at(dir, &entries)
 }
 
 // Commit the text and its exact metadata together, restoring the previous text
@@ -331,6 +347,7 @@ mod tests {
             size_bytes: None,
             duration_seconds: None,
             results: vec![],
+            incomplete_ranges: vec![],
         }
     }
     #[test]

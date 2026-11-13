@@ -874,9 +874,30 @@ fn take_terminal_session(
     }
 }
 
+/// The interface draws the last eight seconds. The service keeps a minute of
+/// levels; sending all of it several times a second for hours is wasted work
+/// in the WebView, so only the newest buckets cross the bridge.
+#[cfg(any(target_os = "android", test))]
+const DISPLAYED_LEVELS: usize = 64;
+#[cfg(any(target_os = "android", test))]
+fn displayed_envelope(envelope: &serde_json::Value) -> serde_json::Value {
+    let Some(levels) = envelope.as_array() else {
+        return serde_json::json!([]);
+    };
+    levels[levels.len().saturating_sub(DISPLAYED_LEVELS)..]
+        .iter()
+        .map(|level| {
+            let level = level
+                .as_f64()
+                .filter(|level| level.is_finite())
+                .unwrap_or(0.0);
+            (level.clamp(0.0, 1.0) * 1000.0).round() / 1000.0
+        })
+        .collect()
+}
 #[cfg(any(target_os = "android", test))]
 fn native_state_payload(status: &serde_json::Value) -> serde_json::Value {
-    serde_json::json!({"state":status["state"],"stateRevision":status["stateRevision"],"path":status["path"],"elapsedSeconds":status["elapsedSeconds"],"elapsedMillis":status["elapsedMillis"].as_u64().unwrap_or_else(||status["elapsedSeconds"].as_u64().unwrap_or(0)*1000),"envelope":status["envelope"],"envelopeSequence":status["envelopeSequence"],"envelopeIntervalMs":status["envelopeIntervalMs"]})
+    serde_json::json!({"state":status["state"],"stateRevision":status["stateRevision"],"path":status["path"],"elapsedSeconds":status["elapsedSeconds"],"elapsedMillis":status["elapsedMillis"].as_u64().unwrap_or_else(||status["elapsedSeconds"].as_u64().unwrap_or(0)*1000),"envelope":displayed_envelope(&status["envelope"]),"envelopeSequence":status["envelopeSequence"],"envelopeIntervalMs":status["envelopeIntervalMs"]})
 }
 
 #[cfg(target_os = "android")]
@@ -1050,7 +1071,7 @@ pub async fn recording_activity_snapshot(
         }
         #[cfg(not(target_os="android"))]
         {let _=app; Ok(serde_json::json!({"state":"idle"}))}
-    }).await.map_err(|e|e.to_string())?
+    }).await.map_err(|_| "errors.operationFailed".to_owned())?
 }
 
 // A stable private filename makes import idempotent if the process exits after
@@ -1062,7 +1083,7 @@ fn quick_recording_id(path: &Path) -> Result<String, String> {
         .and_then(|s| s.to_str())
         != Some("hearfolio-quick-recordings")
     {
-        return Err("Invalid quick recording location".into());
+        return Err("errors.recordingUnavailable".into());
     }
     let uuid = path
         .file_name()
@@ -1089,7 +1110,7 @@ fn import_quick_recording(
     let entry = if let Some(entry) = existing {
         // Never discard the source if the archived copy is missing or damaged.
         if !crate::compact::archived_matches(source, Path::new(&entry.input_path))? {
-            return Err("Archived quick recording differs; source preserved".into());
+            return Err("errors.audioRead".into());
         }
         entry
     } else {
@@ -1138,7 +1159,7 @@ pub async fn import_quick_recordings(
             }
         })
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|_| "errors.operationFailed".to_owned())?
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -1215,7 +1236,7 @@ pub async fn recording_quick_control(
         }
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|_| "errors.operationFailed".to_owned())?
 }
 
 // Stable native recording IDs prevent duplicate history entries when a process
@@ -1368,6 +1389,28 @@ mod native_recovery_tests {
         assert_eq!(payload["stateRevision"], 7);
         assert_eq!(payload["path"], status["path"]);
         assert_eq!(payload["envelope"], status["envelope"]);
+        // A minute of service history is trimmed to what the interface draws;
+        // the sequence still numbers the newest bucket.
+        let mut long = status.clone();
+        long["envelope"] = (0..480)
+            .map(|index| f64::from(index) / 480.0 + 0.000_012_345)
+            .collect();
+        long["envelopeSequence"] = serde_json::json!(57_600);
+        let trimmed = native_state_payload(&long);
+        let levels = trimmed["envelope"].as_array().unwrap();
+        assert_eq!(levels.len(), 64);
+        assert_eq!(levels[63], 0.998);
+        assert_eq!(levels[0], 0.867);
+        assert_eq!(trimmed["envelopeSequence"], 57_600);
+        assert!(
+            trimmed.to_string().len() < 700,
+            "{}",
+            trimmed.to_string().len()
+        );
+        assert_eq!(
+            native_state_payload(&serde_json::json!({}))["envelope"],
+            serde_json::json!([])
+        );
         let mut resumed = status.clone();
         resumed["state"] = serde_json::json!("recording");
         resumed["stateRevision"] = serde_json::json!(8);

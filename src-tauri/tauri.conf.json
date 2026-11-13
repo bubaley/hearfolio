@@ -76,8 +76,23 @@
             "hearfolio-transfer"
           ],
           "appLink": false
+        },
+        {
+          "scheme": [
+            "hearfolio"
+          ],
+          "host": "oauth",
+          "pathPrefix": [
+            "/callback"
+          ],
+          "appLink": false
         }
-      ]
+      ],
+      "desktop": {
+        "schemes": [
+          "hearfolio"
+        ]
+      }
     }
   }
 }

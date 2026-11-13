@@ -16,6 +16,8 @@ export type PostprocessResult = {id:string;ruleId:string;ruleName:string;instruc
 export type Entry = {
   id: string; name: string; inputPath: string; outputPath: string | null;
   configuration?: RecognitionConfig | null; model: string | null; createdAt: number; sizeBytes?: number | null; durationSeconds?: number | null; results?:PostprocessResult[];
+  /** Passages `[fromSeconds,toSeconds]` the model could not transcribe in full. */
+  incompleteRanges?:[number,number][];
 };
 export type Progress = { kind: 'download' | 'transcribe' | 'postprocess' | 'import' | 'storage' | 'update'; stage: string; current: number; total: number; elapsed: number };
 export type Settings = {language:LanguagePreference;systemLanguage:'ru'|'en';openrouterUrl:string;hasToken:boolean;storageParent:string;storagePath:string;lastConfiguration:RecognitionConfig;chunkSeconds?:number};
@@ -36,6 +38,7 @@ const installedModels = new Set(['whisper-base']);
 let previewEntries: Entry[] = [];
 let previewRules:PostprocessRule[]=[];
 let previewPlayer:HTMLAudioElement|null=null;
+let previewFailed=false;
 function previewPlayerState():NativePlayerState{return {duration:previewPlayer&&Number.isFinite(previewPlayer.duration)?previewPlayer.duration:0,currentTime:previewPlayer?.currentTime||0,playing:Boolean(previewPlayer&&!previewPlayer.paused&&!previewPlayer.ended)};}
 if(preview){try{const rules=JSON.parse(localStorage.getItem('hearfolio-preview-rules')||'[]');if(Array.isArray(rules))previewRules=rules;}catch{/* Ignore malformed preview rules. */}}
 let previewSettings:Settings={language:'system',systemLanguage:currentLanguage(),openrouterUrl:'https://openrouter.ai/api/v1',chunkSeconds:120,hasToken:false,storageParent:'/Users/you',storagePath:'/Users/you/.hearfolio',lastConfiguration:{provider:'local',model:'whisper-base',mode:'local'}};
@@ -109,6 +112,7 @@ export async function call<T>(command: string, args: Record<string, unknown> = {
     case 'recording_activity_snapshot':case 'operation_activity_snapshot':value={state:'idle'};break;
     case 'acknowledge_operation':case 'cancel_background_operation':value=undefined;break;
     case 'cloud_resume_state':value=null;break;
+    case 'unfinished_transcriptions':value=new URLSearchParams(window.location.search).get('unfinished')==='1'&&previewEntries[0]&&!previewEntries[0].outputPath?[{id:previewEntries[0].id,done:3,total:8}]:[];break;
     case 'import_quick_recordings':value=[];break;
     case 'list_loose_recordings':value=previewLoose.map(item=>({...item}));break;
     case 'adopt_loose_recording':case 'export_loose_recording':if(!previewLoose.some(item=>item.path===args.path))throw new Error('errors.recordMissing');break;
@@ -207,6 +211,8 @@ export async function call<T>(command: string, args: Record<string, unknown> = {
         if(index===0){previewSettings.lastConfiguration=configuration;localStorage.setItem('hearfolio-preview-settings',JSON.stringify(previewSettings));}
         emit('partial-text', {text:segments.slice(0,index+1).join(''),recordId:entry.id,operationId:null} satisfies PartialTextEvent);
         emit('task-progress', {kind:'transcribe',stage:'progress.recognizedChunks',current:index+1,total:segments.length,elapsed:Math.floor((Date.now()-started)/1000)});
+        // `?fail=transcribe` ends the first attempt after two segments, to exercise the error and retry states.
+        if(index===1&&!previewFailed&&new URLSearchParams(window.location.search).get('fail')==='transcribe'){previewFailed=true;throw new Error('errors.cloudHttp|HTTP 503: preview outage');}
       }
       previewTexts.set(entry.id,result); entry.outputPath='preview.txt'; entry.model=configuration.model; value=result; break;
     }

@@ -32,6 +32,8 @@ reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], def
 base64 = "0.22"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
+rand = "0.9"
+url = "2"
 tungstenite = { version = "0.28", features = ["handshake"] }
 symphonia = { version = "0.5.5", features = ["aac", "isomp4", "mp3", "flac", "ogg", "vorbis", "wav", "pcm"] }
 hound = "3.5"
@@ -50,6 +52,10 @@ tauri-plugin-recording = { path = "tauri-plugin-recording" }
 [target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dependencies]
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# A second launch with a `hearfolio://` URL (Windows/Linux deep links) hands it to the running app.
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+# Organization tokens live in the OS credential store: Keychain, Credential Manager, Secret Service.
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "2.5.1"

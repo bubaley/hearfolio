@@ -12,7 +12,7 @@ test('native timer is smooth between measured samples, bounded on stalled captur
  let previous=late;
  for(let now=167;now<=455;now+=16){const value=clock.milliseconds(now);assert.ok(value>=previous,'monotonic');assert.ok(value-previous<16*1.6,'no jumps between frames');previous=value;}
  assert.ok(Math.abs(previous-(1030+(455-151)))<60,`converges on measured time, got ${previous}`);
- assert.equal(clock.milliseconds(10000),1380); // A hidden or stalled UI cannot invent minutes of audio.
+ assert.equal(clock.milliseconds(10000),1830); // A hidden or stalled UI cannot invent minutes of audio.
  clock.synchronize(1100,'paused',10001);
  assert.equal(clock.milliseconds(20000),1100);
  clock.synchronize(1100,'recording',20000);
@@ -24,9 +24,8 @@ test('envelope places native buckets on the recording timeline',()=>{
  const envelope=new RecorderEnvelope(4,125);
  envelope.synchronize([.1,.2,.3],24,'a.wav');
  assert.equal(envelope.newestMillis(),3000);
- assert.deepEqual(envelope.levels(),[0,.1,.2,.3]);
- envelope.sample(.5,10000,true,3200);
- assert.equal(envelope.newestMillis(),3200);
+ assert.deepEqual(envelope.levels(),[0,.1,.2,.3].map(Math.fround));
+ assert.equal(envelope.at(23),Math.fround(.3));assert.equal(envelope.at(21),Math.fround(.1));
 });
 
 test('state after a control waits for an old poll and then reads fresh without overlap',async()=>{
@@ -60,29 +59,29 @@ test('restored pending start belongs to the new recording and can advance to cap
 test('timeline advances only on measured samples and remains still during pause',()=>{
  const meter=new RecorderEnvelope(4,100);
  meter.sample(.2,100,true);meter.sample(.8,200,true);
- assert.deepEqual(meter.levels(),[0,0,.2,.8]);
+ assert.deepEqual(meter.levels(),[0,0,.2,.8].map(Math.fround));
  assert.equal(meter.sample(1,250,true),false);
  assert.equal(meter.sample(1,400,false),false);
- assert.deepEqual(meter.levels(),[0,0,.2,.8]);
- meter.sample(0,500,true);assert.deepEqual(meter.levels(),[0,.2,.8,0]);
+ assert.deepEqual(meter.levels(),[0,0,.2,.8].map(Math.fround));
+ meter.sample(0,500,true);assert.deepEqual(meter.levels(),[0,.2,.8,0].map(Math.fround));
 });
 test('unlock and long pause preserve existing history without invented background samples',()=>{
  const meter=new RecorderEnvelope(3);
  meter.sample(.4,100,true);meter.sample(.7,2000,true);
- assert.deepEqual(meter.levels(),[0,.4,.7]);
+ assert.deepEqual(meter.levels(),[0,.4,.7].map(Math.fround));
  meter.sample(NaN,2300,true);meter.sample(9,2600,true);
- assert.deepEqual(meter.levels(),[.7,0,1]);
+ assert.deepEqual(meter.levels(),[.7,0,1].map(Math.fround));
  meter.reset();assert.deepEqual(meter.levels(),[0,0,0]);
 });
 test('native measured tail restores all background samples and ignores duplicate or older delivery',()=>{
  const meter=new RecorderEnvelope(4);
  assert.equal(meter.synchronize([.1,.5,.9],3,'session-a'),true);
- assert.deepEqual(meter.levels(),[0,.1,.5,.9]);
+ assert.deepEqual(meter.levels(),[0,.1,.5,.9].map(Math.fround));
  assert.equal(meter.synchronize([1],2,'session-a'),false);
  assert.equal(meter.synchronize([1],3,'session-a'),false);
- assert.deepEqual(meter.levels(),[0,.1,.5,.9]);
+ assert.deepEqual(meter.levels(),[0,.1,.5,.9].map(Math.fround));
  meter.synchronize([.1,.5,.9,.2,.8,.3],6,'session-a');
- assert.deepEqual(meter.levels(),[.9,.2,.8,.3]);
+ assert.deepEqual(meter.levels(),[.9,.2,.8,.3].map(Math.fround));
 });
 test('only a new native session resets history; invalid native samples remain bounded',()=>{
  const meter=new RecorderEnvelope(4);
@@ -133,4 +132,41 @@ test('durable completed recording survives service acknowledgement without closi
  assert.equal(order.acceptResult({path:'a',stateRevision:3}),true);
  order.accept({state:'recording',path:'b',stateRevision:5});
  assert.equal(order.acceptResult({path:'a',stateRevision:3}),false);
+});
+test('a level stays on its bucket: late or bursty native delivery never shifts earlier bars',()=>{
+ const meter=new RecorderEnvelope(4);
+ meter.synchronize([.1,.2],2,'s');
+ assert.equal(meter.at(0),Math.fround(.1));assert.equal(meter.at(1),Math.fround(.2));assert.equal(meter.at(2),0);
+ // Five buckets later only the newest three are delivered: bucket 2 was never seen and stays silent.
+ meter.synchronize([.5,.6,.7],6,'s');
+ assert.equal(meter.count,6);assert.equal(meter.newestMillis(),750);
+ assert.deepEqual([2,3,4,5].map(bucket=>meter.at(bucket)),[0,.5,.6,.7].map(Math.fround));
+ assert.equal(meter.at(1),0,'outside the retained window');assert.equal(meter.at(6),0);assert.equal(meter.at(-1),0);
+});
+test('two hours of capture keep constant memory and exact positions',()=>{
+ const meter=new RecorderEnvelope(64),buckets=2*60*60*8;
+ for(let sequence=3;sequence<=buckets;sequence+=3)meter.synchronize(Array.from({length:64},(_,index)=>((sequence-64+index)%10)/10),sequence,'long');
+ assert.equal(meter.count,buckets);assert.equal(meter.levels().length,64);
+ for(let bucket=buckets-64;bucket<buckets;bucket++)assert.equal(meter.at(bucket),Math.fround((bucket%10)/10));
+});
+test('desktop levels are committed once per bucket as the loudest observation, whatever the timer rate',()=>{
+ const meter=new RecorderEnvelope(4,100);
+ assert.equal(meter.observe(.2,10),false);assert.equal(meter.observe(.9,60),false);assert.equal(meter.observe(.1,95),false);
+ assert.equal(meter.count,0,'the bucket is still being heard');
+ assert.equal(meter.observe(.3,104),true);
+ assert.equal(meter.at(0),Math.fround(.9));
+ // A throttled timer skips buckets 2 and 3 entirely: they stay silent, bucket 1 keeps its level.
+ assert.equal(meter.observe(.4,430),true);assert.equal(meter.observe(.6,505),true);
+ assert.deepEqual([1,2,3,4].map(bucket=>meter.at(bucket)),[.3,0,0,.4].map(Math.fround));
+ assert.equal(meter.observe(1,120),false,'time never runs backwards');
+});
+test('one slow native reply does not freeze the timer between polls',()=>{
+ const clock=new NativeRecorderClock();
+ clock.synchronize(5000,'recording',0);clock.milliseconds(0);
+ let previous=5000,stalled=0;
+ // Replies normally arrive every 250 ms; this one takes 700 ms.
+ for(let now=16;now<=700;now+=16){const value=clock.milliseconds(now);if(value-previous<4)stalled++;previous=value;}
+ assert.equal(stalled,0,'the display keeps real-time pace');
+ clock.synchronize(5690,'recording',700);
+ for(let now=716;now<=1000;now+=16){const value=clock.milliseconds(now);assert.ok(value>=previous&&value-previous<16*1.6);previous=value;}
 });
