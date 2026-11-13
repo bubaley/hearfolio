@@ -302,10 +302,10 @@ pub async fn apply_postprocess(
                 );
             })?;
             crate::background::check_current()?;
-            let result = {
+            let result = crate::background::commit(|| {
                 let _lock = crate::history_lock()?;
-                save_result_at(&dir, &id, result)?
-            };
+                save_result_at(&dir, &id, result)
+            })?;
             crate::emit(
                 &app,
                 "postprocess",

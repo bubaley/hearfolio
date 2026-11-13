@@ -683,7 +683,7 @@ impl OperationGuard {
         Ok(guard)
     }
     /// Reserves the single operation slot for the calling thread.
-    fn register(
+    pub(crate) fn register(
         app: Option<&AppHandle>,
         path: std::path::PathBuf,
         job: Option<u64>,
@@ -920,6 +920,45 @@ pub(crate) fn check_current() -> Result<(), String> {
     }
     Ok(())
 }
+fn thread_operation() -> Option<String> {
+    CURRENT_OPERATION.with(|current| current.borrow().clone())
+}
+/// The current operation's id when the calling thread works for it. Scratch
+/// files carry it, so a reaped run and its retry never share a file.
+pub(crate) fn current_operation_id() -> Option<String> {
+    let current = thread_operation()?;
+    operation_state()
+        .as_ref()
+        .filter(|active| active.snapshot.id == current)
+        .map(|_| current)
+}
+/// True on a thread whose operation was reaped (or replaced): whatever it
+/// reports belongs to nobody and must not reach the UI or the new operation.
+pub(crate) fn stale_thread() -> bool {
+    thread_operation().is_some() && current_operation_id().is_none()
+}
+/// Runs `work` (an archive write) only while the calling thread's operation
+/// is live and not stopped, holding the operation lock so the watchdog cannot
+/// reap it half-way. Work outside an operation runs as is. `work` must not
+/// report progress or check the operation itself.
+pub(crate) fn commit<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let Some(current) = thread_operation() else {
+        return work();
+    };
+    let state = operation_state();
+    match state
+        .as_ref()
+        .filter(|active| active.snapshot.id == current)
+    {
+        None => Err("errors.operationInterrupted".into()),
+        Some(active) if active.cancelled => Err(active
+            .snapshot
+            .error
+            .clone()
+            .unwrap_or_else(|| "errors.operationCancelled".into())),
+        Some(_) => work(),
+    }
+}
 // Stage and step changes are durable immediately; byte-level deltas are
 // throttled and flushed by `check_current`.
 fn progress_milestone(previous: Option<&serde_json::Value>, next: &serde_json::Value) -> bool {
@@ -932,9 +971,14 @@ fn progress_milestone(previous: Option<&serde_json::Value>, next: &serde_json::V
             && next["total"].as_u64().is_some_and(|total| total <= 1000))
 }
 pub(crate) fn operation_progress(kind: &str, progress: serde_json::Value) {
+    let Some(current) = thread_operation() else {
+        return;
+    };
     let mut state = operation_state();
     let Some(active) = state.as_mut() else { return };
-    if active.snapshot.kind != kind {
+    // Only the operation's own thread reports: a reaped job must neither show
+    // its progress as the new run's nor hide the new run's stall.
+    if active.snapshot.kind != kind || active.snapshot.id != current {
         return;
     }
     let milestone = progress_milestone(active.snapshot.progress.as_ref(), &progress);
@@ -949,9 +993,10 @@ pub(crate) fn operation_progress(kind: &str, progress: serde_json::Value) {
 }
 /// Records live text for snapshot readers and returns `(operationId, recordId)`.
 pub(crate) fn operation_partial(kind: &str, text: &str) -> Option<(String, Option<String>)> {
+    let current = thread_operation()?;
     let mut state = operation_state();
     let active = state.as_mut()?;
-    if active.snapshot.kind != kind {
+    if active.snapshot.kind != kind || active.snapshot.id != current {
         return None;
     }
     active.snapshot.partial = Some(text.to_owned());
@@ -981,7 +1026,7 @@ pub async fn operation_activity_snapshot() -> Result<serde_json::Value, String> 
 }
 /// Asks the running job to stop. A job that does not react within
 /// `STOP_GRACE` is reaped, so "Stop" always frees the app.
-fn request_stop(id: &str) -> Result<bool, String> {
+pub(crate) fn request_stop(id: &str) -> Result<bool, String> {
     let mut state = operation_state();
     let Some(active) = state.as_mut().filter(|active| active.snapshot.id == id) else {
         return Ok(false);
@@ -1233,6 +1278,95 @@ mod operation_tests {
         drop(next);
         assert!(crate::job_holder().is_none());
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn a_reaped_thread_cannot_report_into_or_commit_over_its_retry() {
+        let _serial = serial();
+        let (old_path, new_path) = (temp_state(), temp_state());
+        let (ready, registered) = std::sync::mpsc::channel();
+        let (wake, wait) = std::sync::mpsc::channel::<()>();
+        let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let late_commit = committed.clone();
+        let thread_path = old_path.clone();
+        let worker = std::thread::spawn(move || {
+            let job = crate::JobGuard::acquire("transcribe").unwrap();
+            let mut operation = OperationGuard::register(
+                None,
+                thread_path,
+                Some(job.token()),
+                "transcribe",
+                Some("record"),
+            )
+            .unwrap();
+            ready.send(operation.id.clone()).unwrap();
+            let _ = wait.recv();
+            // Woken after the reap, as a stuck request finally returns.
+            let stale = stale_thread();
+            operation_progress(
+                "transcribe",
+                serde_json::json!({"stage":"progress.recognizedChunks","current":7,"total":8}),
+            );
+            let partial = operation_partial("transcribe", "old run's text");
+            let result = commit(|| {
+                late_commit.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            });
+            operation.finish(&result);
+            (stale, partial, result)
+        });
+        let old_id = registered.recv().unwrap();
+        {
+            let mut state = operation_state();
+            let active = state.as_mut().unwrap();
+            active.stop_requested = Some(backdate(STOP_GRACE));
+        }
+        assert_eq!(reap_stale_operation().unwrap().id, old_id);
+        // The retry of the same record starts on this thread.
+        let job = crate::JobGuard::acquire("transcribe").unwrap();
+        let mut retry = OperationGuard::register(
+            None,
+            new_path.clone(),
+            Some(job.token()),
+            "transcribe",
+            Some("record"),
+        )
+        .unwrap();
+        let quiet_since = backdate(std::time::Duration::from_secs(60));
+        operation_state().as_mut().unwrap().last_activity = quiet_since;
+        assert!(!stale_thread());
+        assert_eq!(current_operation_id().as_deref(), Some(retry.id.as_str()));
+        wake.send(()).unwrap();
+        let (stale, partial, result) = worker.join().unwrap();
+        assert!(stale);
+        assert!(partial.is_none());
+        assert_eq!(result.unwrap_err(), "errors.operationInterrupted");
+        assert!(!committed.load(std::sync::atomic::Ordering::SeqCst));
+        {
+            let state = operation_state();
+            let active = state.as_ref().unwrap();
+            assert_eq!(active.snapshot.id, retry.id);
+            assert!(active.snapshot.progress.is_none());
+            assert!(active.snapshot.partial.is_none());
+            // The old thread's report did not hide the retry's own silence.
+            assert_eq!(active.last_activity, quiet_since);
+        }
+        // The retry's own reports and writes go through.
+        operation_progress(
+            "transcribe",
+            serde_json::json!({"stage":"a","current":1,"total":2}),
+        );
+        assert!(operation_partial("transcribe", "new text").is_some());
+        assert_eq!(commit(|| Ok(5)), Ok(5));
+        // A stopped run writes nothing either.
+        assert!(request_stop(&retry.id).unwrap());
+        assert_eq!(commit(|| Ok(())).unwrap_err(), "errors.operationCancelled");
+        retry.finish::<()>(&Err("errors.operationCancelled".into()));
+        drop(job);
+        // Outside any operation (archive import of a recording) work runs as is.
+        assert_eq!(commit(|| Ok("plain")), Ok("plain"));
+        assert!(!stale_thread());
+        std::fs::remove_file(old_path).unwrap();
+        std::fs::remove_file(new_path).unwrap();
     }
     #[test]
     fn unanswered_stop_and_silent_jobs_are_reaped_but_live_ones_are_not() {

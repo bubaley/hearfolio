@@ -215,7 +215,8 @@ async function explainBusy(){
     if(activity.kind==='idle'){
       // Nothing native is running; a stale interface state is re-read from the native side.
       void syncNativeRecording(true);void syncNativeOperation();
-      if(busy&&recordingPhase==='idle'&&!progress&&!nativeOperation)busy=false;
+      // A run whose answer never came (reaped natively) is let go here.
+      if(busy&&recordingPhase==='idle')abandonOperation();
       render();
     }
     const nameOf=(id:string)=>{const entry=history.find(item=>item.id===id)||(active?.id===id?active:null);return entry?displayName(entry):null;};
@@ -266,7 +267,13 @@ function updateNotice() {
   element.querySelector('[data-notice-action]')?.addEventListener('click',()=>{status='';updateNotice();action?.run();});
   element.querySelector('[data-notice-secondary]')?.addEventListener('click',()=>{status='';updateNotice();action?.secondary?.run();});
 }
+// Bumped by every start and every forced reset: a run that was given up on
+// (reaped natively, or reset because nothing native is running) and answers
+// late must not end or overwrite the run that replaced it.
+let operationGeneration=0;
+function abandonOperation(){operationGeneration++;endOperation();}
 function beginOperation(kind:Progress['kind'],stage:string) {
+  operationGeneration++;
   if(noticeTimer){clearTimeout(noticeTimer);noticeTimer=null;}
   busy=true;status='';operationStarted=Date.now();progress={kind,stage,current:0,total:0,elapsed:0};progressKey='';progressPacer.reset(0,performance.now());
   if (elapsedTimer) clearInterval(elapsedTimer);
@@ -908,6 +915,7 @@ async function cancelRecording(){
 }
 async function importSelection(selected:AudioSelection,kind:'recording'|'import'|'recovered'='import'):Promise<boolean>{
   beginOperation('import',tr('Добавляем запись'));settingsDraft=null;view='work';render();
+  const generation=operationGeneration;
   let imported=false;
   try{
     const entry=await call<Entry>('import_audio',{path:selected.path,...(selected.name?{name:selected.name}:{}),configuration:{...(configuration.model.trim()?configuration:settings.lastConfiguration)}});
@@ -921,8 +929,8 @@ async function importSelection(selected:AudioSelection,kind:'recording'|'import'
     if(refreshed[0].status==='fulfilled')settings=refreshed[0].value;
     if(refreshed[1].status==='fulfilled')history=sortHistory(refreshed[1].value);
     else notice(errorText(refreshed[1].reason),true);
-  }catch(error){notice(`${tr('Не удалось добавить запись: ')}${errorText(error)}`,true);}
-  finally{endOperation();render();}
+  }catch(error){if(generation===operationGeneration)notice(`${tr('Не удалось добавить запись: ')}${errorText(error)}`,true);}
+  finally{if(generation===operationGeneration){endOperation();render();}}
   return imported;
 }
 async function choose(path?:string) {
@@ -1012,6 +1020,7 @@ async function run() {
   if(text&&resultSaved)previousResult={text,saved:true};
   receivedPartial=false;outputTab='transcript';
   beginOperation('transcribe',tr("Подготавливаем запись"));startReveal(0);render();
+  const generation=operationGeneration;
   try {
     await settingsSaveQueue;await configurationSaveQueue;
     text=await call<string>('transcribe',{id,configuration:{...configuration}});finishReveal();
@@ -1021,11 +1030,12 @@ async function run() {
     const warning=incompleteNotice(detail.entry);if(warning){status=warning;isError=true;noticeAction=null;}
   } catch(error) {
     void refreshResume(id);
+    if(generation!==operationGeneration)return;
     if(!receivedPartial){text=beforeAttempt.text;resultSaved=beforeAttempt.saved;if(resultSaved)previousResult=null;stopReveal();}else finishReveal();
     if(String(error).includes('errors.operationCancelled')){status=errorText(error);isError=false;noticeAction=null;}
     else if(String(error).includes('errors.operationBusy')){status='';noticeAction=null;void explainBusy();}
     else{status=`${tr("Не удалось завершить распознавание: ")}${errorText(error)}`;isError=true;noticeAction={message:status,label:tr('Повторить'),run:()=>{void run();}};}
-  } finally {ensureRules();try{settings=await call<Settings>('get_settings');}catch{/* Keep known defaults when settings cannot be refreshed. */}endOperation();render();}
+  } finally {if(generation===operationGeneration){ensureRules();try{settings=await call<Settings>('get_settings');}catch{/* Keep known defaults when settings cannot be refreshed. */}if(generation===operationGeneration)endOperation();render();}}
 }
 function confirmAction(heading:string,message:string,action:string,danger=true,dismiss=tr('Отмена')):Promise<boolean> {
   if(document.querySelector('dialog[open]'))return Promise.resolve(false);
@@ -1218,6 +1228,13 @@ async function syncNativeOperation(){
   operationPolling=true;
   try{await consumeNativeOperation(await call<OperationSnapshot>('operation_activity_snapshot'));}catch{/* The persisted snapshot can be read on the next foreground tick. */}finally{operationPolling=false;}
 }
-subscribe<OperationSnapshot>('operation-native-finished',snapshot=>{if(platform.os==='android')void consumeNativeOperation(snapshot);}).catch(()=>{});
+subscribe<OperationSnapshot>('operation-native-finished',snapshot=>{
+  if(platform.os==='android'){void consumeNativeOperation(snapshot);return;}
+  // Desktop: the original invoke answers right after this event. If it does
+  // not (the job was reaped while stuck), let the interface go.
+  if(snapshot.state==='running'||!snapshot.id)return;
+  const id=snapshot.id;
+  setTimeout(()=>{if(busy&&nativeOperation?.id===id){abandonOperation();render();notice(errorText(snapshot.error||'errors.operationInterrupted'),snapshot.state!=='cancelled');}},2000);
+}).catch(()=>{});
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)void syncNativeOperation();});
 setInterval(()=>{void syncNativeOperation();},1000);
