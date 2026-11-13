@@ -53,6 +53,11 @@ let resume:(CloudResume&{id:string})|null=null;
 let unfinished=new Map<string,{done:number;total:number}>();
 // Startup recovery of an interrupted recording can take a while (the audio is compacted before archiving).
 let restoring=false;
+// Android: until startup has read the native recorder and operation state, a
+// capture must not start (it could race a session being restored). Keep the
+// controls disabled from the first frame instead of enabling them and then
+// disabling them again once the restore takes long enough to show a banner.
+let nativeRecovery=false;
 async function refreshResume(id:string){
   await refreshUnfinished();
   try{const state=await call<CloudResume|null>('cloud_resume_state',{id});if(active?.id===id)resume=state&&state.done>0&&state.done<state.total?{id,...state}:null;}
@@ -176,7 +181,7 @@ const dateLabel=(timestamp:number)=>new Date(timestamp).toLocaleDateString(local
 const audioFormats='MP3, M4A, WAV, AAC, FLAC, OGG, MP4';
 const recordCount=(count:number)=>countLabel(count,'record');
 const say=settingsLabel;
-const disabled=()=>busy||restoring||platform.os==='unknown'?'disabled':'';
+const disabled=()=>busy||restoring||nativeRecovery||platform.os==='unknown'?'disabled':'';
 const deviceSystemLanguage=()=>((navigator.languages?.[0]||navigator.language).toLowerCase().startsWith('ru')?'ru':'en') as 'ru'|'en';
 const applyLanguagePreference=()=>setLanguage(settings.language,platform.mobile?deviceSystemLanguage():settings.systemLanguage);
 const words=()=>text.trim()?text.trim().split(/\s+/).length:0;
@@ -352,7 +357,7 @@ function looseBadgeHtml():string {return loose.length?`<span class="nav-badge" a
 function archiveNavHtml():string {return `<button class="nav-item ${view==='archive'?'active':''}" data-view="archive">${icon('archive')}<span>${tr('Архив')}</span>${looseBadgeHtml()}</button>`;}
 function sidebarHtml():string {
   if(platform.mobile)return '';
-  const locked=recordingPhase!=='idle'||busy||platform.os==='unknown';
+  const locked=recordingPhase!=='idle'||busy||nativeRecovery||platform.os==='unknown';
   return `<aside class="sidebar" aria-label="${tr('Записи')}"><div class="sidebar-chrome" data-tauri-drag-region><button class="icon-button" id="collapse" title="${tr('Скрыть список')} · ⌘B" aria-label="${tr('Скрыть список')}" aria-expanded="true">${icon('panel')}</button></div><div class="sidebar-body"><button class="brand" id="new" title="${tr('Новая запись')} · ⌘N" ${locked?'disabled':''}>${brandHtml()}</button><div class="sidebar-actions">${platform.audioRecording?recordingElsewhere()?recordingReturnHtml():`<button class="record-cta" id="quick-record" ${locked?'disabled':''}><span class="record-dot" aria-hidden="true"></span>${tr('Записать')}</button>`:''}<button class="secondary import-cta" data-choose title="${tr('Открыть аудиофайл')} · ⌘O" ${locked?'disabled':''}>${icon('upload')}<span>${tr('Файл')}</span></button></div>${sourceTabsHtml()}${history.length>3||search||isCloudSource()?searchFieldHtml():''}<div class="record-list" id="history-results">${historyResults()}</div><nav class="sidebar-nav" aria-label="${tr('Приложение')}">${archiveNavHtml()}${desktopModelsNav()}<button class="nav-item ${view==='devices'?'active':''}" data-view="devices">${icon('devices')}<span>${tr('Устройства')}</span></button><button class="nav-item ${view==='settings'||view==='rules'?'active':''}" data-view="settings">${icon('settings')}<span>${tr('Настройки')}</span></button><button class="icon-button" data-theme title="${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}" aria-label="${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}">${icon(theme==='dark'?'sun':'moon')}</button></nav></div></aside>`;
 }
 // While a recording runs elsewhere in the app, the record button turns into a way back to it.
@@ -840,7 +845,7 @@ async function newRecord():Promise<boolean> {
   if(busy||!await mayLeaveSettings()||!await mayReplaceRecord())return false;
   resetPlayback();settingsDraft=null;active=null;restoreConfiguration();text='';outputTab='transcript';resultSaved=false;previousResult=null;status='';view='work';render();return true;
 }
-async function quickRecord(){if(busy||recordingPhase!=='idle')return;if(active&&!await newRecord())return;await startRecording();}
+async function quickRecord(){if(busy||nativeRecovery||recordingPhase!=='idle')return;if(active&&!await newRecord())return;await startRecording();}
 async function discardPendingRecording():Promise<boolean> {
   if(!pendingRecording)return true;
   if(!await confirmAction(tr('Удалить записанное аудио?'),tr('Эта запись ещё не добавлена в архив и будет потеряна.'),tr('Удалить запись')))return false;
@@ -854,8 +859,8 @@ function resetRecorderUi(){
   nativeRecordingSeconds=null;nativeRecordingMillis=null;nativeRecorderClock.reset();restoreNativeRecordingFlag(false);
 }
 async function startRecording(){
-  if(busy||active||!platform.audioRecording||!await mayLeaveSettings()||!await mayReplaceRecord())return;
-  if(busy||active)return;
+  if(busy||active||nativeRecovery||!platform.audioRecording||!await mayLeaveSettings()||!await mayReplaceRecord())return;
+  if(busy||active||nativeRecovery)return;
   nativeCaptureGeneration++;nativeRecordingOrder.beginStart();lastNativeRecordingResult='';nativeRecordingSeconds=null;nativeRecordingMillis=null;nativeRecordingPath='';recordingPausedAt=0;recordingPausedMillis=0;nativeRecorderClock.reset();recorderEnvelope.reset();recorderView.restart();settingsDraft=null;view='work';recordingPhase='starting';busy=true;status='';recordingStarted=0;render();
   try{await startAudioRecording();nativeRecordingOrder.confirmStart();recordingStarted=Date.now();recordingPhase='recording';await syncNativeRecording(true);render();}
   catch(error){nativeRecordingOrder.abortStart();recordingPhase='idle';busy=false;if(platform.os==='android'&&!preview)await syncNativeRecording(true);render();if(recordingPhase==='idle')notice(errorText(error),true);}
@@ -1064,7 +1069,7 @@ async function initialize() {
   if(initial[0].status==='fulfilled')platform=initial[0].value;else notice(errorText(initial[0].reason),true);
   if(initial[1].status==='fulfilled'){settings=initial[1].value;applyLanguagePreference();}else notice(`${tr('Не удалось загрузить настройки: ')}${errorText(initial[1].reason)}`,true);
   if(initial[2].status==='fulfilled')applicationVersion=initial[2].value;
-  booted=true;if(platform.mobile)view='history';
+  booted=true;if(platform.mobile)view='history';nativeRecovery=platform.os==='android';
   if(['macos','linux','windows'].includes(platform.os))subscribeAudioDrop(paths=>{if(paths.length){if(paths.length>1)notice(tr("Добавляем первый файл. Остальные можно добавить по одному."));choose(paths[0]);}}).catch(error=>notice(errorText(error),true));
   cloudModels=readAudioCatalog(localStorage,settings.openrouterUrl);
   restoreConfiguration(active);render();
@@ -1074,7 +1079,7 @@ async function initialize() {
     // Reading the recorder state also archives a capture the last session left behind.
     const slow=setTimeout(()=>{restoring=true;render();},600);
     try{await syncNativeOperation();await syncNativeRecording();await importQuickRecordings();}
-    finally{clearTimeout(slow);if(restoring){restoring=false;render();}}
+    finally{clearTimeout(slow);restoring=false;nativeRecovery=false;render();}
   }
   // A crash during a desktop recording leaves a repaired WAV in temp; archive it instead of losing it.
   if(!preview&&['macos','linux','windows'].includes(platform.os)){try{const recovered=await call<AudioSelection[]>('recover_audio_recordings');for(const selection of recovered)await importSelection(selection,'recovered');if(recovered.length)notice(`${tr('Восстановлено записей после сбоя:')} ${recovered.length}`);}catch(error){notice(errorText(error),true);}}

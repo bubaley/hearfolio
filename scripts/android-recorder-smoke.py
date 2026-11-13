@@ -31,6 +31,35 @@ socket.addEventListener('message', ({data}) => {
 });
 """
 
+# Tauri's invoke cannot be wrapped (a non-writable property), so record what
+# the page showed instead: every change of the recorder/home controls, notices
+# (they fade after a few seconds) and each click, with page timestamps. A run
+# that times out then shows whether the tap started anything at all.
+TRACE = r"""
+(() => {
+  if (!window.__TAURI_INTERNALS__) return false;
+  if (window.__smokeTrace) return true;
+  const log = window.__smokeTrace = [];
+  const push = entry => { log.push({at: Math.round(performance.now()), ...entry}); if (log.length > 600) log.shift(); };
+  const view = () => {
+    const button = id => { const element = document.querySelector(id); return element ? (element.disabled ? 'disabled' : 'enabled') : '-'; };
+    return {
+      quick: button('#quick-record'), stop: button('#stop-recording'), pause: button('#pause-recording'),
+      boot: !!document.querySelector('.boot'), dialog: !!document.querySelector('dialog[open]'),
+      notice: document.querySelector('#status')?.innerText?.trim() || '',
+    };
+  };
+  let last = '';
+  new MutationObserver(() => {
+    const state = view(), key = JSON.stringify(state);
+    if (key !== last) { last = key; push(state); }
+  }).observe(document.documentElement, {subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ['disabled']});
+  document.addEventListener('click', event => push({click: event.target?.closest?.('[id]')?.id || event.target?.tagName || '?'}), true);
+  push(view());
+  return true;
+})()
+"""
+
 class Smoke:
     def __init__(self, args):
         self.args = args
@@ -41,6 +70,7 @@ class Smoke:
         self.snapshots = []
         self.pcm_readiness = []
         self.events = []
+        self.traces = []
 
     def adb(self, *command, binary=False, check=True, timeout=30):
         serial = ['-s', self.args.serial] if self.args.serial else []
@@ -85,8 +115,10 @@ class Smoke:
         return json.loads(result.stdout)
 
     def click(self, selector):
-        self.wait(lambda: self.evaluate(f'!!document.querySelector({json.dumps(selector)}) && !document.querySelector({json.dumps(selector)}).disabled'), f'enabled button {selector}')
-        self.evaluate(f'document.querySelector({json.dumps(selector)}).click()')
+        # Check and click in one evaluation: a button can be disabled between
+        # two CDP round trips, and click() on a disabled button is a silent no-op.
+        expression = f'(() => {{ const button = document.querySelector({json.dumps(selector)}); if (!button || button.disabled) return false; button.click(); return true; }})()'
+        self.wait(lambda: self.evaluate(expression), f'enabled button {selector}')
 
     def wait(self, predicate, label, timeout=35, check_foreground=True):
         deadline = time.monotonic() + timeout
@@ -105,6 +137,13 @@ class Smoke:
                     raise
             time.sleep(0.3)
         raise RuntimeError(f'Timed out waiting for {label}: {last}')
+
+    def collect_trace(self, label):
+        try:
+            trace = self.evaluate('({now: Math.round(performance.now()), changes: window.__smokeTrace || []})')
+        except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+            trace = {'error': str(error)}
+        self.traces.append({'label': label, **trace})
 
     def invoke(self, name):
         return self.evaluate(f'window.__TAURI_INTERNALS__.invoke({json.dumps(name)})')
@@ -132,6 +171,7 @@ class Smoke:
         self.wait(self.connect, 'debug WebView after foreground return', timeout=30)
         if old_forward and old_forward != self.forward:
             self.adb('forward', '--remove', f'tcp:{old_forward}', check=False)
+        self.wait(lambda: self.evaluate(TRACE), 'Tauri bridge after foreground return')
 
     def background_capture(self, source):
         for mode in ['screen-off', 'home']:
@@ -234,7 +274,7 @@ class Smoke:
         self.adb('logcat', '-c')
         self.adb('shell', 'am', 'start', '-W', '-n', self.args.package + '/.MainActivity')
         self.wait(self.connect, 'debug WebView CDP', timeout=60)
-        self.wait(lambda: self.evaluate('!!window.__TAURI_INTERNALS__'), 'Tauri bridge')
+        self.wait(lambda: self.evaluate(TRACE), 'Tauri bridge')
         first = self.recording(pause=True)
         self.click('[data-back]')
         second = self.recording()
@@ -242,6 +282,9 @@ class Smoke:
         print('PASS: real UI start/screen-off/home/pause/resume/stop/restart; native journal, PCM WAV, foreground and crash checks')
 
     def diagnostics(self):
+        if self.socket:
+            self.collect_trace('final')
+        (self.output / 'ui-trace.json').write_text(json.dumps(self.traces, indent=2))
         for buffer in ['main', 'crash']:
             (self.output / f'logcat-{buffer}.txt').write_text(self.adb('logcat', '-d', '-b', buffer, check=False))
         (self.output / 'activity.txt').write_text(self.adb('shell', 'dumpsys', 'activity', 'activities', check=False))

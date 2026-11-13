@@ -66,6 +66,35 @@ class RecorderCaptureLoopTest {
             assertTrue(failures.isEmpty());assertFalse(loop.failed)
         } finally {file.delete()}
     }
+    // CI saw the paused clock move 8 ms after "paused" was reported: a buffer
+    // accepted just before pause() was counted only after its disk write.
+    @Test fun captureClockIsFinalOncePauseReturns() {
+        val file=File.createTempFile("hearfolio-capture-", ".wav")
+        try {
+            val reads=java.util.concurrent.atomic.AtomicLong()
+            lateinit var loop:RecorderCaptureLoop
+            val input=Input { samples -> reads.incrementAndGet();samples.fill(1000.toShort());samples.size }
+            val failures=java.util.Collections.synchronizedList(mutableListOf<Exception>())
+            loop=RecorderCaptureLoop(file,8000,input,{throw IllegalStateException("must retain input")},{failures.add(it)},sync={})
+            val worker=Thread { loop.run() }.apply { start() }
+            fun awaitReads(count:Long) { val target=reads.get()+count;val deadline=System.nanoTime()+5_000_000_000L
+                while(reads.get()<target) { check(System.nanoTime()<deadline) { "capture stalled" };Thread.yield() } }
+            try {
+                repeat(300) {
+                    val before=loop.envelope.elapsedMillis
+                    loop.pause(false)
+                    val deadline=System.nanoTime()+5_000_000_000L
+                    while(loop.envelope.elapsedMillis==before) { check(System.nanoTime()<deadline) { "no capture" };Thread.yield() }
+                    loop.pause(true)
+                    val paused=loop.envelope.snapshot()
+                    awaitReads(3)
+                    assertEquals(paused,loop.envelope.snapshot())
+                }
+            } finally { loop.stop();worker.join(5000) }
+            assertTrue(failures.isEmpty());assertFalse(loop.failed)
+            header(file,loop.envelope.elapsedMillis*8)
+        } finally {file.delete()}
+    }
     @Test fun stalledNonblockingReadRecoversWithoutWaitingForActivityOrClosingWav() {
         val file=File.createTempFile("hearfolio-capture-", ".wav")
         try {

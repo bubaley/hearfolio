@@ -130,16 +130,25 @@ internal class RecorderCaptureLoop(
                         // Accept at one short control boundary. Once accepted,
                         // this pre-pause buffer belongs to the WAV; disk/fsync
                         // latency must never prevent a stop/pause request.
-                        val accepted=synchronized(gate) {running && !paused && phaseRevision==revision}
+                        // The capture clock and levels advance inside that same
+                        // boundary (memory only): once pause() returns, the
+                        // reported duration is final instead of moving again
+                        // when a slow write of the accepted buffer completes.
+                        val accepted=synchronized(gate) {
+                            (running && !paused && phaseRevision==revision).also { accepted ->
+                                if(accepted) {
+                                    require(count + read * 2L <= 0xffffffffL - 36)
+                                    envelope.append(samples,read)
+                                }
+                            }
+                        }
                         if(accepted) {
-                            require(count + read * 2L <= 0xffffffffL - 36)
                             for(index in 0 until read) {
                                 val value=samples[index].toInt()
                                 bytes[index*2]=value.toByte();bytes[index*2+1]=(value shr 8).toByte()
                             }
                             wav.write(bytes,0,read*2)
                             count+=read*2L
-                            envelope.append(samples,read)
                             if(count-checkpoint>=rate*4L) {WavRecovery.header(wav,count,rate);sync(wav);checkpoint=count}
                         }
                     }
