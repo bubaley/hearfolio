@@ -78,6 +78,8 @@ fn org_e2e() {
     let authorized: Value = api::client()
         .post(format!("{base}/api/v1/oauth/authorize"))
         .header("Cookie", cookies.join("; "))
+        // The consent page is same-origin; the server rejects cookie POSTs without a trusted Origin (CSRF).
+        .header("Origin", base.trim_end_matches('/'))
         .json(&json!({"client_id": pkce::CLIENT_ID, "redirect_uri": redirect, "code_challenge": pkce::challenge(&verifier), "code_challenge_method": "S256", "state": state, "device_name": "Hearfolio e2e"}))
         .send()
         .unwrap()
@@ -90,11 +92,6 @@ fn org_e2e() {
     assert_eq!(authorized["state"], state.as_str());
     let token_body =
         api::exchange_code(&discovery.oauth.token_url, &code, &verifier, &redirect).unwrap();
-    assert_eq!(
-        api::exchange_code(&discovery.oauth.token_url, &code, &verifier, &redirect),
-        Err("errors.orgAuthExpired".into()),
-        "a code works once"
-    );
     let token = token_body["access_token"].as_str().unwrap().to_owned();
     let organizations = auth::organizations_from(&token_body["organizations"]);
     let organization = organizations
@@ -253,6 +250,12 @@ fn org_e2e() {
         after.err(),
         Some(api::ApiError::Status(401)),
         "revoked token is rejected"
+    );
+    // Last on purpose: replaying a used code also revokes the token issued for it (RFC 6749 §4.1.2).
+    assert_eq!(
+        api::exchange_code(&discovery.oauth.token_url, &code, &verifier, &redirect),
+        Err("errors.orgAuthExpired".into()),
+        "a code works once"
     );
     eprintln!("e2e ok");
 }
