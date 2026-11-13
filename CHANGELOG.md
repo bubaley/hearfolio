@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.2 (2026-11-13)
+
+### Fixes and performance
+
+- **org:** tell a storage refusal from a lost network ([234222b](https://github.com/bubaley/hearfolio/commit/234222b93cb8205700f78d00ea3aed560f09c142))
+
 ## 0.11.1 (2026-11-13)
 
 ### Fixes and performance
