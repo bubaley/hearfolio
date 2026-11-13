@@ -10,6 +10,7 @@ test('upload states read like the product spec',()=>{
   assert.equal(uploadStatus(upload({phase:'uploading',uploaded:90}),say).label,'Загружается 45%');
   assert.equal(uploadPercent(upload({phase:'completing',uploaded:10})),100);
   assert.equal(uploadStatus(upload({waitingNetwork:true,phase:'uploading'}),say).label,'Ждёт сети');
+  assert.deepEqual(uploadStatus(upload({phase:'uploading',uploaded:16_777_216,error:'errors.orgStorageRejected'}),say),{label:'Хранилище не принимает файл',tone:'error',percent:null,action:'retry-upload'});
   const failed=uploadStatus(upload({phase:'failed',error:'errors.orgServer'}),say);
   assert.deepEqual([failed.label,failed.tone,failed.action],['Ошибка загрузки','error','retry-upload']);
   assert.equal(uploadStatus(upload({phase:'failed',error:'errors.orgDisconnected'}),say).action,null);

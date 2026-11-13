@@ -89,6 +89,27 @@ impl ApiError {
     }
 }
 
+/// The error kind, host and causes — never the URL (presigned URLs carry signatures).
+pub fn describe(error: &reqwest::Error) -> String {
+    let mut text = format!(
+        "host={} timeout={} connect={} request={} body={} redirect={} builder={}",
+        error.url().and_then(|url| url.host_str()).unwrap_or("?"),
+        error.is_timeout(),
+        error.is_connect(),
+        error.is_request(),
+        error.is_body(),
+        error.is_redirect(),
+        error.is_builder(),
+    );
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        text.push_str(" <- ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
 pub fn from_reqwest(error: &reqwest::Error) -> ApiError {
     if let Some(status) = error.status() {
         return ApiError::Status(status.as_u16());
@@ -97,6 +118,7 @@ pub fn from_reqwest(error: &reqwest::Error) -> ApiError {
         return ApiError::Invalid;
     }
     // Connect failures, DNS, timeouts and dropped bodies: the network, not the server.
+    eprintln!("Hearfolio Cloud: network error: {}", describe(error));
     ApiError::Offline
 }
 
@@ -165,6 +187,15 @@ impl Api<'_> {
         self.send::<Value>(self.request(reqwest::Method::DELETE, path))
             .map(|_| ())
     }
+}
+
+/// Any HTTP answer from our server proves the network works.
+pub fn reachable(server: &str) -> bool {
+    client()
+        .get(format!("{server}/.well-known/hearfolio"))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .is_ok()
 }
 
 pub fn discovery(server: &str) -> Result<super::server::Discovery, String> {

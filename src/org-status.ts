@@ -22,6 +22,8 @@ export function uploadStatus(upload:UploadView,say:Say):Status {
     return {label:say('Ошибка загрузки','Upload failed'),tone:'error',percent:null,action:'retry-upload'};
   }
   if(upload.waitingNetwork)return {label:say('Ждёт сети','Waiting for network'),tone:'queued',percent:null,action:null};
+  // The server's file storage refuses the audio (usually out of space): retried automatically, or now on demand.
+  if(upload.error==='errors.orgStorageRejected')return {label:say('Хранилище не принимает файл','Storage refuses the file'),tone:'error',percent:null,action:'retry-upload'};
   if(upload.phase==='queued')return {label:say('В очереди','Queued'),tone:'queued',percent:null,action:null};
   const percent=uploadPercent(upload);
   if(upload.phase==='uploading'&&upload.uploaded===0&&upload.error)return {label:say('Повторяем загрузку','Retrying upload'),tone:'queued',percent:0,action:null};

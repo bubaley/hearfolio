@@ -245,3 +245,53 @@ fn multipart_upload_resumes_after_a_failed_part_and_lands_in_the_cache() {
         super::super::library::read_index(&super::super::library::dir("conn", "org").unwrap());
     assert_eq!(library.items["rec-1"]["status"], "queued");
 }
+
+/// S3 that refuses every PUT the way Timeweb does on `QuotaExceeded`: answers
+/// 403 after the headers and closes without reading the body.
+fn refusing_storage() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                head.push(byte[0]);
+            }
+            let request = String::from_utf8_lossy(&head);
+            let reply = if request.starts_with("GET /.well-known/hearfolio") {
+                let body = json!({"product":"hearfolio","name":"Test","server_version":"0.1.0","api_version":1,"min_app_version":"0.1.0"}).to_string();
+                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+            } else {
+                let body = "<Error><Code>QuotaExceeded</Code></Error>";
+                format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+            };
+            let _ = std::io::Write::write_all(&mut stream, reply.as_bytes());
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    base
+}
+
+#[test]
+fn a_storage_that_hangs_up_mid_body_is_not_reported_as_offline() {
+    let base = refusing_storage();
+    let mut job = upload::sample(16 * 1024 * 1024);
+    job.file = std::env::temp_dir().join(format!("hearfolio-refused-{}.m4a", uuid::Uuid::new_v4()));
+    fs::write(&job.file, vec![7u8; job.size as usize]).unwrap();
+    let result = put(&job, &format!("{base}/bucket/object"), 0, job.size, &[]);
+    let _ = fs::remove_file(&job.file);
+    let failure = match result {
+        Err(PutError::Dropped) => dropped(&base),
+        Err(PutError::Failed(failure)) => failure,
+        Err(PutError::Expired) => panic!("a 403 after the body would be Expired, not a hang-up"),
+        Ok(_) => panic!("the storage refused the upload"),
+    };
+    assert_eq!(
+        failure,
+        Failure::Transient("errors.orgStorageRejected".into())
+    );
+    // The same hang-up with our server unreachable is the network.
+    assert_eq!(dropped("http://127.0.0.1:9"), Failure::Offline);
+}

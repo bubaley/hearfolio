@@ -526,6 +526,7 @@ fn next_step(job: &Job, ctx: &Context) -> Result<Option<Step>, Failure> {
                         forget_plan(&job.client_id);
                         Ok(None)
                     }
+                    Err(PutError::Dropped) => Err(dropped(&ctx.base)),
                     Err(PutError::Failed(failure)) => Err(failure),
                 }
             } else {
@@ -536,6 +537,7 @@ fn next_step(job: &Job, ctx: &Context) -> Result<Option<Step>, Failure> {
                         forget_plan(&job.client_id);
                         Ok(None)
                     }
+                    Err(PutError::Dropped) => Err(dropped(&ctx.base)),
                     Err(PutError::Failed(failure)) => Err(failure),
                 }
             }
@@ -610,7 +612,21 @@ fn forget_plan(client_id: &str) {
 
 enum PutError {
     Expired,
+    /// The connection closed while the body was still being sent: the storage
+    /// answered early (quota, signature, size) or the network dropped.
+    Dropped,
     Failed(Failure),
+}
+
+/// Storage hangs up on a rejected PUT without reading the body, so the client
+/// only sees a dropped connection. If our server answers right now, the
+/// network is fine and the storage refused the file.
+fn dropped(base: &str) -> Failure {
+    if api::reachable(base) {
+        Failure::Transient("errors.orgStorageRejected".into())
+    } else {
+        Failure::Offline
+    }
 }
 
 /// Reads a byte range of the file, counting bytes as reqwest sends them.
@@ -753,9 +769,14 @@ fn put(
         map.remove(&job.client_id);
     }
     let response = match result {
-        Some(result) => {
-            result.map_err(|error| PutError::Failed(api::from_reqwest(&error).failure()))?
-        }
+        Some(result) => result.map_err(|error| {
+            let failure = api::from_reqwest(&error).failure();
+            if failure == Failure::Offline && error.is_body() && !error.is_timeout() {
+                PutError::Dropped
+            } else {
+                PutError::Failed(failure)
+            }
+        })?,
         None => return Err(PutError::Failed(Failure::Offline)),
     };
     match response.status().as_u16() {
