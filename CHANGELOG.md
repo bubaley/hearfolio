@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.11.0 (2026-11-13)
+
+### Features
+
+- **cloud:** connect Hearfolio Cloud organizations, upload and sync recordings ([ff557eb](https://github.com/bubaley/hearfolio/commit/ff557eb315af9ceff0dc072ef3f2950a1f3bd61d))
+
+### Fixes and performance
+
+- **cloud:** isolate accounts on re-login, keep upload progress on rejections, split the library mirror ([ce0587b](https://github.com/bubaley/hearfolio/commit/ce0587bf54f6d912d062a8dc741a3cfb1b66f308))
+- **cloud:** report unanswered segments, keep paid progress across updates, respect model output limits ([2b03881](https://github.com/bubaley/hearfolio/commit/2b03881a0418b9e2ebbc0347ff2a3adef7a7a81c))
+- smooth recorder, confirmations, resilient OpenRouter segments and crash recovery ([ddebaea](https://github.com/bubaley/hearfolio/commit/ddebaeafcdb8fcf40cd8f2ed19bc34d9471a6d32))
+
+### Maintenance
+
+- **cloud:** send Origin on consent and replay the used code last in the live e2e ([8c2978d](https://github.com/bubaley/hearfolio/commit/8c2978d9086bf204c051bf645fc87018aac635e3))
+- **cloud:** live end-to-end check and organization docs ([0255ecb](https://github.com/bubaley/hearfolio/commit/0255ecbba091ef3efbb7d8b60727290ea126608d))
+
 ## 0.10.0 (2026-10-28)
 
 ### Features
