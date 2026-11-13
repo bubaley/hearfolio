@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.11.1 (2026-11-13)
+
+### Fixes and performance
+
+- **android:** never ignore a record tap after a cold start; freeze the clock at pause ([c64609e](https://github.com/bubaley/hearfolio/commit/c64609e454a751327379bfca254489295be0a37b))
+- **org:** resume uploads after the network returns; return to a running recording ([8bb75e0](https://github.com/bubaley/hearfolio/commit/8bb75e0f07fb76d777bd22c6d6ded1db06eff905))
+- keep a reaped job from touching its retry's progress, files and archive ([c7010af](https://github.com/bubaley/hearfolio/commit/c7010af9b8e0c655d1ff682609e4904a3a275eb5))
+- never leave the app permanently busy; explain and stop running work ([57d304f](https://github.com/bubaley/hearfolio/commit/57d304fde5c362c2db1ce54747a9c75cee489d24))
+
+### Maintenance
+
+- embed the Common Controls manifest in Windows test binaries ([5d800d0](https://github.com/bubaley/hearfolio/commit/5d800d0a1f63ef08dcac1dc5c7587e2c7f192a30))
+
 ## 0.11.0 (2026-11-13)
 
 ### Features
