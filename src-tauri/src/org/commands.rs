@@ -921,7 +921,6 @@ pub async fn org_prepare_native_playback(
         #[cfg(target_os = "android")]
         {
             use tauri::Manager;
-            let _job = crate::JobGuard::acquire()?;
             return app
                 .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
                 .run("preparePlayback", json!({"path": path}));

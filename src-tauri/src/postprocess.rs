@@ -161,14 +161,14 @@ pub fn list_postprocess_rules() -> Result<Vec<PostprocessRule>, String> {
 
 #[tauri::command]
 pub fn save_postprocess_rule(rule: PostprocessRule) -> Result<PostprocessRule, String> {
-    let _job = crate::JobGuard::acquire()?;
+    let _job = crate::JobGuard::acquire("archive")?;
     let _lock = crate::history_lock()?;
     save_rule_at(&crate::base()?, rule)
 }
 
 #[tauri::command]
 pub fn delete_postprocess_rule(id: String) -> Result<(), String> {
-    let _job = crate::JobGuard::acquire()?;
+    let _job = crate::JobGuard::acquire("archive")?;
     let _lock = crate::history_lock()?;
     delete_rule_at(&crate::base()?, &id)
 }
@@ -268,11 +268,11 @@ pub async fn apply_postprocess(
     rule_id: String,
     model: String,
 ) -> Result<PostprocessResult, String> {
-    let job = crate::JobGuard::acquire()?;
+    let job = crate::JobGuard::acquire("postprocess")?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
         let mut operation =
-            crate::background::OperationGuard::start(&app, "postprocess", Some(&id), true)?;
+            crate::background::OperationGuard::start(&app, &_job, "postprocess", Some(&id), true)?;
         let result = (|| {
             let started = Instant::now();
             let run_id = unique_id("result");
@@ -302,10 +302,10 @@ pub async fn apply_postprocess(
                 );
             })?;
             crate::background::check_current()?;
-            let result = {
+            let result = crate::background::commit(|| {
                 let _lock = crate::history_lock()?;
-                save_result_at(&dir, &id, result)?
-            };
+                save_result_at(&dir, &id, result)
+            })?;
             crate::emit(
                 &app,
                 "postprocess",

@@ -35,21 +35,72 @@ use tauri::{Emitter, Manager};
 
 static HISTORY_LOCK: Mutex<()> = Mutex::new(());
 static JOB_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Serializes tests that take the process-wide job lock.
+#[cfg(test)]
+static JOB_TEST_LOCK: Mutex<()> = Mutex::new(());
 fn history_lock() -> Result<MutexGuard<'static, ()>, String> {
     HISTORY_LOCK.lock().map_err(|_| "errors.historyLock".into())
 }
-struct JobGuard;
+/// Who holds the exclusive job lock. Each guard owns a token, so a lock that
+/// was released on its behalf (a wedged job reaped by the operation watchdog)
+/// is never cleared again by that job's late drop.
+struct JobOwner {
+    token: u64,
+    kind: &'static str,
+    since: Instant,
+}
+static JOB_OWNER: Mutex<Option<JobOwner>> = Mutex::new(None);
+static NEXT_JOB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn job_owner() -> MutexGuard<'static, Option<JobOwner>> {
+    JOB_OWNER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+struct JobGuard {
+    token: u64,
+}
 impl JobGuard {
-    fn acquire() -> Result<Self, String> {
-        JOB_ACTIVE
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| "errors.operationBusy".to_owned())?;
-        Ok(Self)
+    /// `kind` names the work for the busy explanation shown to the user.
+    fn acquire(kind: &'static str) -> Result<Self, String> {
+        // A job that stopped responding must not keep everything else busy.
+        background::reap_stale_operation();
+        let mut owner = job_owner();
+        if owner.is_some() {
+            return Err("errors.operationBusy".to_owned());
+        }
+        let token = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
+        *owner = Some(JobOwner {
+            token,
+            kind,
+            since: Instant::now(),
+        });
+        JOB_ACTIVE.store(true, Ordering::Release);
+        Ok(Self { token })
     }
+    fn token(&self) -> u64 {
+        self.token
+    }
+}
+/// Releases the job lock if `token` still owns it.
+fn release_job(token: u64) -> bool {
+    let mut owner = job_owner();
+    if owner.as_ref().is_some_and(|owner| owner.token == token) {
+        *owner = None;
+        JOB_ACTIVE.store(false, Ordering::Release);
+        true
+    } else {
+        false
+    }
+}
+/// `(kind, held for)` of the current job lock.
+fn job_holder() -> Option<(&'static str, Duration)> {
+    job_owner()
+        .as_ref()
+        .map(|owner| (owner.kind, owner.since.elapsed()))
 }
 impl Drop for JobGuard {
     fn drop(&mut self) {
-        JOB_ACTIVE.store(false, Ordering::Release);
+        release_job(self.token);
     }
 }
 
@@ -184,9 +235,13 @@ fn audio_duration(path: &Path) -> Option<f64> {
         (value.is_finite() && value > 0.0).then_some(value)
     })
 }
+/// Saves only while the calling run still owns its operation (see
+/// `background::commit`), so a reaped run never overwrites its retry.
 fn save_transcript(id: &str, model: String, text: &str) -> Result<(), String> {
-    let _lock = history_lock()?;
-    save_transcript_at(&base()?, id, model, text)
+    background::commit(|| {
+        let _lock = history_lock()?;
+        save_transcript_at(&base()?, id, model, text)
+    })
 }
 fn emit(
     app: &tauri::AppHandle,
@@ -196,6 +251,9 @@ fn emit(
     total: u64,
     elapsed: u64,
 ) {
+    if background::stale_thread() {
+        return;
+    }
     background::operation_progress(
         kind,
         serde_json::json!({"kind":kind,"stage":stage,"current":current,"total":total,"elapsed":elapsed}),
@@ -273,6 +331,19 @@ fn nemo_downloaded_bytes() -> u64 {
         .max()
         .unwrap_or(0)
 }
+/// One tick of a supervised child process: `None` while it runs. A stopped
+/// or reaped operation kills and reaps the child, so a retry never races a
+/// leftover process over the same files.
+fn child_exit(child: &mut std::process::Child) -> Result<Option<std::process::ExitStatus>, String> {
+    if let Err(error) = background::check_current() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    child
+        .try_wait()
+        .map_err(|e| format!("errors.operationFailed|{e}"))
+}
 fn monitored(
     mut c: Command,
     app: &tauri::AppHandle,
@@ -288,10 +359,7 @@ fn monitored(
     let mut child = c.spawn().map_err(|e| format!("errors.processFailed|{e}"))?;
     let start = Instant::now();
     loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|e| format!("errors.operationFailed|{e}"))?
-        {
+        if let Some(status) = child_exit(&mut child)? {
             if !status.success() {
                 return Err(format!("errors.processFailed|{}", tail(log)));
             }
@@ -378,10 +446,7 @@ fn monitored_whisper(
             partial(app, &text);
             last = text;
         }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|e| format!("errors.operationFailed|{e}"))?
-        {
+        if let Some(status) = child_exit(&mut child)? {
             if !status.success() {
                 return Err(format!("errors.whisperTranscribe|{}", tail(log)));
             }
@@ -450,10 +515,10 @@ async fn import_audio(
     name: Option<String>,
     configuration: RecognitionConfig,
 ) -> Result<HistoryEntry, String> {
-    let job = JobGuard::acquire()?;
+    let job = JobGuard::acquire("import")?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
-        let mut operation = background::OperationGuard::start(&app, "import", None, false)?;
+        let mut operation = background::OperationGuard::start(&app, &_job, "import", None, false)?;
         let result = import_audio_sync(&app, path, name, configuration);
         operation.finish(&result);
         result
@@ -541,7 +606,33 @@ fn import_audio_with_id(
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        compact::compact_recording(app, source, &stem)
+        // Compaction runs beside the job so it keeps its heartbeat and can be
+        // stopped; an abandoned encoder only leaves a scratch file behind.
+        let (send, receive) = std::sync::mpsc::channel();
+        {
+            let (app, source) = (app.clone(), source.to_owned());
+            thread::spawn(move || {
+                let _ = send.send(compact::compact_recording(&app, &source, &stem));
+            });
+        }
+        let started = Instant::now();
+        loop {
+            match receive.recv_timeout(Duration::from_secs(1)) {
+                Ok(result) => break result,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    background::check_current()?;
+                    emit(
+                        app,
+                        "import",
+                        "progress.copyAudio",
+                        0,
+                        1,
+                        started.elapsed().as_secs(),
+                    );
+                }
+            }
+        }
     } else {
         None
     };
@@ -551,7 +642,10 @@ fn import_audio_with_id(
         emit(app, "import", "progress.copyAudio", 1, 1, 0);
         (staging, size, Some(compact_extension.to_owned()))
     } else {
-        let staging = base()?.join("temp").join(format!("{id}-import.audio"));
+        let staging = base()?.join("temp").join(format!(
+            "{}-import.audio",
+            scratch_stem(&id, background::current_operation_id().as_deref())
+        ));
         let mut input = platform::open_audio(app, &path)?;
         let total = input.metadata().map(|metadata| metadata.len()).unwrap_or(0);
         let mut output =
@@ -621,9 +715,14 @@ fn import_audio_with_id(
         })
         .unwrap_or_else(|| format!("Recording-{}.{extension}", clock()));
     let target = base()?.join("input").join(format!("{id}.{extension}"));
-    if let Err(error) = fs::rename(&staging, &target) {
+    // A stopped or reaped import must not touch the archive: its retry may
+    // already own this record. Both archive writes happen only while this
+    // run still owns the operation.
+    if let Err(error) = background::commit(|| {
+        fs::rename(&staging, &target).map_err(|error| format!("errors.audioRead|{error}"))
+    }) {
         let _ = fs::remove_file(&staging);
-        return Err(format!("errors.audioRead|{error}"));
+        return Err(error);
     }
     let entry = HistoryEntry {
         id,
@@ -641,22 +740,44 @@ fn import_audio_with_id(
         results: vec![],
         incomplete_ranges: vec![],
     };
-    let _lock = history_lock()?;
-    let dir = base()?;
-    let mut entries = match read_history_at(&dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            let _ = fs::remove_file(&target);
-            return Err(e);
+    let committed = background::commit(|| {
+        let _lock = history_lock()?;
+        let dir = base()?;
+        let mut entries = read_history_at(&dir)?;
+        if let Some(existing) = entries.iter().find(|existing| existing.id == entry.id) {
+            return Ok(existing.clone());
         }
-    };
-    entries.push(entry.clone());
-    if let Err(e) = write_history_at(&dir, &entries) {
-        let _ = fs::remove_file(target);
-        return Err(e);
+        entries.push(entry.clone());
+        write_history_at(&dir, &entries)?;
+        Ok(entry.clone())
+    });
+    match committed {
+        Ok(entry) => {
+            recording::imported(source);
+            Ok(entry)
+        }
+        Err(error) => {
+            remove_unreferenced_audio(&target);
+            Err(error)
+        }
     }
-    recording::imported(source);
-    Ok(entry)
+}
+/// Removes an archive file that no history entry points at (a run that did
+/// not get to commit). A file another run already committed stays.
+fn remove_unreferenced_audio(target: &Path) {
+    let Ok(_lock) = history_lock() else { return };
+    let referenced = base()
+        .and_then(|dir| read_history_at(&dir))
+        .map(|entries| {
+            entries
+                .iter()
+                .any(|entry| Path::new(&entry.input_path) == target)
+        })
+        // Unknown history: keep the file rather than risk an archived record.
+        .unwrap_or(true);
+    if !referenced {
+        let _ = fs::remove_file(target);
+    }
 }
 #[tauri::command]
 fn get_history(id: String) -> Result<HistoryDetail, String> {
@@ -686,7 +807,7 @@ fn update_record_configuration(
     id: String,
     configuration: RecognitionConfig,
 ) -> Result<HistoryEntry, String> {
-    let _job = JobGuard::acquire()?;
+    let _job = JobGuard::acquire("archive")?;
     let _lock = history_lock()?;
     update_configuration_at(&base()?, &id, configuration)
 }
@@ -698,7 +819,7 @@ async fn set_storage_parent(
     if cfg!(mobile) {
         return Err("errors.storageChangeUnavailableMobile".into());
     }
-    let job = JobGuard::acquire()?;
+    let job = JobGuard::acquire("storage")?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
         let _history = history_lock()?;
@@ -733,13 +854,13 @@ async fn set_storage_parent(
 }
 #[tauri::command]
 fn rename_history(id: String, name: String) -> Result<HistoryEntry, String> {
-    let _job = JobGuard::acquire()?;
+    let _job = JobGuard::acquire("archive")?;
     let _lock = history_lock()?;
     rename_entry_at(&base()?, &id, &name)
 }
 #[tauri::command]
 fn delete_history(id: String) -> Result<(), String> {
-    let _job = JobGuard::acquire()?;
+    let _job = JobGuard::acquire("archive")?;
     let _lock = history_lock()?;
     let root = base()?;
     delete_entries_at(&root, Some(&id))?;
@@ -748,7 +869,7 @@ fn delete_history(id: String) -> Result<(), String> {
 }
 #[tauri::command]
 fn clear_history() -> Result<(), String> {
-    let _job = JobGuard::acquire()?;
+    let _job = JobGuard::acquire("archive")?;
     let _lock = history_lock()?;
     let root = base()?;
     delete_entries_at(&root, None)?;
@@ -774,7 +895,7 @@ async fn download_model(app: tauri::AppHandle, id: String) -> Result<(), String>
     if cfg!(mobile) {
         return Err("errors.localUnavailableMobile".into());
     }
-    let job = JobGuard::acquire()?;
+    let job = JobGuard::acquire("download")?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
         let target = model_path(&id)?;
@@ -844,6 +965,9 @@ struct PartialText {
     operation_id: Option<String>,
 }
 fn partial(app: &tauri::AppHandle, text: &str) {
+    if background::stale_thread() {
+        return;
+    }
     let (operation_id, record_id) = background::operation_partial("transcribe", text)
         .map_or((None, None), |(operation, record)| {
             (Some(operation), record)
@@ -891,6 +1015,7 @@ fn stream_nemotron(
     let result = (|| {
         let start = Instant::now();
         loop {
+            background::check_current()?;
             if TcpStream::connect(("127.0.0.1", port)).is_ok() {
                 break;
             }
@@ -984,6 +1109,7 @@ fn stream_nemotron(
         let mut sent = 0u64;
         let transfer = Instant::now();
         loop {
+            background::check_current()?;
             let n = reader
                 .read(&mut chunk)
                 .map_err(|e| format!("errors.operationFailed|{e}"))?;
@@ -1022,6 +1148,7 @@ fn stream_nemotron(
             .map_err(|e| format!("errors.operationFailed|{e}"))?;
         let deadline = Instant::now();
         while !finished.get() && deadline.elapsed() < Duration::from_secs(180) {
+            background::check_current()?;
             match socket.read() {
                 Ok(message) => on_event(message)?,
                 Err(WsError::Io(e))
@@ -1064,6 +1191,13 @@ fn is_cloud_scratch(name: &str) -> bool {
 /// Recordings, their journals and committed transcription progress are never
 /// removed.
 const SCRATCH_AGE: Duration = Duration::from_secs(13 * 60 * 60);
+/// Scratch file stem of one run on a record.
+fn scratch_stem(record: &str, operation: Option<&str>) -> String {
+    match operation {
+        Some(operation) => format!("{record}-{operation}"),
+        None => record.to_owned(),
+    }
+}
 fn remove_interrupted_scratch(root: &Path, now: SystemTime) {
     for entry in fs::read_dir(root.join("temp"))
         .into_iter()
@@ -1179,10 +1313,10 @@ async fn transcribe(
     id: String,
     configuration: Option<RecognitionConfig>,
 ) -> Result<String, String> {
-    let job = JobGuard::acquire()?;
+    let job = JobGuard::acquire("transcribe")?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
-        let mut operation = background::OperationGuard::start(&app, "transcribe", Some(&id), true)?;
+        let mut operation = background::OperationGuard::start(&app, &_job, "transcribe", Some(&id), true)?;
         let result = (|| {
             let settings = cloud::load()?;
             let entries = read_history()?;
@@ -1256,15 +1390,19 @@ async fn transcribe(
                         return Err("errors.audioEmpty".into());
                     }
                     let root = base()?;
-                    let mut progress = resume::CloudProgress::begin(
-                        &root,
-                        &id,
-                        &configuration,
-                        &input,
-                        settings.chunk_seconds,
-                        chunks.len() as u64,
-                        slicing,
-                    )?;
+                    // `begin` may reset the record's resume file; a reaped run
+                    // must not reset its retry's.
+                    let mut progress = background::commit(|| {
+                        resume::CloudProgress::begin(
+                            &root,
+                            &id,
+                            &configuration,
+                            &input,
+                            settings.chunk_seconds,
+                            chunks.len() as u64,
+                            slicing,
+                        )
+                    })?;
                     let lengths: Vec<f64> = chunks
                         .iter()
                         .map(|chunk| {
@@ -1323,7 +1461,9 @@ async fn transcribe(
                             );
                         })?;
                         // Paid work is durable before the next request starts.
-                        progress.commit(&root, outcome.text.clone(), outcome.incomplete)?;
+                        background::commit(|| {
+                            progress.commit(&root, outcome.text.clone(), outcome.incomplete)
+                        })?;
                         parts.push(outcome.text);
                         cloud_job::verdict(&parts, progress.incomplete(), false)?;
                         emit(
@@ -1347,19 +1487,31 @@ async fn transcribe(
                 // instead of failing at once on the stored empty parts.
                 if matches!(&result, Err(error) if error == "errors.emptyTranscript" || error == "errors.cloudNoText")
                 {
-                    resume::remove(&base()?, &id);
+                    let _ = background::commit(|| {
+                        resume::remove(&base()?, &id);
+                        Ok(())
+                    });
                 }
                 let (text, passages) = result?;
                 cloud::mark_working(&configuration)?;
                 background::check_current()?;
-                save_transcript(&id, format!("openrouter/{}", configuration.model), &text)?;
-                resume::remove(&base()?, &id);
-                if !passages.is_empty() {
-                    // Stored with the record: the hint reaches the user even if
-                    // the interface was not alive when the run ended.
+                background::commit(|| {
                     let _lock = history_lock()?;
-                    let _ = records::set_incomplete_ranges_at(&base()?, &id, passages);
-                }
+                    let root = base()?;
+                    save_transcript_at(
+                        &root,
+                        &id,
+                        format!("openrouter/{}", configuration.model),
+                        &text,
+                    )?;
+                    resume::remove(&root, &id);
+                    if !passages.is_empty() {
+                        // Stored with the record: the hint reaches the user even
+                        // if the interface was not alive when the run ended.
+                        let _ = records::set_incomplete_ranges_at(&root, &id, passages);
+                    }
+                    Ok(())
+                })?;
                 emit(
                     &app,
                     "transcribe",
@@ -1375,16 +1527,19 @@ async fn transcribe(
             }
             let ffmpeg = bin("ffmpeg").ok_or("errors.ffmpegMissing")?;
             let temp = base()?.join("temp");
+            // Named per run: a reaped run that is still exiting and its retry
+            // never write, read or delete each other's files.
+            let stem = scratch_stem(&id, background::current_operation_id().as_deref());
             let wav = temp.join(format!(
-                "{id}.{}",
+                "{stem}.{}",
                 if model == "nemotron-3.5" {
                     "pcm"
                 } else {
                     "wav"
                 }
             ));
-            let log = temp.join(format!("{id}.log"));
-            let prefix = temp.join(format!("{id}-result"));
+            let log = temp.join(format!("{stem}.log"));
+            let prefix = temp.join(format!("{stem}-result"));
             let result = (|| {
                 emit(&app, "transcribe", "progress.prepareAudio", 0, 0, 0);
                 let mut c = Command::new(ffmpeg);
@@ -1426,7 +1581,7 @@ async fn transcribe(
                         .arg("-of")
                         .arg(&prefix)
                         .arg("-pp");
-                    let live = temp.join(format!("{id}-live.log"));
+                    let live = temp.join(format!("{stem}-live.log"));
                     let run_result = monitored_whisper(c, &app, &log, &live, &configuration);
                     let _ = fs::remove_file(live);
                     run_result?;
@@ -1553,6 +1708,7 @@ pub fn run() {
             recording::open_android_battery_settings,
             background::operation_activity_snapshot,
             background::cancel_background_operation,
+            background::busy_activity,
             background::acknowledge_operation,
             cloud_resume_state,
             unfinished_transcriptions,
@@ -1652,5 +1808,49 @@ mod tests {
             "one\ntwo"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod supervised_process_tests {
+    use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_operation_kills_its_child_process_and_runs_never_share_scratch() {
+        let _serial = JOB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = std::env::temp_dir().join(format!(
+            "hearfolio-supervised-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        // Outside an operation (a model download) the child just runs.
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        assert!(child_exit(&mut child).unwrap().is_none());
+        let job = JobGuard::acquire("transcribe").unwrap();
+        let mut operation = background::OperationGuard::register(
+            None,
+            state.clone(),
+            Some(job.token()),
+            "transcribe",
+            Some("hearing-1"),
+        )
+        .unwrap();
+        let id = background::current_operation_id().unwrap();
+        assert!(child_exit(&mut child).unwrap().is_none());
+        assert!(background::request_stop(&id).unwrap());
+        assert_eq!(
+            child_exit(&mut child).unwrap_err(),
+            "errors.operationCancelled"
+        );
+        // Killed and reaped: no whisper/ffmpeg outlives its run.
+        assert!(child.try_wait().unwrap().is_some());
+        let stem = scratch_stem("hearing-1", Some(&id));
+        assert_ne!(stem, scratch_stem("hearing-1", Some("another-run")));
+        assert!(stem.starts_with("hearing-1-"));
+        assert_eq!(scratch_stem("hearing-1", None), "hearing-1");
+        operation.finish::<()>(&Err("errors.operationCancelled".into()));
+        drop(job);
+        let _ = fs::remove_file(state);
     }
 }

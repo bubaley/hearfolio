@@ -97,8 +97,6 @@ static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 #[cfg(any(target_os = "android", test))]
 static NATIVE_LIFECYCLE: Mutex<()> = Mutex::new(());
 
-#[cfg(test)]
-static JOB_TEST_LOCK: Mutex<()> = Mutex::new(());
 static FINISHED: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 fn create_writer(path: &Path, sample_rate: u32) -> Result<Writer, String> {
@@ -166,11 +164,37 @@ fn retire_absent_session(
 ) -> Option<Session> {
     // Native idle includes the absence of pending permission/start work, not
     // merely absence of an AudioRecord instance. Never infer it from a timeout.
-    if status["state"] == "idle" {
+    // A native state that names another file (or none) is just as
+    // authoritative: the service is not recording ours, and only its own
+    // terminal journal (same file name) may finish our session. Without this a
+    // start the service never took kept the job lock until the 4 h deadline.
+    let ours = active.as_ref().is_some_and(|session| {
+        status["path"]
+            .as_str()
+            .is_some_and(|path| Path::new(path).file_name() == session.path.file_name())
+    });
+    if status["state"] == "idle" || (status["state"].is_string() && !ours) {
         active.take()
     } else {
         None
     }
+}
+/// A session the service does not own ends here; audio it may have left is
+/// kept for the archive's retry/export list instead of being deleted.
+#[cfg(target_os = "android")]
+fn release_absent_session(session: Session) -> Result<(), String> {
+    let path = session.path.clone();
+    if path.exists() {
+        FINISHED
+            .lock()
+            .map_err(|_| "errors.recordingStop")?
+            .insert(path.clone());
+        store_recording_result(
+            &serde_json::json!({"path":path,"error":"errors.recordingInterrupted","selection":{"path":path,"name":"Recording.wav"}}),
+        );
+    }
+    drop(session);
+    Ok(())
 }
 #[cfg(target_os = "android")]
 fn native(app: &tauri::AppHandle, command: &str, path: Option<&Path>) -> Result<(), String> {
@@ -199,7 +223,7 @@ fn restore_session(active: &mut Option<Session>, path: &Path) -> Result<bool, St
     *active = Some(Session {
         path: path.to_owned(),
         writer: None,
-        _job: JobGuard::acquire()?,
+        _job: JobGuard::acquire("recording")?,
     });
     Ok(true)
 }
@@ -305,7 +329,7 @@ pub async fn start_audio_recording(
         let _lifecycle = NATIVE_LIFECYCLE
             .lock()
             .map_err(|_| "errors.recordingStart")?;
-        let job = JobGuard::acquire()?;
+        let job = JobGuard::acquire("recording")?;
         let extension = "wav";
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -337,8 +361,24 @@ pub async fn start_audio_recording(
         if let Err(error) = native(&app, "start", Some(&path)) {
             // Any bridge failure can race capture already claimed by the
             // service. An error string is not evidence that native ownership
-            // ended. The monitor or authoritative idle/terminal snapshot will
-            // retire this session; never delete a possible active WAV here.
+            // ended; the service's own status is. Ask it now, so a start it
+            // never took (permission denied, a lost prompt, a refused
+            // foreground service) frees the job lock at once.
+            if let Ok(status) =
+                native_call::<serde_json::Value>(&app, "recordingStatus", serde_json::json!({}))
+            {
+                let absent = {
+                    let mut active = SESSION.lock().map_err(|_| "errors.recordingStart")?;
+                    if active.as_ref().is_some_and(|session| session.path == path) {
+                        retire_absent_session(&mut active, &status)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(session) = absent {
+                    release_absent_session(session)?;
+                }
+            }
             return Err(error);
         }
         #[cfg(target_os = "android")]
@@ -591,7 +631,7 @@ pub async fn list_loose_recordings(app: tauri::AppHandle) -> Result<Vec<LooseRec
 #[tauri::command]
 pub async fn adopt_loose_recording(app: tauri::AppHandle, path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let _job = JobGuard::acquire()?;
+        let _job = JobGuard::acquire("import")?;
         let path = loose_recording(&app, &path)?;
         FINISHED
             .lock()
@@ -723,7 +763,7 @@ fn discard(path: &Path) -> Result<(), String> {
 }
 #[tauri::command]
 pub fn discard_audio_recording(path: String) -> Result<(), String> {
-    let _job = JobGuard::acquire()?;
+    let _job = JobGuard::acquire("archive")?;
     discard(Path::new(&path))
 }
 
@@ -732,7 +772,9 @@ mod tests {
     use super::*;
     #[test]
     fn stopped_recording_survives_retry_and_cancel_releases_job_without_deleting_foreign_file() {
-        let _serial = JOB_TEST_LOCK.lock().unwrap();
+        let _serial = crate::JOB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let directory = std::env::temp_dir().join(format!(
             "hearfolio-recording-lifecycle-{}",
             SystemTime::now()
@@ -750,15 +792,15 @@ mod tests {
         let session = Session {
             path: path.clone(),
             writer: None,
-            _job: JobGuard::acquire().unwrap(),
+            _job: JobGuard::acquire("test").unwrap(),
         };
-        assert!(JobGuard::acquire().is_err());
+        assert!(JobGuard::acquire("test").is_err());
         FINISHED.lock().unwrap().insert(path.clone());
         drop(session);
         assert!(path.is_file());
         imported(&foreign);
         assert!(foreign.is_file());
-        let job = JobGuard::acquire().unwrap();
+        let job = JobGuard::acquire("test").unwrap();
         imported(&path);
         assert!(!path.exists());
         let cancelled = directory.join("cancelled.wav");
@@ -769,7 +811,7 @@ mod tests {
         };
         drop(session);
         assert!(!cancelled.exists());
-        drop(JobGuard::acquire().unwrap());
+        drop(JobGuard::acquire("test").unwrap());
         fs::remove_dir_all(directory).unwrap();
     }
     #[test]
@@ -1018,14 +1060,7 @@ pub async fn recording_activity_snapshot(
                 let mut active=SESSION.lock().map_err(|_|"errors.recordingUnavailable")?;
                 retire_absent_session(&mut active,&status)
             };
-            if let Some(session)=absent_session {
-                let path=session.path.clone();
-                if path.exists() {
-                    FINISHED.lock().map_err(|_|"errors.recordingStop")?.insert(path.clone());
-                    store_recording_result(&serde_json::json!({"path":path,"error":"errors.recordingInterrupted","selection":{"path":path,"name":"Recording.wav"}}));
-                }
-                drop(session);
-            }
+            if let Some(session)=absent_session { release_absent_session(session)?; }
             // The service survives Activity/WebView recreation. Re-register its
             // active regular recording before exposing controls to the frontend.
             adopt_native_session(&app,&status)?;
@@ -1055,7 +1090,7 @@ pub async fn recording_activity_snapshot(
                 // Recover a completed service recording after process recreation.
                 // A foreground import may already own this completed result.
                 // Keep returning the authoritative snapshot while it finishes.
-                if let (Ok(_job),Some(path))=(JobGuard::acquire(),terminal_path) {
+                if let (Ok(_job),Some(path))=(JobGuard::acquire("import"),terminal_path) {
                     if let Some(file)=validated_native_path(&path,&crate::base()?.join("temp")) {
                         FINISHED.lock().map_err(|_|"errors.recordingStop")?.insert(file.clone());
                         let payload=archive_native_recording(&app,&file,status["error"].as_str(),&status["stateRevision"]);
@@ -1132,7 +1167,7 @@ pub async fn import_quick_recordings(
 ) -> Result<Vec<crate::records::HistoryEntry>, String> {
     #[cfg(target_os = "android")]
     {
-        let job = JobGuard::acquire()?;
+        let job = JobGuard::acquire("import")?;
         tauri::async_runtime::spawn_blocking(move || {
             let _job = job;
             let pending: serde_json::Value = app
@@ -1421,32 +1456,36 @@ mod native_recovery_tests {
     }
     #[test]
     fn terminal_snapshot_releases_matching_session_after_journal_failure_and_preserves_source() {
-        let _serial = JOB_TEST_LOCK.lock().unwrap();
+        let _serial = crate::JOB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path =
             std::env::temp_dir().join(format!("hearfolio-recording-{}.wav", uuid::Uuid::new_v4()));
         fs::write(&path, "recoverable bytes").unwrap();
         let mut session = Some(Session {
             path: path.clone(),
             writer: None,
-            _job: JobGuard::acquire().unwrap(),
+            _job: JobGuard::acquire("test").unwrap(),
         });
         assert!(take_terminal_session(&mut session, "recording", &path).is_none());
         assert!(
             take_terminal_session(&mut session, "finished", Path::new("/foreign.wav")).is_none()
         );
-        assert!(JobGuard::acquire().is_err());
+        assert!(JobGuard::acquire("test").is_err());
         let terminal = take_terminal_session(&mut session, "finished", &path).unwrap();
         FINISHED.lock().unwrap().insert(path.clone());
         drop(terminal);
         assert!(session.is_none());
         assert!(path.exists());
-        drop(JobGuard::acquire().unwrap());
+        drop(JobGuard::acquire("test").unwrap());
         discard(&path).unwrap();
         assert!(!path.exists());
     }
     #[test]
     fn lost_bridge_response_releases_lifecycle_and_authoritative_idle_releases_pending_job() {
-        let _serial = JOB_TEST_LOCK.lock().unwrap();
+        let _serial = crate::JOB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path =
             std::env::temp_dir().join(format!("hearfolio-pending-{}.wav", uuid::Uuid::new_v4()));
         let mut active = None;
@@ -1465,15 +1504,57 @@ mod native_recovery_tests {
             &serde_json::json!({"state":"starting","path":path})
         )
         .is_none());
-        assert!(JobGuard::acquire().is_err());
+        assert!(JobGuard::acquire("test").is_err());
         drop(retire_absent_session(&mut active, &serde_json::json!({"state":"idle"})).unwrap());
         assert!(restore_session(&mut active, &path).unwrap());
         drop(active);
-        drop(JobGuard::acquire().unwrap());
+        drop(JobGuard::acquire("test").unwrap());
+    }
+    #[test]
+    fn start_the_service_never_took_releases_the_job_lock() {
+        let _serial = crate::JOB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = std::env::temp_dir().join(format!(
+            "hearfolio-recording-{}.wav",
+            uuid::Uuid::new_v4().as_u128()
+        ));
+        // Reported by 0.10.0 users: the permission prompt was lost or the
+        // service refused to start, the native state still described the
+        // previous recording, and the session kept the job lock for 4 h.
+        for status in [
+            serde_json::json!({"state":"error","path":null,"error":"errors.recordingStart"}),
+            serde_json::json!({"state":"cancelled","path":"/data/temp/hearfolio-recording-1.wav"}),
+            serde_json::json!({"state":"finished","path":"/data/temp/hearfolio-recording-2.wav"}),
+            serde_json::json!({"state":"recording","path":"/q/hearfolio-recording-3.wav","quick":true}),
+        ] {
+            let mut active = None;
+            restore_session(&mut active, &path).unwrap();
+            assert!(JobGuard::acquire("test").is_err());
+            drop(retire_absent_session(&mut active, &status).expect("absent session"));
+            drop(JobGuard::acquire("test").expect("job lock released"));
+        }
+        // The service's own file keeps the session, whatever its state.
+        for state in ["starting", "recording", "paused", "stopping", "finished"] {
+            let mut active = None;
+            restore_session(&mut active, &path).unwrap();
+            let status = serde_json::json!({"state":state,"path":path});
+            assert!(retire_absent_session(&mut active, &status).is_none());
+            assert!(active.is_some());
+            drop(active);
+        }
+        // A status that could not be read never retires anything.
+        let mut active = None;
+        restore_session(&mut active, &path).unwrap();
+        assert!(retire_absent_session(&mut active, &serde_json::json!({})).is_none());
+        drop(active);
+        drop(JobGuard::acquire("test").unwrap());
     }
     #[test]
     fn timed_out_old_response_and_terminal_journal_cannot_claim_a_new_recording() {
-        let _serial = JOB_TEST_LOCK.lock().unwrap();
+        let _serial = crate::JOB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let old_path =
             std::env::temp_dir().join(format!("hearfolio-old-{}.wav", uuid::Uuid::new_v4()));
         let new_path =
@@ -1488,28 +1569,32 @@ mod native_recovery_tests {
         assert!(take_terminal_session(&mut active, "finished", &old_path).is_none());
         assert!(take_terminal_session(&mut active, "cancelled", &old_path).is_none());
         assert_eq!(active.as_ref().unwrap().path, new_path);
-        assert!(JobGuard::acquire().is_err());
+        assert!(JobGuard::acquire("test").is_err());
         drop(active);
-        drop(JobGuard::acquire().unwrap());
+        drop(JobGuard::acquire("test").unwrap());
     }
     #[test]
     fn recreated_session_reacquires_job_and_preserves_an_existing_owner() {
-        let _serial = JOB_TEST_LOCK.lock().unwrap();
+        let _serial = crate::JOB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path =
             std::env::temp_dir().join(format!("hearfolio-restored-{}.wav", uuid::Uuid::new_v4()));
         let mut active = None;
         assert!(restore_session(&mut active, &path).unwrap());
-        assert!(JobGuard::acquire().is_err());
+        assert!(JobGuard::acquire("test").is_err());
         assert!(!restore_session(&mut active, Path::new("/foreign.wav")).unwrap());
         assert_eq!(active.as_ref().unwrap().path, path);
         let terminal = take_terminal_session(&mut active, "finished", &path).unwrap();
         drop(terminal);
-        drop(JobGuard::acquire().unwrap());
+        drop(JobGuard::acquire("test").unwrap());
     }
     #[cfg(unix)]
     #[test]
     fn android_data_directory_alias_uses_one_identity_for_session_and_terminal_journal() {
-        let _serial = JOB_TEST_LOCK.lock().unwrap();
+        let _serial = crate::JOB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root =
             std::env::temp_dir().join(format!("hearfolio-path-alias-{}", uuid::Uuid::new_v4()));
         let actual = root.join("user-0");
@@ -1530,7 +1615,7 @@ mod native_recovery_tests {
         assert_eq!(active.as_ref().unwrap().path, native);
         let stopped = take_terminal_session(&mut active, "finished", &native).unwrap();
         drop(stopped);
-        drop(JobGuard::acquire().unwrap());
+        drop(JobGuard::acquire("test").unwrap());
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -1562,7 +1647,9 @@ mod native_recovery_tests {
     }
     #[test]
     fn explicit_stop_claim_is_serialized_against_journal_monitor() {
-        let _serial = JOB_TEST_LOCK.lock().unwrap();
+        let _serial = crate::JOB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path =
             std::env::temp_dir().join(format!("hearfolio-race-{}.wav", uuid::Uuid::new_v4()));
         let mut active = None;
@@ -1576,7 +1663,7 @@ mod native_recovery_tests {
         let _monitor = NATIVE_LIFECYCLE.lock().unwrap();
         assert!(take_terminal_session(&mut active, "finished", &path).is_none());
         drop(stopped);
-        drop(JobGuard::acquire().unwrap());
+        drop(JobGuard::acquire("test").unwrap());
     }
     #[test]
     fn only_allocated_native_wav_names_get_a_stable_archive_id() {
