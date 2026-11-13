@@ -6,6 +6,7 @@ import {FrameLoop} from './frame-loop';
 import {Pacer} from './pacer';
 import {pauseAudioRecording, resumeAudioRecording, restoreNativeRecordingFlag, observePendingOperation, operationHandled, markOperationHandled} from './api';
 import type {OperationSnapshot} from './operation-recovery';
+import {describeBusy, type BusyActivity, type BusyNotice} from './busy-activity';
 import {transferSettingsHtml, devicesHtml, transferBarHtml, shareRecordingToDevice, bindTransfers, initializeTransfers, hasTransferDraft, discardTransferDraft, transferActivityLabel} from './transfers';
 import './styles.css';
 import './transfers.css';
@@ -195,22 +196,75 @@ function readiness():string {
   return '';
 }
 // An action offered next to a notice, e.g. "Retry" after a failed transcription. It belongs to one message.
-type NoticeAction={label:string;run:()=>void};
+type NoticeAction={label:string;run:()=>void;secondary?:{label:string;run:()=>void}};
 let noticeAction:(NoticeAction&{message:string})|null=null;
 function notice(message:string,error=false,action?:NoticeAction) {
+  // "Busy" alone is a dead end: replace it with what is running and how to open or stop it.
+  if(error&&!action&&message.includes(errorText('errors.operationBusy')))void explainBusy();
   status=message; isError=error; noticeAction=action&&message?{...action,message}:null;
   if (noticeTimer) clearTimeout(noticeTimer);
   updateNotice();
   if (message&&!error) noticeTimer=setTimeout(()=>{if(status===message&&!isError){status='';updateNotice();}noticeTimer=null;},3500);
+}
+let explainingBusy=false;
+async function explainBusy(){
+  if(explainingBusy)return;explainingBusy=true;
+  try{
+    let activity:BusyActivity={kind:'idle'};
+    try{activity=await call<BusyActivity>('busy_activity');}catch{/* Older native side: keep the generic message. */return;}
+    if(activity.kind==='idle'){
+      // Nothing native is running; a stale interface state is re-read from the native side.
+      void syncNativeRecording(true);void syncNativeOperation();
+      if(busy&&recordingPhase==='idle'&&!progress&&!nativeOperation)busy=false;
+      render();
+    }
+    const nameOf=(id:string)=>{const entry=history.find(item=>item.id===id)||(active?.id===id?active:null);return entry?displayName(entry):null;};
+    const described=describeBusy(activity,nameOf,currentLanguage());
+    const open=busyOpen(described),stop=busyStop(described);
+    const first=open||stop,second=open&&stop?stop:undefined;
+    notice(described.message,activity.kind!=='idle',first?{...first,...(second?{secondary:second}:{})}:undefined);
+  }finally{explainingBusy=false;}
+}
+function busyOpen(described:BusyNotice):NoticeAction|undefined{
+  const target=described.open;if(!target)return undefined;
+  return {label:tr('Открыть'),run:()=>{void (async()=>{
+    if(target.target==='record'){
+      if(platform.os==='android')await syncNativeOperation();
+      if(active?.id!==target.recordId&&!busy)await loadHistory(target.recordId);
+      if(active?.id===target.recordId){settingsDraft=null;view='work';}
+    }else if(target.target==='recorder'){settingsDraft=null;view='work';await syncNativeRecording(true);}
+    else if(target.target==='settings'){view='settings';}
+    else view=target.target;
+    render();
+  })();}};
+}
+function busyStop(described:BusyNotice):NoticeAction|undefined{
+  const target=described.stop;if(!target)return undefined;
+  return {label:tr('Остановить'),run:()=>{void (async()=>{
+    try{
+      if(target.target==='operation'){
+        if(nativeOperation?.id===target.id){await cancelNativeOperation();return;}
+        await call('cancel_background_operation',{id:target.id});
+        notice(say('Останавливаем. Через несколько секунд можно будет продолжить.','Stopping. You can continue in a few seconds.'));
+      }else if(target.target==='transfer'){
+        await call('cancel_transfer_activity',{id:target.id});
+        notice(say('Передача останавливается.','The transfer is stopping.'));
+      }else{
+        settingsDraft=null;view='work';await syncNativeRecording(true);render();
+        if(recorderLive())await stopRecording();
+      }
+    }catch(error){notice(errorText(error),true);}
+  })();}};
 }
 function updateNotice() {
   const element=document.querySelector<HTMLElement>('#status');
   if(!element)return;
   const action=noticeAction&&noticeAction.message===status?noticeAction:null;
   element.className=`notice ${isError?'error':''} ${action?'has-action':''}`;
-  element.innerHTML=status?`<span>${isError?icon('alert'):icon('check')}${esc(status)}</span>${action?`<button type="button" class="notice-action" data-notice-action>${esc(action.label)}</button>`:''}<button class="icon-button" data-dismiss aria-label="${tr('Закрыть сообщение')}">${icon('close')}</button>`:'';
+  element.innerHTML=status?`<span>${isError?icon('alert'):icon('check')}${esc(status)}</span>${action?`<span class="notice-actions"><button type="button" class="notice-action" data-notice-action>${esc(action.label)}</button>${action.secondary?`<button type="button" class="notice-action" data-notice-secondary>${esc(action.secondary.label)}</button>`:''}</span>`:''}<button class="icon-button" data-dismiss aria-label="${tr('Закрыть сообщение')}">${icon('close')}</button>`:'';
   element.querySelector('[data-dismiss]')?.addEventListener('click',()=>{status='';updateNotice();});
   element.querySelector('[data-notice-action]')?.addEventListener('click',()=>{status='';updateNotice();action?.run();});
+  element.querySelector('[data-notice-secondary]')?.addEventListener('click',()=>{status='';updateNotice();action?.secondary?.run();});
 }
 function beginOperation(kind:Progress['kind'],stage:string) {
   if(noticeTimer){clearTimeout(noticeTimer);noticeTimer=null;}
@@ -882,7 +936,7 @@ async function choose(path?:string) {
 }
 async function loadHistory(id:string) {
   if(active?.id===id){if(!await mayLeaveSettings())return;settingsDraft=null;view='work';render();return;}
-  if(busy){notice(tr('Дождитесь окончания текущей задачи.'));return;}
+  if(busy){void explainBusy();return;}
   if(!await mayLeaveSettings())return;
   if(!await mayReplaceRecord())return;
   try {const detail=await call<{entry:Entry;text:string;warning?:string|null}>('get_history',{id});resetPlayback();active=detail.entry;restoreConfiguration(detail.entry);text=detail.text;outputTab='transcript';ensureRules();resultSaved=Boolean(detail.entry.outputPath&&detail.text);previousResult=null;settingsDraft=null;view='work';resume=null;void refreshResume(id);status=detail.warning?errorText(detail.warning):'';isError=Boolean(detail.warning);render();}
@@ -969,6 +1023,7 @@ async function run() {
     void refreshResume(id);
     if(!receivedPartial){text=beforeAttempt.text;resultSaved=beforeAttempt.saved;if(resultSaved)previousResult=null;stopReveal();}else finishReveal();
     if(String(error).includes('errors.operationCancelled')){status=errorText(error);isError=false;noticeAction=null;}
+    else if(String(error).includes('errors.operationBusy')){status='';noticeAction=null;void explainBusy();}
     else{status=`${tr("Не удалось завершить распознавание: ")}${errorText(error)}`;isError=true;noticeAction={message:status,label:tr('Повторить'),run:()=>{void run();}};}
   } finally {ensureRules();try{settings=await call<Settings>('get_settings');}catch{/* Keep known defaults when settings cannot be refreshed. */}endOperation();render();}
 }

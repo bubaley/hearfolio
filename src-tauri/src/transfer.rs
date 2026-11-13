@@ -392,7 +392,7 @@ fn emit(app: &tauri::AppHandle, id: &str, status: &str, current: u64, total: u64
 }
 #[tauri::command]
 pub async fn transfer_send(app: tauri::AppHandle, id: String, to: String) -> Result<(), String> {
-    let job = crate::JobGuard::acquire()?;
+    let job = crate::JobGuard::acquire("transfer")?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
         let mut background = crate::background::TransferGuard::start(&app, "send")?;
@@ -755,7 +755,7 @@ fn commit_received(
 
 #[tauri::command]
 pub async fn transfer_receive(app: tauri::AppHandle, id: String) -> Result<HistoryEntry, String> {
-    let job = crate::JobGuard::acquire()?;
+    let job = crate::JobGuard::acquire("transfer")?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
         let mut background=crate::background::TransferGuard::start(&app, "receive")?;

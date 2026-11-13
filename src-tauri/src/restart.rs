@@ -57,7 +57,7 @@ static PENDING_RELAUNCH: std::sync::Mutex<Option<RelaunchTicket>> = std::sync::M
 pub fn restart_application(app: tauri::AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let job = crate::JobGuard::acquire()?;
+        let job = crate::JobGuard::acquire("restart")?;
         let binary = tauri::process::current_binary(&app.env())
             .map_err(|_| "errors.restartUnavailable".to_owned())?;
         let bundle =

@@ -403,6 +403,7 @@ button.brand:disabled { opacity: 1; }
 .notice .icon-button { width: 26px; height: 26px; color: inherit; opacity: .7; flex: none; }
 .notice-action { flex: none; padding: 6px 12px; border-radius: 999px; background: #ffffff2e; color: inherit; font-size: 13px; font-weight: 600; white-space: nowrap; }
 .notice-action:hover { background: #ffffff47; }
+.notice-actions { display: flex; flex: none; gap: 6px; }
 .notice.has-action { border-radius: var(--radius-m); }
 .notice .icon-button:hover:not(:disabled) { background: #ffffff26; color: inherit; opacity: 1; }
 .work-surface:has(.dock) .notice { bottom: 100px; }
@@ -502,7 +503,8 @@ html.qr-scanning #app { visibility: hidden; }
 .mobile-platform .notice.has-action>span { align-items: flex-start; font-size: 14px; line-height: 1.45; }
 .mobile-platform .notice.has-action>span svg { flex: none; margin-top: 3px; }
 .mobile-platform .notice.has-action .icon-button { grid-column: 2; grid-row: 1; margin: -6px -4px 0 0; }
-.mobile-platform .notice-action { grid-column: 1 / -1; grid-row: 2; min-height: 42px; font-size: 15px; }
+.mobile-platform .notice-actions { grid-column: 1 / -1; grid-row: 2; gap: 8px; }
+.mobile-platform .notice-action { flex: 1; min-height: 42px; font-size: 15px; }
 .mobile-platform .work-surface:has(.dock) .notice { bottom: calc(150px + env(safe-area-inset-bottom)); }
 .mobile-platform .field input, .mobile-platform .field select, .mobile-platform .field textarea, .mobile-platform .search-field input { font-size: 16px; }
 .mobile-platform .search-field { height: 48px; min-height: 48px; padding: 0 14px; gap: 10px; border-radius: var(--radius-m); }

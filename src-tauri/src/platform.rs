@@ -247,9 +247,9 @@ pub fn native_audio_duration(app: &AppHandle, path: &Path) -> Option<f64> {
 
 #[tauri::command]
 pub async fn save_audio(app: AppHandle, id: String) -> Result<(), String> {
-    let job = crate::JobGuard::acquire()?;
+    // Read-only: never takes the job lock. A save dialog can stay open for
+    // minutes, and Android may lose its result with the Activity.
     tauri::async_runtime::spawn_blocking(move || {
-        let _job = job;
         let (source, name) = tracked_audio(&id)?;
         save_copy(&app, &source, &name)
     })
@@ -298,7 +298,6 @@ fn save_copy(app: &AppHandle, source: &Path, name: &str) -> Result<(), String> {
 pub async fn share_audio(app: AppHandle, id: String) -> Result<(), String> {
     #[cfg(target_os = "android")]
     return tauri::async_runtime::spawn_blocking(move || {
-        let _job = crate::JobGuard::acquire()?;
         let (path, name) = tracked_audio(&id)?;
         android(
             &app,
@@ -320,7 +319,6 @@ pub async fn export_loose_recording(
     share: bool,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let _job = crate::JobGuard::acquire()?;
         let source = crate::recording::loose_recording(&app, &path)?;
         #[cfg(target_os = "android")]
         if share {
@@ -365,8 +363,9 @@ pub async fn prepare_native_playback(
     app: AppHandle,
     id: String,
 ) -> Result<NativePlayerState, String> {
+    // Playback only reads the archived file; the native player itself refuses
+    // while the microphone is in use.
     tauri::async_runtime::spawn_blocking(move || {
-        let _job = crate::JobGuard::acquire()?;
         let (path, _) = tracked_audio(&id)?;
         #[cfg(target_os = "android")]
         return android(&app, "preparePlayback", serde_json::json!({"path":path}));

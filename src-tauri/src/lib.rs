@@ -35,21 +35,72 @@ use tauri::{Emitter, Manager};
 
 static HISTORY_LOCK: Mutex<()> = Mutex::new(());
 static JOB_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Serializes tests that take the process-wide job lock.
+#[cfg(test)]
+static JOB_TEST_LOCK: Mutex<()> = Mutex::new(());
 fn history_lock() -> Result<MutexGuard<'static, ()>, String> {
     HISTORY_LOCK.lock().map_err(|_| "errors.historyLock".into())
 }
-struct JobGuard;
+/// Who holds the exclusive job lock. Each guard owns a token, so a lock that
+/// was released on its behalf (a wedged job reaped by the operation watchdog)
+/// is never cleared again by that job's late drop.
+struct JobOwner {
+    token: u64,
+    kind: &'static str,
+    since: Instant,
+}
+static JOB_OWNER: Mutex<Option<JobOwner>> = Mutex::new(None);
+static NEXT_JOB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn job_owner() -> MutexGuard<'static, Option<JobOwner>> {
+    JOB_OWNER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+struct JobGuard {
+    token: u64,
+}
 impl JobGuard {
-    fn acquire() -> Result<Self, String> {
-        JOB_ACTIVE
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| "errors.operationBusy".to_owned())?;
-        Ok(Self)
+    /// `kind` names the work for the busy explanation shown to the user.
+    fn acquire(kind: &'static str) -> Result<Self, String> {
+        // A job that stopped responding must not keep everything else busy.
+        background::reap_stale_operation();
+        let mut owner = job_owner();
+        if owner.is_some() {
+            return Err("errors.operationBusy".to_owned());
+        }
+        let token = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
+        *owner = Some(JobOwner {
+            token,
+            kind,
+            since: Instant::now(),
+        });
+        JOB_ACTIVE.store(true, Ordering::Release);
+        Ok(Self { token })
     }
+    fn token(&self) -> u64 {
+        self.token
+    }
+}
+/// Releases the job lock if `token` still owns it.
+fn release_job(token: u64) -> bool {
+    let mut owner = job_owner();
+    if owner.as_ref().is_some_and(|owner| owner.token == token) {
+        *owner = None;
+        JOB_ACTIVE.store(false, Ordering::Release);
+        true
+    } else {
+        false
+    }
+}
+/// `(kind, held for)` of the current job lock.
+fn job_holder() -> Option<(&'static str, Duration)> {
+    job_owner()
+        .as_ref()
+        .map(|owner| (owner.kind, owner.since.elapsed()))
 }
 impl Drop for JobGuard {
     fn drop(&mut self) {
-        JOB_ACTIVE.store(false, Ordering::Release);
+        release_job(self.token);
     }
 }
 
@@ -450,10 +501,10 @@ async fn import_audio(
     name: Option<String>,
     configuration: RecognitionConfig,
 ) -> Result<HistoryEntry, String> {
-    let job = JobGuard::acquire()?;
+    let job = JobGuard::acquire("import")?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
-        let mut operation = background::OperationGuard::start(&app, "import", None, false)?;
+        let mut operation = background::OperationGuard::start(&app, &_job, "import", None, false)?;
         let result = import_audio_sync(&app, path, name, configuration);
         operation.finish(&result);
         result
@@ -686,7 +737,7 @@ fn update_record_configuration(
     id: String,
     configuration: RecognitionConfig,
 ) -> Result<HistoryEntry, String> {
-    let _job = JobGuard::acquire()?;
+    let _job = JobGuard::acquire("archive")?;
     let _lock = history_lock()?;
     update_configuration_at(&base()?, &id, configuration)
 }
@@ -698,7 +749,7 @@ async fn set_storage_parent(
     if cfg!(mobile) {
         return Err("errors.storageChangeUnavailableMobile".into());
     }
-    let job = JobGuard::acquire()?;
+    let job = JobGuard::acquire("storage")?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
         let _history = history_lock()?;
@@ -733,13 +784,13 @@ async fn set_storage_parent(
 }
 #[tauri::command]
 fn rename_history(id: String, name: String) -> Result<HistoryEntry, String> {
-    let _job = JobGuard::acquire()?;
+    let _job = JobGuard::acquire("archive")?;
     let _lock = history_lock()?;
     rename_entry_at(&base()?, &id, &name)
 }
 #[tauri::command]
 fn delete_history(id: String) -> Result<(), String> {
-    let _job = JobGuard::acquire()?;
+    let _job = JobGuard::acquire("archive")?;
     let _lock = history_lock()?;
     let root = base()?;
     delete_entries_at(&root, Some(&id))?;
@@ -748,7 +799,7 @@ fn delete_history(id: String) -> Result<(), String> {
 }
 #[tauri::command]
 fn clear_history() -> Result<(), String> {
-    let _job = JobGuard::acquire()?;
+    let _job = JobGuard::acquire("archive")?;
     let _lock = history_lock()?;
     let root = base()?;
     delete_entries_at(&root, None)?;
@@ -774,7 +825,7 @@ async fn download_model(app: tauri::AppHandle, id: String) -> Result<(), String>
     if cfg!(mobile) {
         return Err("errors.localUnavailableMobile".into());
     }
-    let job = JobGuard::acquire()?;
+    let job = JobGuard::acquire("download")?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
         let target = model_path(&id)?;
@@ -1179,10 +1230,10 @@ async fn transcribe(
     id: String,
     configuration: Option<RecognitionConfig>,
 ) -> Result<String, String> {
-    let job = JobGuard::acquire()?;
+    let job = JobGuard::acquire("transcribe")?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
-        let mut operation = background::OperationGuard::start(&app, "transcribe", Some(&id), true)?;
+        let mut operation = background::OperationGuard::start(&app, &_job, "transcribe", Some(&id), true)?;
         let result = (|| {
             let settings = cloud::load()?;
             let entries = read_history()?;
@@ -1553,6 +1604,7 @@ pub fn run() {
             recording::open_android_battery_settings,
             background::operation_activity_snapshot,
             background::cancel_background_operation,
+            background::busy_activity,
             background::acknowledge_operation,
             cloud_resume_state,
             unfinished_transcriptions,
