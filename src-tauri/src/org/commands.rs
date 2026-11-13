@@ -643,6 +643,8 @@ pub async fn org_retry_upload(client_id: String) -> Result<Option<worker::JobVie
 /// Wake the queue now (app focus, network back): waiting jobs try immediately.
 #[tauri::command]
 pub fn org_wake() {
+    // Network back or app focused: connections pooled before are likely dead.
+    super::api::reset_client();
     {
         let _lock = super::lock();
         if let Ok(mut jobs) = super::read_queue() {

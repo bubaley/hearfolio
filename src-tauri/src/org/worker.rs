@@ -261,6 +261,10 @@ fn process(job: Job) {
                 if failure == Failure::Permanent("errors.orgUnauthorized".into()) {
                     mark_reauth(&job.connection_id);
                 }
+                if failure == Failure::Offline {
+                    // Pooled connections may be dead after a network change.
+                    api::reset_client();
+                }
                 Step::Failed(failure)
             }
         };
@@ -617,6 +621,8 @@ struct Progress {
     client_id: String,
     last_emit: Instant,
     abort: Arc<AtomicBool>,
+    /// Shared with the watchdog: when the body last moved, and whether it is all sent.
+    moved: Arc<Mutex<(Instant, bool)>>,
 }
 impl Read for Progress {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
@@ -630,6 +636,9 @@ impl Read for Progress {
         let read = self.file.read(&mut buffer[..limit])?;
         self.left -= read as u64;
         self.sent += read as u64;
+        if let Ok(mut moved) = self.moved.lock() {
+            *moved = (Instant::now(), self.left == 0);
+        }
         if let Ok(mut map) = INFLIGHT.lock() {
             map.insert(self.client_id.clone(), self.sent);
         }
@@ -653,6 +662,47 @@ fn announce(client_id: &str) {
     }
 }
 
+/// A part upload stalled this long without the body moving is on a dead
+/// connection: the OS would keep retransmitting for many minutes.
+const STALL_SENDING: Duration = Duration::from_secs(45);
+/// Once the whole body is handed to the socket, the kernel buffer still has to
+/// drain over a slow uplink before the server answers.
+const STALL_ANSWER: Duration = Duration::from_secs(120);
+
+/// Runs a blocking request on its own thread and gives up (`None`) when the
+/// body stops moving. Blocking reqwest cannot be cancelled, so a stalled
+/// request is left to end on its own timeout.
+fn send_watched(
+    request: reqwest::blocking::RequestBuilder,
+    moved: &Arc<Mutex<(Instant, bool)>>,
+) -> Option<reqwest::Result<reqwest::blocking::Response>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("org-upload-put".into())
+        .spawn(move || {
+            let _ = sender.send(request.send());
+        });
+    if spawned.is_err() {
+        return None;
+    }
+    loop {
+        match receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => return Some(result),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let (at, done) = moved
+                    .lock()
+                    .map(|moved| *moved)
+                    .unwrap_or((Instant::now(), false));
+                let limit = if done { STALL_ANSWER } else { STALL_SENDING };
+                if at.elapsed() > limit {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 fn put(
     job: &Job,
     url: &str,
@@ -673,13 +723,16 @@ fn put(
     file.seek(SeekFrom::Start(start))
         .map_err(|_| PutError::Failed(Failure::Permanent("errors.orgAudioMissing".into())))?;
     let length = end - start;
+    let abort = Arc::new(AtomicBool::new(false));
+    let moved = Arc::new(Mutex::new((Instant::now(), length == 0)));
     let reader = Progress {
         file,
         left: length,
         sent: 0,
         client_id: job.client_id.clone(),
         last_emit: Instant::now(),
-        abort: Arc::new(AtomicBool::new(false)),
+        abort: abort.clone(),
+        moved: moved.clone(),
     };
     let mut request = api::client()
         .put(url)
@@ -689,12 +742,22 @@ fn put(
     for (name, value) in headers {
         request = request.header(name.as_str(), value.as_str());
     }
-    let response = request
-        .send()
-        .map_err(|error| PutError::Failed(api::from_reqwest(&error).failure()))?;
+    let result = send_watched(request, &moved);
+    if result.is_none() {
+        // The connection went silent (network lost mid-part). The blocked
+        // request is abandoned; the next attempt starts on a fresh connection.
+        abort.store(true, Ordering::Relaxed);
+        api::reset_client();
+    }
     if let Ok(mut map) = INFLIGHT.lock() {
         map.remove(&job.client_id);
     }
+    let response = match result {
+        Some(result) => {
+            result.map_err(|error| PutError::Failed(api::from_reqwest(&error).failure()))?
+        }
+        None => return Err(PutError::Failed(Failure::Offline)),
+    };
     match response.status().as_u16() {
         200..=299 => Ok(response
             .headers()
@@ -737,10 +800,9 @@ fn android_service(_jobs: &[Job]) {
     #[cfg(target_os = "android")]
     {
         use tauri::Manager;
-        let active: Vec<&Job> = _jobs
-            .iter()
-            .filter(|job| job.active() && !job.waiting_network)
-            .collect();
+        // Jobs waiting for the network keep the service too: Android does not
+        // let a background app start it again once the network is back.
+        let active: Vec<&Job> = _jobs.iter().filter(|job| job.active()).collect();
         let (sent, total) = active.iter().fold((0, 0), |(sent, total), job| {
             (sent + job.confirmed_bytes(), total + job.size)
         });

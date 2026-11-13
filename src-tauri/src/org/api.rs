@@ -3,19 +3,39 @@
 use super::upload::Failure;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::{sync::OnceLock, time::Duration};
+use std::{sync::Mutex, time::Duration};
 
-pub fn client() -> &'static reqwest::blocking::Client {
-    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
+static CLIENT: Mutex<Option<reqwest::blocking::Client>> = Mutex::new(None);
+
+/// Shared HTTP client (a cheap handle to one connection pool).
+pub fn client() -> reqwest::blocking::Client {
+    let mut slot = CLIENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    slot.get_or_insert_with(|| {
         reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .timeout(None)
+            // Mobile networks drop connections silently (Wi‑Fi ↔ LTE, tunnels):
+            // probe idle sockets and never reuse a pooled one for long.
+            .tcp_keepalive(Duration::from_secs(15))
+            .tcp_keepalive_interval(Duration::from_secs(5))
+            .tcp_keepalive_retries(3)
+            .pool_idle_timeout(Duration::from_secs(30))
             .user_agent(concat!("Hearfolio/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::custom(redirect_policy))
             .build()
             .expect("HTTP client")
     })
+    .clone()
+}
+
+/// Forget pooled connections: after the network changes they are dead and a
+/// request on one hangs until its timeout. Requests already running keep theirs.
+pub fn reset_client() {
+    if let Ok(mut slot) = CLIENT.lock() {
+        *slot = None;
+    }
 }
 
 /// Redirects may only stay on the same host and never downgrade HTTPS: the
