@@ -58,27 +58,12 @@ class OperationArgs {
     var success: Boolean = false
 }
 @InvokeArg
-class TransferArgs {
-    var path: String = ""
-    var snapshotPath: String = ""
-    var controlPath: String = ""
-    lateinit var id: String
-    var direction: String = "send"
-    var stage: String = "waiting"
-    var current: Long = 0
-    var total: Long = 0
-    var success: Boolean = false
-}
-
-@InvokeArg
 class SecretArgs { var name: String = ""; var value: String = "" }
 @InvokeArg
 class UploadServiceArgs { var count: Int = 0; var current: Long = 0; var total: Long = 0 }
 
 @TauriPlugin(permissions = [Permission(strings = [Manifest.permission.RECORD_AUDIO], alias = "microphone"), Permission(strings = [Manifest.permission.POST_NOTIFICATIONS], alias = "notifications")])
 class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
-    private var discoveryRequested = false
-    private val discoveryOwner = "activity:${System.identityHashCode(this)}"
     private fun secretName(name: String) = name.takeIf { it.isNotEmpty() && it.length <= 80 && it.all { c -> c.isLetterOrDigit() || c == '-' } }
     @Command fun secretPut(invoke: Invoke) {
         val args = invoke.parseArgs(SecretArgs::class.java); val name = secretName(args.name)
@@ -100,9 +85,6 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
         UploadService.update(activity.applicationContext, args.count, args.current, args.total)
         invoke.resolve()
     }
-    @Command fun startLanDiscovery(invoke: Invoke) {discoveryRequested=true;LanDiscovery.acquire(activity,discoveryOwner);invoke.resolve()}
-    override fun onResume(activity: AppCompatActivity) {if(discoveryRequested) LanDiscovery.acquire(activity,discoveryOwner)}
-    override fun onStop(activity: AppCompatActivity) {LanDiscovery.release(discoveryOwner)}
     private var player: MediaPlayer? = null
     private var playbackGeneration = 0
     private var preparingPlayback: Invoke? = null
@@ -216,7 +198,7 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun quickControl(invoke: Invoke) {
-        val args=invoke.parseArgs(TransferArgs::class.java)
+        val args=invoke.parseArgs(RecordingControlArgs::class.java)
         val action=args.stage
         val requestedPath=RecorderPathIdentity.canonical(args.path)
         recordingCommand(invoke) {
@@ -240,36 +222,6 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
         }
         val files=dir.listFiles()?.filter { it.isFile && it.canonicalFile.parentFile==dir.canonicalFile && it.name.startsWith("hearfolio-recording-") && (it.name.endsWith(".m4a") || it.name.endsWith(".wav")) }?.map { it.canonicalPath } ?: emptyList()
         val result=JSObject();result.put("paths",org.json.JSONArray(files));invoke.resolve(result)
-    }
-
-    @Command
-    fun startInbox(invoke: Invoke) {
-        if (Build.VERSION.SDK_INT >= 33 && getPermissionState("notifications") != PermissionState.GRANTED) {
-            requestPermissionForAlias("notifications", invoke, "inboxPermissionResult")
-        } else startInboxGranted(invoke)
-    }
-    @PermissionCallback
-    fun inboxPermissionResult(invoke: Invoke) {
-        if (Build.VERSION.SDK_INT >= 33 && getPermissionState("notifications") != PermissionState.GRANTED) invoke.reject("errors.transferBackgroundUnavailable") else startInboxGranted(invoke)
-    }
-    private fun startInboxGranted(invoke: Invoke) {
-        try {
-            InboxService.ready = { error -> if (error == null) invoke.resolve() else invoke.reject(error) }
-            val args=invoke.parseArgs(TransferArgs::class.java)
-            ContextCompat.startForegroundService(activity, Intent(activity, InboxService::class.java).setAction(InboxService.START).putExtra("snapshotPath",args.snapshotPath).putExtra("controlPath",args.controlPath))
-        } catch (_: Exception) { InboxService.ready = null; invoke.reject("errors.transferBackgroundUnavailable") }
-    }
-    @Command
-    fun stopInbox(invoke: Invoke) { activity.stopService(Intent(activity, InboxService::class.java)); invoke.resolve() }
-    @Command
-    fun inboxStatus(invoke: Invoke) {
-        val result = JSObject(); result.put("active", InboxService.active);result.put("error",InboxService.failure);invoke.resolve(result)
-    }
-    @Command
-    fun inboxOffers(invoke: Invoke) {
-        val args = invoke.parseArgs(TransferArgs::class.java)
-        InboxService.instance?.offers(args.current.toInt(), args.success)
-        invoke.resolve()
     }
 
     @Command
@@ -326,50 +278,7 @@ class RecordingPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve()
     }
 
-    @Command
-    fun beginTransfer(invoke: Invoke) {
-        if (Build.VERSION.SDK_INT >= 33 && getPermissionState("notifications") != PermissionState.GRANTED) {
-            requestPermissionForAlias("notifications", invoke, "transferNotificationResult")
-        } else { startTransfer(invoke) }
-    }
-
-    @PermissionCallback
-    fun transferNotificationResult(invoke: Invoke) { startTransfer(invoke) }
-
-    private fun startTransfer(invoke: Invoke) {
-        try {
-            val args = invoke.parseArgs(TransferArgs::class.java)
-            TransferService.prepare(args.id)
-            TransferService.ready = { error -> if (error == null) invoke.resolve() else invoke.reject(error) }
-            ContextCompat.startForegroundService(activity, Intent(activity, TransferService::class.java).setAction(TransferService.BEGIN).putExtra("id",args.id).putExtra("direction",args.direction).putExtra("snapshotPath",args.snapshotPath).putExtra("controlPath",args.controlPath))
-        } catch (error: Exception) { TransferService.ready = null; invoke.reject("errors.transferBackgroundUnavailable") }
-    }
-
-    @Command
-    fun checkTransfer(invoke: Invoke) {
-        val args = invoke.parseArgs(TransferArgs::class.java)
-        val response = JSObject(); response.put("cancelled", TransferService.isCancelled(args.id)); invoke.resolve(response)
-    }
-
-    @Command
-    fun updateTransfer(invoke: Invoke) {
-        val args = invoke.parseArgs(TransferArgs::class.java)
-        if (TransferService.job == args.id) { if (InboxService.active) InboxService.instance?.progress(args.stage,args.current,args.total) else TransferService.instance?.update(args.stage,args.current,args.total) }
-        invoke.resolve()
-    }
-
-    @Command
-    fun finishTransfer(invoke: Invoke) {
-        val args = invoke.parseArgs(TransferArgs::class.java)
-        if (InboxService.active && TransferService.job == args.id) { InboxService.instance?.transfer(false, args.success); invoke.resolve(); return }
-        if (TransferService.job == args.id && TransferService.instance != null) {
-            TransferService.stopped = { invoke.resolve() }
-            activity.startService(Intent(activity, TransferService::class.java).setAction(TransferService.END).putExtra("id",args.id).putExtra("success",args.success))
-        } else { invoke.resolve() }
-    }
-
     override fun onDestroy(activity: AppCompatActivity) {
-        LanDiscovery.release(discoveryOwner);
         // Permission callbacks from this destroyed Activity must never start a
         // second capture after the replacement WebView has resumed.
         val claimed=startTicket?.claimed==true

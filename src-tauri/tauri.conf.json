@@ -73,12 +73,6 @@
       "mobile": [
         {
           "scheme": [
-            "hearfolio-transfer"
-          ],
-          "appLink": false
-        },
-        {
-          "scheme": [
             "hearfolio"
           ],
           "host": "oauth",

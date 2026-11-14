@@ -14,9 +14,6 @@ edition = "2021"
 name = "speechdesk_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
-[features]
-transfer-mvp = []
-
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 cc = "1"
@@ -37,14 +34,14 @@ url = "2"
 tungstenite = { version = "0.28", features = ["handshake"] }
 symphonia = { version = "0.5.5", features = ["aac", "isomp4", "mp3", "flac", "ogg", "vorbis", "wav", "pcm"] }
 hound = "3.5"
-tiny_http = "0.12"
-if-addrs = "0.13"
-mdns-sd = "0.21"
-hmac = "0.12"
 # Pure-Rust lossless encoder for compacting recordings where no system AAC
 # encoder is available (Windows/Linux, and as a fallback elsewhere).
 flacenc = { version = "0.5.1", default-features = false }
 tauri-plugin-fs = "2.5.2"
+
+[dev-dependencies]
+# A local HTTP server standing in for Hearfolio Cloud in upload tests.
+tiny_http = "0.12"
 
 [target.'cfg(target_os = "android")'.dependencies]
 tauri-plugin-recording = { path = "tauri-plugin-recording" }
@@ -56,9 +53,6 @@ tauri-plugin-process = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 # Organization tokens live in the OS credential store: Keychain, Credential Manager, Secret Service.
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
-
-[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
-tauri-plugin-barcode-scanner = "2.5.1"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

@@ -573,7 +573,7 @@ fn loose_recording_paths(app: &tauri::AppHandle) -> Result<Vec<PathBuf>, String>
     {
         let pending: serde_json::Value = app
             .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
-            .transfer("quickRecordings", serde_json::json!({}))?;
+            .invoke("quickRecordings", serde_json::json!({}))?;
         for path in pending["paths"]
             .as_array()
             .into_iter()
@@ -1172,7 +1172,7 @@ pub async fn import_quick_recordings(
             let _job = job;
             let pending: serde_json::Value = app
                 .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
-                .transfer("quickRecordings", serde_json::json!({}))?;
+                .invoke("quickRecordings", serde_json::json!({}))?;
             let mut imported = Vec::new();
             let mut failure = None;
             for path in pending["paths"]
@@ -1400,7 +1400,7 @@ pub async fn open_android_battery_settings(app: tauri::AppHandle) -> Result<(), 
         #[cfg(target_os = "android")]
         return app
             .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
-            .transfer("openBatterySettings", serde_json::json!({}));
+            .invoke("openBatterySettings", serde_json::json!({}));
         #[cfg(not(target_os = "android"))]
         {
             let _ = app;

@@ -27,6 +27,7 @@ Run the frontend build and Rust checks before opening a pull request:
 
 ```sh
 npm run build
+npm run test:unit
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```

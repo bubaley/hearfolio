@@ -12,10 +12,10 @@ const messages: Record<string,string> = {
   'Сейчас':'Now',
   'Аудио готово':'Audio ready',
   'Выберите модель и нажмите «Распознать».':'Choose a model and select Transcribe.',
-  'На другое устройство':'Send to another device',
   'Сохранить текст':'Save text',
   'Поделиться записью':'Share recording',
   'Поделиться':'Share',
+  'Здесь появятся все записи с этого устройства.':'Every recording on this device will appear here.',
   'Диктофон':'Recorder',
   'Формат аудио':'Audio format',
   'Сохранить запись':'Save recording',
@@ -90,7 +90,7 @@ const messages: Record<string,string> = {
   'Добавить в архив':'Add to archive','Удалить эту запись':'Delete this recording','Удалить записанное аудио?':'Delete recorded audio?',
   'Эта запись ещё не добавлена в архив и будет потеряна.':'This recording has not been added to the archive and will be lost.',
   'Сервис':'Service','Модель':'Model','Режим':'Mode','Выбирается автоматически':'Selected automatically',
-  'Расшифровка':'Transcript','Записи':'Recordings','Модели':'Models','Настройки':'Settings','Устройства':'Devices','Отключить':'Unpair',
+  'Расшифровка':'Transcript','Записи':'Recordings','Модели':'Models','Настройки':'Settings',
   'Модель не выбрана':'No model selected','Проверяем готовность…':'Checking readiness…',
   'Установите FFmpeg для подготовки аудио.':'Install FFmpeg to prepare audio.',
   'Добавьте API token OpenRouter.':'Add your OpenRouter API token.','Выберите модель OpenRouter.':'Choose an OpenRouter model.',
@@ -233,12 +233,6 @@ export function countLabel(count:number,kind:'record'|'word') {
   return `${count} ${forms[form as keyof typeof forms]||forms.other}`;
 }
 const errorMessages:Record<string,[string,string]>={
-  transferBackgroundUnavailable: ['Не удалось запустить фоновую передачу. Откройте приложение и повторите.','Could not start the background transfer. Open the app and retry.'],
-  transferCancelled: ['Передача отменена','Transfer cancelled'],
-  transferInterrupted:['Система прервала передачу. Сохранённые записи остались в архиве. Повторите передачу, когда будете готовы.','The system interrupted the transfer. Saved recordings remain in your archive. Retry when you are ready.'],
-  cameraPermissionDenied:['Разрешите Hearfolio доступ к камере в настройках телефона. Код можно ввести вручную.','Allow Hearfolio camera access in your phone settings. You can also enter the code manually.'],
-  qrScanFailed:['Не удалось запустить сканер. Проверьте доступ к камере или введите код вручную.','Could not start the scanner. Check camera access or enter the code manually.'],
-  qrInvitationInvalid:['Это не QR-код приглашения Hearfolio. Создайте приглашение в разделе «Устройства» на другом устройстве.','This is not a Hearfolio invitation QR. Create an invitation in Devices on your other device.'],
 
   "postprocessRuleIdInvalid":["Неверный идентификатор правила.", "Invalid rule identifier."],
   "postprocessRuleNameInvalid":["Введите название правила длиной до 200 символов.", "Enter a rule name up to 200 characters."],
@@ -325,7 +319,6 @@ const errorMessages:Record<string,[string,string]>={
   "nemotronStream":["Не удалось получить текст от Nemotron.", "Could not receive text from Nemotron."],
   "nemotronTimeout":["Nemotron не ответил вовремя.", "Nemotron did not respond in time."],
   "operationBusy":["Сейчас выполняется другая задача. Дождитесь её окончания или остановите её.", "Another task is running. Wait for it to finish or stop it."],
-  "transferServerRequired":["Укажите адрес вашего сервера передачи.", "Enter your transfer server address."],
   "operationBackgroundUnavailable":["Не удалось запустить фоновую обработку. Откройте приложение и повторите.", "Could not start background processing. Open the app and try again."],
   "operationCancelled":["Обработка отменена. Сохранённые записи и результаты остались в архиве.", "Processing cancelled. Saved recordings and results remain in your archive."],
   "operationInterrupted":["Система прервала обработку. Аудио осталось в архиве. Запустите обработку ещё раз, когда будете готовы.", "The system interrupted processing. The audio remains in your archive. Restart processing when you are ready."],

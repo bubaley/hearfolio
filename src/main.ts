@@ -7,18 +7,17 @@ import {Pacer} from './pacer';
 import {pauseAudioRecording, resumeAudioRecording, restoreNativeRecordingFlag, observePendingOperation, operationHandled, markOperationHandled} from './api';
 import type {OperationSnapshot} from './operation-recovery';
 import {describeBusy, type BusyActivity, type BusyNotice} from './busy-activity';
-import {transferSettingsHtml, devicesHtml, transferBarHtml, shareRecordingToDevice, bindTransfers, initializeTransfers, hasTransferDraft, discardTransferDraft, transferActivityLabel} from './transfers';
 import './styles.css';
-import './transfers.css';
-import {renderSettings, initialSettingsDraft, mergeSettingsDraft, hasSettingsChanges, isSettingsSection, settingsLabel, type SettingsSection, type SettingsDraft} from './settings-ui';
+import {renderSettings, initialSettingsDraft, mergeSettingsDraft, hasSettingsChanges, isSettingsSection, settingsLabel, settingsSectionTitle, type SettingsSection, type SettingsDraft} from './settings-ui';
 import {recordingInputLevel, call, pickAudio, startAudioRecording, stopAudioRecording, cancelAudioRecording, discardAudioRecording, exportText, subscribe, subscribeAudioDrop, registerPreviewFile, audioSource, shareAudio, shareText, saveAudio, prepareNativePlayback, nativePlaybackState, playNativePlayback, pauseNativePlayback, seekNativePlayback, releaseNativePlayback, type NativePlayerState, type PartialTextEvent, type CloudResume, openExternal, openAndroidBatterySettings, pickStorageParent, loadRuntimePlatform, previewCapabilities, appVersion, checkDesktopUpdate, latestAndroidRelease, restartApp, isNewerVersion, preview, listLooseRecordings, adoptLooseRecording, exportLooseRecording, type LooseRecording, type AudioSelection, type Entry, type Progress, type Settings, type CloudModel, type RecognitionConfig, type RuntimeCapabilities, type AndroidRelease, type AppUpdate} from './api';
 import {icon, escapeHtml as esc} from './icons';
-import {initOrg, bindOrg, sourceTabsHtml, isCloudSource, cloudListHtml, cloudDetailHtml, closeDetail as closeOrgDetail, detailTitle as orgDetailTitle, destinationChipHtml, afterImport as orgAfterImport, copyToOrganization, hasOrganizations, orgSettingsHtml} from './org';
+import {installSelects} from './select';
+import {initOrg, bindOrg, sourceTabsHtml, isCloudSource, cloudListHtml, cloudDetailHtml, closeDetail as closeOrgDetail, detailTitle as orgDetailTitle, detailToolsHtml as orgDetailToolsHtml, destinationChipHtml, destinationDockHtml, afterImport as orgAfterImport, copyToOrganization, hasOrganizations, orgSettingsHtml} from './org';
 import {tr, locale, countLabel, errorText, setLanguage, currentLanguage, type LanguagePreference} from './i18n';
 
 import {setupPostprocess, rulesHtml, postprocessHtml, resultsHtml, textPickerHtml, textPickerOpen, bindPostprocess, ensureRules, hasRuleDraft, mayLeaveRules, restorePostprocessActivity} from './postprocess';
 
-type View = 'work' | 'history' | 'archive' | 'models' | 'settings' | 'rules' | 'devices' | 'cloud';
+type View = 'work' | 'history' | 'archive' | 'models' | 'settings' | 'rules' | 'cloud';
 let settingsSection:SettingsSection|null=null, settingsSaving=false, settingsError='';
 const models = [
   {id:'whisper-tiny',name:'Whisper Tiny',detail:"Для коротких заметок. Быстрее остальных, но чаще ошибается.",size:"75 МБ",installed:false},
@@ -175,7 +174,7 @@ function paintProgress(now:number){
 }
 let recordingPausedAt=0,recordingPausedMillis=0;
 document.documentElement.dataset.theme=theme;
-const title:Record<View,string>={work:"Запись",history:"Записи",archive:"Архив",models:"Модели",settings:"Настройки",devices:"Устройства",rules:"Правила обработки",cloud:"Запись"};
+const title:Record<View,string>={work:"Запись",history:"Записи",archive:"Архив",models:"Модели",settings:"Настройки",rules:"Правила обработки",cloud:"Запись"};
 const formatTime=(seconds:number)=>{const whole=Math.floor(seconds),pad=(value:number)=>String(value).padStart(2,'0');return whole>=3600?`${Math.floor(whole/3600)}:${pad(Math.floor(whole/60)%60)}:${pad(whole%60)}`:`${Math.floor(whole/60)}:${pad(whole%60)}`;};
 const dateLabel=(timestamp:number)=>new Date(timestamp).toLocaleDateString(locale(),{day:'numeric',month:'long'});
 const audioFormats='MP3, M4A, WAV, AAC, FLAC, OGG, MP4';
@@ -252,9 +251,6 @@ function busyStop(described:BusyNotice):NoticeAction|undefined{
         if(nativeOperation?.id===target.id){await cancelNativeOperation();return;}
         await call('cancel_background_operation',{id:target.id});
         notice(say('Останавливаем. Через несколько секунд можно будет продолжить.','Stopping. You can continue in a few seconds.'));
-      }else if(target.target==='transfer'){
-        await call('cancel_transfer_activity',{id:target.id});
-        notice(say('Передача останавливается.','The transfer is stopping.'));
       }else{
         settingsDraft=null;view='work';await syncNativeRecording(true);render();
         if(recorderLive())await stopRecording();
@@ -330,7 +326,7 @@ function recordStateHtml(entry:Entry):string {
   const partial=unfinished.get(entry.id);
   return partial?`<span class="record-state paused" title="${tr('Расшифровка не завершена')}">${partial.done}/${partial.total}</span>`:`<span class="record-state">${tr('Аудио')}</span>`;
 }
-function recordDetailHtml(entry:Entry):string {return `<span class="record-detail"><span>${dateLabel(entry.createdAt)}</span>${entry.durationSeconds?`<span>${formatTime(entry.durationSeconds)}</span>`:''}</span>`;}
+function recordDetailHtml(entry:Entry):string {return `<span class="record-detail">${recordStateHtml(entry)}<span class="record-date">${dateLabel(entry.createdAt)}</span>${entry.durationSeconds?`<span>${formatTime(entry.durationSeconds)}</span>`:''}</span>`;}
 function recordActionsHtml(entry:Entry):string {
   return `<div class="record-actions"><button class="icon-button" data-rename="${esc(entry.id)}" aria-label="${tr('Переименовать')} ${esc(entry.name)}" title="${tr('Переименовать запись')}" ${disabled()}>${icon('edit')}</button><button class="icon-button" data-delete="${esc(entry.id)}" aria-label="${tr('Удалить')} ${esc(entry.name)}" title="${tr('Удалить запись')}" ${disabled()}>${icon('trash')}</button></div>`;
 }
@@ -339,7 +335,7 @@ function historyItems(entries:Entry[]):string {
   return entries.map(entry=>{
     const label=groupLabel(entry.createdAt),heading=label!==group?`<div class="history-group">${label}</div>`:'';group=label;
     const locked=busy&&jobRecord()!==entry.id&&active?.id!==entry.id;
-    return `${heading}<div class="record-row ${active?.id===entry.id&&(view==='work'||!platform.mobile)?'selected':''}"><button class="record-link" data-history="${esc(entry.id)}" ${locked||platform.os==='unknown'?'disabled':''} title="${esc(entry.name)}"><span class="record-title">${esc(displayName(entry))}</span>${recordDetailHtml(entry)}</button>${recordStateHtml(entry)}${platform.mobile?'':recordActionsHtml(entry)}</div>`;
+    return `${heading}<div class="record-row ${active?.id===entry.id&&(view==='work'||!platform.mobile)?'selected':''}"><button class="record-link" data-history="${esc(entry.id)}" ${locked||platform.os==='unknown'?'disabled':''} title="${esc(entry.name)}"><span class="record-title">${esc(displayName(entry))}</span>${recordDetailHtml(entry)}</button>${platform.mobile?'':recordActionsHtml(entry)}</div>`;
   }).join('');
 }
 function historyResults():string {
@@ -347,7 +343,7 @@ function historyResults():string {
   const entries=history.filter(entry=>entry.name.toLocaleLowerCase().includes(search.toLocaleLowerCase()));
   if (loading) return `<div class="list-empty"><span class="spinner"></span>${tr('Загружаем записи…')}</div>`;
   if (historyError) return `<div class="list-empty">${esc(historyError)}<button class="text-button" id="retry-history">${tr('Повторить')}</button></div>`;
-  if (!entries.length) return search?`<div class="list-empty">${tr('Записи не найдены')}</div>`:`<div class="list-empty first-run"><strong>${tr('Пока пусто')}</strong><span>${tr(platform.audioRecording?'Запишите разговор или добавьте файл — здесь появятся аудио и текст.':'Добавьте аудиофайл — здесь появятся аудио и текст.')}</span></div>`;
+  if (!entries.length) return search?`<div class="list-empty">${tr('Записи не найдены')}</div>`:`<div class="list-empty first-run"><span class="empty-symbol" aria-hidden="true">${icon('wave')}</span><strong>${tr('Пока пусто')}</strong><span>${tr(platform.audioRecording?'Запишите разговор или добавьте файл — здесь появятся аудио и текст.':'Добавьте аудиофайл — здесь появятся аудио и текст.')}</span></div>`;
   return historyItems(entries);
 }
 function searchFieldHtml():string {return `<label class="search-field">${icon('search')}<input id="history-search" type="search" placeholder="${tr('Поиск')}" value="${esc(search)}" aria-label="${tr('Найти запись')}" autocomplete="off"></label>`;}
@@ -358,7 +354,7 @@ function archiveNavHtml():string {return `<button class="nav-item ${view==='arch
 function sidebarHtml():string {
   if(platform.mobile)return '';
   const locked=recordingPhase!=='idle'||busy||nativeRecovery||platform.os==='unknown';
-  return `<aside class="sidebar" aria-label="${tr('Записи')}"><div class="sidebar-chrome" data-tauri-drag-region><button class="icon-button" id="collapse" title="${tr('Скрыть список')} · ⌘B" aria-label="${tr('Скрыть список')}" aria-expanded="true">${icon('panel')}</button></div><div class="sidebar-body"><button class="brand" id="new" title="${tr('Новая запись')} · ⌘N" ${locked?'disabled':''}>${brandHtml()}</button><div class="sidebar-actions">${platform.audioRecording?recordingElsewhere()?recordingReturnHtml():`<button class="record-cta" id="quick-record" ${locked?'disabled':''}><span class="record-dot" aria-hidden="true"></span>${tr('Записать')}</button>`:''}<button class="secondary import-cta" data-choose title="${tr('Открыть аудиофайл')} · ⌘O" ${locked?'disabled':''}>${icon('upload')}<span>${tr('Файл')}</span></button></div>${sourceTabsHtml()}${history.length>3||search||isCloudSource()?searchFieldHtml():''}<div class="record-list" id="history-results">${historyResults()}</div><nav class="sidebar-nav" aria-label="${tr('Приложение')}">${archiveNavHtml()}${desktopModelsNav()}<button class="nav-item ${view==='devices'?'active':''}" data-view="devices">${icon('devices')}<span>${tr('Устройства')}</span></button><button class="nav-item ${view==='settings'||view==='rules'?'active':''}" data-view="settings">${icon('settings')}<span>${tr('Настройки')}</span></button><button class="icon-button" data-theme title="${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}" aria-label="${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}">${icon(theme==='dark'?'sun':'moon')}</button></nav></div></aside>`;
+  return `<aside class="sidebar" aria-label="${tr('Записи')}"><div class="sidebar-chrome" data-tauri-drag-region><button class="icon-button" id="collapse" title="${tr('Скрыть список')} · ⌘B" aria-label="${tr('Скрыть список')}" aria-expanded="true">${icon('panel')}</button></div><div class="sidebar-body"><button class="brand" id="new" title="${tr('Новая запись')} · ⌘N" ${locked?'disabled':''}>${brandHtml()}</button><div class="sidebar-actions">${platform.audioRecording?recordingElsewhere()?recordingReturnHtml():`<button class="record-cta" id="quick-record" ${locked?'disabled':''}><span class="record-dot" aria-hidden="true"></span>${tr('Записать')}</button>`:''}<button class="secondary import-cta" data-choose title="${tr('Открыть аудиофайл')} · ⌘O" ${locked?'disabled':''}>${icon('upload')}<span>${tr('Файл')}</span></button></div>${sourceTabsHtml()}${history.length>3||search||isCloudSource()?searchFieldHtml():''}<div class="record-list" id="history-results">${historyResults()}</div><nav class="sidebar-nav" aria-label="${tr('Приложение')}">${archiveNavHtml()}${desktopModelsNav()}<button class="nav-item ${view==='settings'||view==='rules'?'active':''}" data-view="settings">${icon('settings')}<span>${tr('Настройки')}</span></button><button class="icon-button" data-theme title="${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}" aria-label="${theme==='dark'?tr("Светлая тема"):tr("Тёмная тема")}">${icon(theme==='dark'?'sun':'moon')}</button></nav></div></aside>`;
 }
 // While a recording runs elsewhere in the app, the record button turns into a way back to it.
 const recordingElsewhere=()=>recordingPhase!=='idle'&&view!=='work';
@@ -429,7 +425,7 @@ function composerHtml(issue:string):string {
 }
 function recordHeaderHtml():string {
   if(!active)return '';
-  return `<header class="record-header"><div class="record-heading"><div class="record-name-row"><h1 title="${esc(active.name)}">${esc(displayName(active))}</h1><button class="icon-button" data-rename="${esc(active.id)}" aria-label="${tr('Переименовать запись')}" title="${tr('Переименовать запись')}" ${disabled()}>${icon('edit')}</button></div><div class="record-meta" id="text-meta">${recordMetaHtml()}</div></div><div class="record-tools"><button type="button" class="secondary" id="record-share" aria-haspopup="dialog" aria-expanded="false" aria-controls="record-actions-dialog">${icon('share')}<span>${tr('Поделиться')}</span></button>${platform.mobile?`<button type="button" class="icon-button" data-delete="${esc(active.id)}" aria-label="${tr('Удалить запись')}" ${disabled()}>${icon('trash')}</button>`:''}</div></header>`;
+  return `<header class="record-header"><div class="record-heading"><div class="record-name-row"><h1 title="${esc(active.name)}">${esc(displayName(active))}</h1>${platform.mobile?'':`<button class="icon-button" data-rename="${esc(active.id)}" aria-label="${tr('Переименовать запись')}" title="${tr('Переименовать запись')}" ${disabled()}>${icon('edit')}</button>`}</div><div class="record-meta" id="text-meta">${recordMetaHtml()}</div></div>${platform.mobile?'':`<div class="record-tools"><button type="button" class="secondary" id="record-share" aria-haspopup="dialog" aria-expanded="false" aria-controls="record-actions-dialog">${icon('share')}<span>${tr('Поделиться')}</span></button></div>`}</header>`;
 }
 function outputTabsHtml():string {
   if(!active||!(text||active.results?.length))return '';
@@ -439,7 +435,6 @@ function workHtml():string {
   const issue=readiness(),source=active&&!platform.mobile?audioSource(active):'';
   const recording=recordingPhase!=='idle'||!active;
   return `<section class="workspace ${recording?'is-capture':''}">
-    ${recordingPhase==='idle'?transferBarHtml(active):''}
     ${!recording?`${recordHeaderHtml()}<div class="audio-bar ${platform.mobile?'native-audio-bar':''}">${platform.mobile?nativePlayerHtml():source?`<audio id="audio" controls controlslist="nodownload noplaybackrate" preload="metadata" src="${esc(source)}" aria-label="${tr('Прослушать ')}${esc(active!.name)}"></audio>`:''}<p id="playback-error" class="playback-error" role="alert"></p></div>${outputTabsHtml()}`:''}
     <div class="transcript-scroll" id="result" ${active&&!recording&&(text||active.results?.length)?`role="tabpanel" aria-labelledby="${outputTab==='transcript'?'transcript-tab':'results-tab'}"`:''}>${outputHtml()}${!recording&&text&&resultSaved&&outputTab==='transcript'?postprocessHtml():''}</div>
     ${previousResult?.saved&&!busy&&!resultSaved?`<div class="restore-result"><span>${tr('Предыдущий текст сохранён в архиве.')}</span><button class="text-button" id="restore">${tr('Вернуть его')}</button></div>`:''}
@@ -453,7 +448,7 @@ function nativePlayerHtml():string {
 function homeHtml():string {
   const job=jobRecord()?history.find(entry=>entry.id===jobRecord()):null;
   const restoreBanner=restoring?`<div class="job-banner" role="status"><span class="spinner"></span><span><strong>${tr('Восстанавливаем запись…')}</strong><small>${tr('Аудио сохранено. Это займёт немного времени.')}</small></span></div>`:'';
-  return `<section class="home">${restoreBanner}${job?`<button class="job-banner" data-history="${esc(job.id)}"><span class="spinner"></span><span><strong>${esc(displayName(job))}</strong><small>${esc(progress?.stage||'')}${progressPercent()!==null?` · ${progressPercent()}%`:''}</small></span>${icon('chevron')}</button>`:''}${sourceTabsHtml()}${history.length>5||search||isCloudSource()?searchFieldHtml():''}<div class="record-list" id="history-results">${historyResults()}</div></section>${hasOrganizations()?`<div class="home-destination">${destinationChipHtml(true)}</div>`:''}<div class="home-dock"><button class="dock-side" data-choose ${disabled()}>${icon('upload')}<span>${tr('Файл')}</span></button>${platform.audioRecording?recordOrbHtml('quick-record',tr('Начать запись')):''}<span class="dock-side" aria-hidden="true"></span></div>`;
+  return `<section class="home">${restoreBanner}${job?`<button class="job-banner" data-history="${esc(job.id)}"><span class="spinner"></span><span><strong>${esc(displayName(job))}</strong><small>${esc(progress?.stage||'')}${progressPercent()!==null?` · ${progressPercent()}%`:''}</small></span>${icon('chevron')}</button>`:''}${sourceTabsHtml()}${history.length>5||search||isCloudSource()?searchFieldHtml():''}<div class="record-list" id="history-results">${historyResults()}</div></section><div class="home-dock"><button class="dock-side" data-choose ${disabled()}>${icon('upload')}<span>${tr('Файл')}</span></button>${platform.audioRecording?recordOrbHtml('quick-record',tr('Начать запись')):''}${destinationDockHtml()||'<span class="dock-side" aria-hidden="true"></span>'}</div>`;
 }
 function modelsHtml():string {
   const installationCommand=platform.os==='linux'?'sudo apt install ffmpeg':'brew install ffmpeg whisper.cpp';
@@ -463,11 +458,11 @@ function modelsHtml():string {
 const looseLocked=()=>busy||recordingPhase!=='idle'||platform.os==='unknown'?'disabled':'';
 function looseName(item:LooseRecording):string {return recordingName({path:item.path},item.createdAt);}
 function archiveHtml():string {
-  const locked=looseLocked(),detail=(parts:(string|false|undefined)[])=>`<span class="archive-meta">${parts.filter(Boolean).map(part=>`<span>${esc(String(part))}</span>`).join('')}</span>`;
-  const looseItems=loose.map(item=>`<article class="archive-item"><div class="archive-item-head"><div class="archive-item-title"><strong>${esc(recordNameParts(looseName(item),item.path).title)}</strong>${detail([dateLabel(item.createdAt),item.durationSeconds?formatTime(item.durationSeconds):'',sizeLabel(item.sizeBytes)])}</div><span class="archive-status failed">${tr('Не обработана')}</span></div><div class="archive-item-actions"><button type="button" class="primary" data-loose-retry="${esc(item.path)}" ${locked}>${icon('history')}<span>${tr('Повторить')}</span></button>${platform.mobile?`<button type="button" class="secondary" data-loose-share="${esc(item.path)}" ${locked}>${icon('share')}<span>${tr('Поделиться')}</span></button>`:''}<button type="button" class="secondary" data-loose-save="${esc(item.path)}" ${locked}>${icon('download')}<span>${tr('Сохранить')}</span></button><button type="button" class="icon-button danger" data-loose-delete="${esc(item.path)}" aria-label="${tr('Удалить запись')}" title="${tr('Удалить запись')}" ${locked}>${icon('trash')}</button></div></article>`).join('');
+  const locked=looseLocked(),detail=(state:string,parts:(string|false|undefined)[])=>`<span class="archive-meta">${state}${parts.filter(Boolean).map(part=>`<span>${esc(String(part))}</span>`).join('')}</span>`;
+  const looseItems=loose.map(item=>`<article class="archive-item"><div class="archive-item-head"><div class="archive-item-title"><strong>${esc(recordNameParts(looseName(item),item.path).title)}</strong>${detail(`<span class="archive-status failed">${tr('Не обработана')}</span>`,[dateLabel(item.createdAt),item.durationSeconds?formatTime(item.durationSeconds):'',sizeLabel(item.sizeBytes)])}</div></div><div class="archive-item-actions"><button type="button" class="primary" data-loose-retry="${esc(item.path)}" ${locked}>${icon('history')}<span>${tr('Повторить')}</span></button><span class="archive-item-tools">${platform.mobile?`<button type="button" class="icon-button" data-loose-share="${esc(item.path)}" aria-label="${tr('Поделиться')}" title="${tr('Поделиться')}" ${locked}>${icon('share')}</button>`:''}<button type="button" class="icon-button" data-loose-save="${esc(item.path)}" aria-label="${tr('Сохранить аудио')}" title="${tr('Сохранить аудио')}" ${locked}>${icon('download')}</button><button type="button" class="icon-button danger" data-loose-delete="${esc(item.path)}" aria-label="${tr('Удалить запись')}" title="${tr('Удалить запись')}" ${locked}>${icon('trash')}</button></span></div></article>`).join('');
   const failed=looseLoading&&!loose.length?`<div class="list-empty"><span class="spinner"></span>${tr('Ищем необработанные записи…')}</div>`:looseError?`<div class="list-empty" role="alert">${esc(looseError)}<button class="text-button" id="retry-loose">${tr('Повторить')}</button></div>`:looseItems?`<p class="archive-hint">${tr('Обработка этих записей не завершилась. Аудио сохранено: повторите обработку или выгрузите файл.')}</p>${looseItems}`:'';
-  const saved=history.map(entry=>`<article class="archive-item"><div class="archive-item-head"><div class="archive-item-title"><strong title="${esc(entry.name)}">${esc(displayName(entry))}</strong>${detail([dateLabel(entry.createdAt),entry.durationSeconds?formatTime(entry.durationSeconds):'',entry.sizeBytes?sizeLabel(entry.sizeBytes):''])}</div>${jobRecord()===entry.id?recordStateHtml(entry):`<span class="archive-status ${entry.outputPath?'done':unfinished.has(entry.id)?'paused':''}">${entry.outputPath?tr('Расшифрована'):unfinished.has(entry.id)?`${tr('Не завершена')} · ${unfinished.get(entry.id)!.done}/${unfinished.get(entry.id)!.total}`:tr('Без текста')}</span>`}</div><div class="archive-item-actions"><button type="button" class="secondary" data-history="${esc(entry.id)}" ${busy&&jobRecord()!==entry.id?'disabled':''}>${icon('chevron')}<span>${tr(entry.outputPath?'Открыть':unfinished.has(entry.id)?'Продолжить':'Расшифровать')}</span></button>${platform.mobile?`<button type="button" class="secondary" data-archive-share="${esc(entry.id)}" ${locked}>${icon('share')}<span>${tr('Поделиться')}</span></button>`:''}<button type="button" class="secondary" data-archive-save="${esc(entry.id)}" ${locked}>${icon('download')}<span>${tr('Сохранить')}</span></button></div></article>`).join('');
-  return `<div class="page-heading"><div><h1>${tr('Архив')}</h1><p>${tr('Все записи на этом устройстве и статус их обработки.')}</p></div></div>${failed?`<section class="archive-section"><h2>${tr('Не обработаны')}${loose.length?` <small>${loose.length}</small>`:''}</h2>${failed}</section>`:''}<section class="archive-section"><h2>${tr('В архиве')}${history.length?` <small>${history.length}</small>`:''}</h2>${historyError?`<div class="list-empty">${esc(historyError)}<button class="text-button" id="retry-history">${tr('Повторить')}</button></div>`:saved||`<div class="list-empty">${tr('Пока пусто')}</div>`}</section>`;
+  const saved=history.map(entry=>`<article class="archive-item"><div class="archive-item-head"><div class="archive-item-title"><strong title="${esc(entry.name)}">${esc(displayName(entry))}</strong>${detail(jobRecord()===entry.id?recordStateHtml(entry):`<span class="archive-status ${entry.outputPath?'done':unfinished.has(entry.id)?'paused':''}">${entry.outputPath?tr('Расшифрована'):unfinished.has(entry.id)?`${tr('Не завершена')} · ${unfinished.get(entry.id)!.done}/${unfinished.get(entry.id)!.total}`:tr('Без текста')}</span>`,[dateLabel(entry.createdAt),entry.durationSeconds?formatTime(entry.durationSeconds):'',entry.sizeBytes?sizeLabel(entry.sizeBytes):''])}</div></div><div class="archive-item-actions"><button type="button" class="secondary" data-history="${esc(entry.id)}" ${busy&&jobRecord()!==entry.id?'disabled':''}><span>${tr(entry.outputPath?'Открыть':unfinished.has(entry.id)?'Продолжить':'Расшифровать')}</span></button><span class="archive-item-tools">${platform.mobile?`<button type="button" class="icon-button" data-archive-share="${esc(entry.id)}" aria-label="${tr('Поделиться')}" title="${tr('Поделиться')}" ${locked}>${icon('share')}</button>`:''}<button type="button" class="icon-button" data-archive-save="${esc(entry.id)}" aria-label="${tr('Сохранить аудио')}" title="${tr('Сохранить аудио')}" ${locked}>${icon('download')}</button></span></div></article>`).join('');
+  return `<div class="page-heading"><div><h1>${tr('Архив')}</h1><p>${tr('Все записи на этом устройстве и статус их обработки.')}</p></div></div>${failed?`<section class="archive-section"><h2>${tr('Не обработаны')}${loose.length?` <small>${loose.length}</small>`:''}</h2>${failed}</section>`:''}<section class="archive-section"><h2>${tr('В архиве')}${history.length?` <small>${history.length}</small>`:''}</h2>${historyError?`<div class="list-empty">${esc(historyError)}<button class="text-button" id="retry-history">${tr('Повторить')}</button></div>`:saved||`<div class="list-empty first-run"><span class="empty-symbol" aria-hidden="true">${icon('archive')}</span><strong>${tr('Пока пусто')}</strong><span>${tr('Здесь появятся все записи с этого устройства.')}</span></div>`}</section>`;
 }
 async function refreshLoose(){
   if(platform.os==='unknown')return;
@@ -503,7 +498,7 @@ function bindArchive(){
   document.querySelectorAll<HTMLElement>('[data-archive-save]').forEach(element=>element.onclick=()=>{const entry=saved(element.dataset.archiveSave!);if(entry)void saveAudio(entry).catch(error=>notice(errorText(error),true));});
 }
 function settingsHtml():string {
-  return renderSettings({settings,draft:settingsDraft,section:settingsSection||(!platform.mobile&&window.innerWidth>760?'general':null),mobile:platform.mobile,android:platform.os==='android',theme,busy,saving:settingsSaving,error:settingsError,customStorage:platform.customStorage,transferMvp:Boolean(platform.transferMvp),version:applicationVersion,devicesHtml:transferSettingsHtml(),cloudHtml:orgSettingsHtml(),updatesHtml:updatesHtml(),recordCount:history.length});
+  return renderSettings({settings,draft:settingsDraft,section:settingsSection||(!platform.mobile&&window.innerWidth>760?'general':null),mobile:platform.mobile,android:platform.os==='android',theme,busy,saving:settingsSaving,error:settingsError,customStorage:platform.customStorage,version:applicationVersion,cloudHtml:orgSettingsHtml(),updatesHtml:updatesHtml(),recordCount:history.length});
 }
 function headerTitle():string {
   if(view==='work')return tr(recordingPhase!=='idle'?'Диктофон':active?'Запись':'Новая запись');
@@ -511,14 +506,17 @@ function headerTitle():string {
   return tr(title[view]);
 }
 function mobileHeaderHtml():string {
-  const home=view==='history',back=view==='devices'||view==='rules'?'settings':'history';
-  return `<header class="main-header mobile-header">${home?`<span class="brand">${brandHtml()}</span>`:`<button type="button" class="icon-button back-button" ${view==='settings'&&settingsSection?'data-settings-back':`data-back="${back}"`} aria-label="${tr('Назад')}" ${recordingPhase!=='idle'?'hidden':''}>${icon('back')}</button><span class="header-title">${esc(headerTitle())}</span>`}<div class="header-status"><div id="update-header">${updateHeaderHtml()}</div>${home?`<button type="button" class="icon-button badge-host" data-view="archive" aria-label="${tr('Архив')}">${icon('archive')}${looseBadgeHtml()}</button><button type="button" class="icon-button" data-view="settings" aria-label="${tr('Настройки')}">${icon('settings')}</button>`:''}</div></header>`;
+  const home=view==='history',back=view==='rules'?'settings':'history';
+  // A record names itself in the page; its app bar carries the actions instead of a second title.
+  const record=view==='work'&&active&&recordingPhase==='idle'?active:null;
+  const recordTools=record?`<button type="button" class="icon-button" data-rename="${esc(record.id)}" aria-label="${tr('Переименовать запись')}" ${disabled()}>${icon('edit')}</button><button type="button" class="icon-button" id="record-share" aria-haspopup="dialog" aria-expanded="false" aria-controls="record-actions-dialog" aria-label="${tr('Поделиться')}">${icon('share')}</button><button type="button" class="icon-button" data-delete="${esc(record.id)}" aria-label="${tr('Удалить запись')}" ${disabled()}>${icon('trash')}</button>`:'';
+  const barTitle=record||view==='cloud'?'':view==='settings'&&settingsSection?settingsSectionTitle(settingsSection):headerTitle();
+  return `<header class="main-header mobile-header">${home?`<span class="brand">${brandHtml()}</span>`:`<button type="button" class="icon-button back-button" ${view==='settings'&&settingsSection?'data-settings-back':`data-back="${back}"`} aria-label="${tr('Назад')}" ${recordingPhase!=='idle'?'hidden':''}>${icon('back')}</button><span class="header-title">${esc(barTitle)}</span>`}<div class="header-status"><div id="update-header">${updateHeaderHtml()}</div>${recordTools}${view==='cloud'?orgDetailToolsHtml(true):''}${home?`<button type="button" class="icon-button badge-host" data-view="archive" aria-label="${tr('Архив')}">${icon('archive')}${looseBadgeHtml()}</button><button type="button" class="icon-button" data-view="settings" aria-label="${tr('Настройки')}">${icon('settings')}</button>`:''}</div></header>`;
 }
 function updateHeaderHtml():string {
   return pendingUpdate||androidRelease||updateInstalled?`<button type="button" class="text-button update-shortcut" data-view="settings" data-settings-target="app">${icon('download')}<span>${tr(updateInstalled?'Нужен перезапуск':'Доступно обновление')}</span></button>`:'';
 }
 function updatesHtml():string {
-  if(platform.transferMvp)return `<p>${currentLanguage()==='ru'?'Тестовая сборка: обновления отключены.':'Test build: updates are disabled.'}</p>`;
   if(platform.os!=='android'&&platform.os!=='macos'&&platform.os!=='linux'&&platform.os!=='windows')return `<p>${tr('Обновления на этой платформе недоступны.')}</p>`;
   if(updateInstalled)return `<p>${tr('Обновление установлено. Перезапустите приложение, когда закончите работу.')}</p><button type="button" class="secondary" id="restart-update" ${busy?'disabled':''}>${tr('Перезапустить приложение')}</button>`;
   const version=pendingUpdate?.version||androidRelease?.version;
@@ -529,7 +527,7 @@ function refreshUpdateUi() {
   const header=document.querySelector('#update-header');if(header){header.innerHTML=updateHeaderHtml();header.querySelector<HTMLElement>('[data-view]')?.addEventListener('click',()=>changeView('settings','app'));}
 }
 async function checkUpdates(manual=false) {
-  if(platform.transferMvp||busy||updateChecking||updateInstalled||(!platform.mobile&&platform.os!=='macos'&&platform.os!=='linux'&&platform.os!=='windows')||platform.os==='ios')return;
+  if(busy||updateChecking||updateInstalled||(!platform.mobile&&platform.os!=='macos'&&platform.os!=='linux'&&platform.os!=='windows')||platform.os==='ios')return;
   if(preview&&!manual)return;
   updateChecking=true;updateError='';lastUpdateCheck=Date.now();refreshUpdateUi();
   try{
@@ -575,7 +573,7 @@ function preservePlayback() {
   if (audio) {audioPosition=audio.currentTime;audioWasPlaying=!audio.paused;}
 }
 function activityLabel():string {
-  if(!busy||recordingPhase!=='idle'||!progress)return transferActivityLabel();
+  if(!busy||recordingPhase!=='idle'||!progress)return '';
   return progress.kind==='download'?tr("Скачиваем модель"):progress.kind==='import'?tr("Добавляем запись"):progress.kind==='storage'?tr('Переносим архив'):progress.kind==='update'?tr('Устанавливаем обновление'):progress.kind==='postprocess'?tr('Обрабатываем текст…'):tr('Расшифровываем');
 }
 function desktopHeaderHtml():string {
@@ -586,7 +584,7 @@ function surfaceHtml():string {
   if(view==='cloud')return cloudDetailHtml();
   if(view==='history'&&platform.mobile)return homeHtml();
   if(view==='work'||view==='history')return workHtml();
-  return `<div class="page-scroll ${view==='devices'&&!platform.mobile?'devices-scroll':''}"><div class="page-content ${view==='devices'?'devices-page':''}">${view==='archive'?archiveHtml():view==='models'?modelsHtml():view==='devices'?devicesHtml():view==='rules'?rulesHtml():settingsHtml()}${busy&&progress?`<div id="progress">${progressHtml()}</div>`:''}</div></div>`;
+  return `<div class="page-scroll"><div class="page-content">${view==='archive'?archiveHtml():view==='models'?modelsHtml():view==='rules'?rulesHtml():settingsHtml()}${busy&&progress?`<div id="progress">${progressHtml()}</div>`:''}</div></div>`;
 }
 let booted=false;
 function render() {
@@ -642,9 +640,9 @@ function resetPlayback() {stopPlayerPolling();playerGeneration++;playerId='';pla
 async function mayReplaceRecord(discardRecording=true) {if(pendingRecording){if(discardRecording){if(!await discardPendingRecording())return false;}else if(!await confirmAction(tr('Удалить записанное аудио?'),tr('Эта запись ещё не добавлена в архив и будет потеряна.'),tr('Продолжить без записи'),false))return false;}return !text||resultSaved||await confirmAction(tr("Неполный текст не сохранён"),tr("Скопируйте или экспортируйте текст, чтобы сохранить его. При переходе к другой записи этот результат будет потерян."),tr("Продолжить без текста"),false);}
 async function mayLeaveSettings() {
   if(settingsSaving||!await mayLeaveRules())return false;
-  if(!settingsDraft&&!hasTransferDraft())return true;
+  if(!settingsDraft)return true;
   if(!await confirmAction(tr("Изменения не применены"),tr("Примените настройки перед уходом или продолжите без этих изменений."),tr("Продолжить без изменений"),false))return false;
-  settingsDraft=null;settingsError='';discardTransferDraft();return true;
+  settingsDraft=null;settingsError='';return true;
 }
 async function changeView(target:View, settingsTarget?:SettingsSection):Promise<boolean|void> {
   if(recordingPhase!=='idle')return;
@@ -653,7 +651,7 @@ async function changeView(target:View, settingsTarget?:SettingsSection):Promise<
   if(view==='rules'&&target!=='rules'&&!await mayLeaveRules())return;
   if(view==='cloud'&&target!=='cloud')closeOrgDetail();
   if(target==='models'&&!platform.localRecognition)return;
-  if((view==='settings'||view==='devices')&&target!==view&&!await mayLeaveSettings())return;
+  if(view==='settings'&&target!==view&&!await mayLeaveSettings())return;
   if(target==='settings') {
     if(view==='settings'&&settingsTarget&&settingsTarget!==settingsSection&&!await mayLeaveSettings())return;
     if(view!=='settings')settingsSection=settingsTarget||((platform.mobile||window.innerWidth<=760)?null:'general');
@@ -700,7 +698,7 @@ function bind() {
   document.querySelector('#copy-install')?.addEventListener('click',()=>copyText(platform.os==='linux'?'sudo apt install ffmpeg':'brew install ffmpeg whisper.cpp'));
   document.querySelector('#restore')?.addEventListener('click',()=>{if(previousResult){text=previousResult.text;resultSaved=previousResult.saved;previousResult=null;render();}});
   document.querySelectorAll<HTMLAnchorElement>('a[href^="https://"]').forEach(anchor=>anchor.onclick=event=>{event.preventDefault();openExternal(anchor.href).catch(error=>notice(errorText(error),true));});
-  bindSettings();bindUpdates();bindTransfers(active);bindArchive();bindOrg();
+  bindSettings();bindUpdates();bindArchive();bindOrg();
 }
 function setSidebar(collapsed:boolean) {sidebarCollapsed=collapsed;localStorage.setItem('hearfolio-sidebar',collapsed?'collapsed':'expanded');render();}
 let recordActionsDialog:HTMLDialogElement|null=null;
@@ -709,9 +707,9 @@ function openRecordActions(){
   const entry=active,transcript=text,trigger=document.querySelector<HTMLElement>('#record-share');
   const dialog=document.createElement('dialog');recordActionsDialog=dialog;dialog.className='record-actions-dialog';dialog.id='record-actions-dialog';trigger?.setAttribute('aria-expanded','true');dialog.setAttribute('aria-labelledby','record-actions-title');
   const action=(name:string,label:string,glyph:string)=>`<button type="button" data-record-action="${name}">${icon(glyph)}<span>${tr(label)}</span></button>`;
-  dialog.innerHTML=`<div class="record-actions-heading"><h2 id="record-actions-title">${tr('Поделиться')}</h2><button type="button" class="icon-button" data-actions-close aria-label="${tr('Закрыть')}">${icon('close')}</button></div><div class="record-actions-group">${action('share-audio','Поделиться аудио','share')}${transcript.trim()?action('share-text','Поделиться текстом','file'):''}${!busy?action('device','На другое устройство','devices'):''}${hasOrganizations()?action('organization','Копировать в организацию','cloud'):''}</div><div class="record-actions-group">${action('save-audio','Сохранить аудио','download')}${transcript.trim()?action('save-text','Сохранить текст','download')+action('copy-text','Копировать текст','copy'):''}</div>`;
+  dialog.innerHTML=`<div class="record-actions-heading"><h2 id="record-actions-title">${tr('Поделиться')}</h2><button type="button" class="icon-button" data-actions-close aria-label="${tr('Закрыть')}">${icon('close')}</button></div><div class="record-actions-group">${action('share-audio','Поделиться аудио','share')}${transcript.trim()?action('share-text','Поделиться текстом','file'):''}${hasOrganizations()?action('organization','Копировать в организацию','cloud'):''}</div><div class="record-actions-group">${action('save-audio','Сохранить аудио','download')}${transcript.trim()?action('save-text','Сохранить текст','download')+action('copy-text','Копировать текст','copy'):''}</div>`;
   dialog.querySelector('[data-actions-close]')?.addEventListener('click',()=>dialog.close());
-  dialog.querySelectorAll<HTMLElement>('[data-record-action]').forEach(button=>button.onclick=()=>{const choice=button.dataset.recordAction;dialog.close();if(choice==='device'){shareRecordingToDevice(entry);return;}if(choice==='organization'){void copyToOrganization(entry,displayName(entry));return;}const operation=choice==='share-audio'?shareAudio(entry):choice==='save-audio'?saveAudio(entry):choice==='share-text'?shareText(entry.name,transcript):choice==='save-text'?exportText(recordNameParts(entry.name,entry.inputPath).title.replace(/[\/\\:\u0000-\u001f]/g,'-')+'.txt',transcript):copyText(transcript);void operation.catch(error=>notice(errorText(error),true));});
+  dialog.querySelectorAll<HTMLElement>('[data-record-action]').forEach(button=>button.onclick=()=>{const choice=button.dataset.recordAction;dialog.close();if(choice==='organization'){void copyToOrganization(entry,displayName(entry));return;}const operation=choice==='share-audio'?shareAudio(entry):choice==='save-audio'?saveAudio(entry):choice==='share-text'?shareText(entry.name,transcript):choice==='save-text'?exportText(recordNameParts(entry.name,entry.inputPath).title.replace(/[\/\\:\u0000-\u001f]/g,'-')+'.txt',transcript):copyText(transcript);void operation.catch(error=>notice(errorText(error),true));});
   dialog.addEventListener('click',event=>{if(event.target===dialog){const rect=dialog.getBoundingClientRect();if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)dialog.close();}});
   dialog.addEventListener('close',()=>{dialog.remove();if(recordActionsDialog===dialog)recordActionsDialog=null;trigger?.setAttribute('aria-expanded','false');if(trigger?.isConnected)trigger.focus({preventScroll:true});});
   document.body.append(dialog);dialog.showModal();dialog.querySelector<HTMLElement>('[data-record-action]')?.focus();
@@ -821,17 +819,6 @@ async function loadCloudModels() {
   finally{cloudLoading=false;render();if(url!==settings.openrouterUrl)void loadCloudModels();else if(catalogOpen&&!platform.mobile&&window.innerWidth>760)document.querySelector<HTMLInputElement>('#catalog-search')?.focus();}
 }
 function sortHistory(entries:Entry[]) {return entries.sort((left,right)=>right.createdAt-left.createdAt);}
-async function refreshAfterTransfer() {
-  await refreshHistory();
-  // A running job owns the open record; refreshing it would replace streamed text and close the model picker.
-  if(active&&!busy&&!catalogOpen&&(resultSaved||!text)) {
-    try {
-      const detail=await call<{entry:Entry;text:string}>('get_history',{id:active.id});
-      active=detail.entry;restoreConfiguration(detail.entry);text=detail.text;
-      resultSaved=Boolean(detail.entry.outputPath&&detail.text);previousResult=null;render();
-    } catch(error) {notice(errorText(error),true);}
-  }
-}
 async function refreshUnfinished() {try{unfinished=new Map((await call<{id:string;done:number;total:number}[]>('unfinished_transcriptions')).map(item=>[item.id,{done:item.done,total:item.total}]));}catch{/* The list still works without this hint. */}}
 async function refreshHistory() {try{history=sortHistory(await call<Entry[]>('list_history'));historyError='';}catch(error){historyError=errorText(error);}await refreshUnfinished();loading=false;render();}
 async function refreshRuntime() {
@@ -1003,7 +990,7 @@ async function renameEntry(id:string) {
 async function deleteEntry(id:string) {
   if(busy)return;const entry=history.find(item=>item.id===id);if(!entry)return;
   if(active?.id===id&&text&&!resultSaved&&!await mayReplaceRecord(false))return;
-  if(!await confirmAction(tr("Удалить запись?"),`«${entry.name}${tr("» и её расшифровка будут удалены из архива. Исходный файл останется на месте.")}`,tr("Удалить запись")))return;
+  if(!await confirmAction(tr("Удалить запись?"),`«${displayName(entry)}${tr("» и её расшифровка будут удалены из архива. Исходный файл останется на месте.")}`,tr("Удалить запись")))return;
   try{await call('delete_history',{id});history=history.filter(item=>item.id!==id);if(active?.id===id){resetPlayback();active=null;text='';outputTab='transcript';resultSaved=false;previousResult=null;if(platform.mobile)view='history';}render();}
   catch(error){notice(`${tr("Не удалось удалить запись: ")}${errorText(error)}`,true);}
 }
@@ -1088,9 +1075,9 @@ async function initialize() {
   await refreshLoose();if(loose.length&&!status)notice(`${tr('Не обработано записей:')} ${loose.length}. ${tr('Они в «Архиве».')}`,true);
   if(!preview)void checkUpdates();
 }
+installSelects();
 void initialize();
 void initOrg({render:()=>render(),notice,confirm:(heading,message,action,danger)=>confirmAction(heading,message,action,danger),openDetail:()=>{settingsDraft=null;view='cloud';if(window.innerWidth<=760&&!platform.mobile)sidebarCollapsed=true;render();},closeDetail:()=>{closeOrgDetail();view=platform.mobile?'history':'work';render();},mobile:()=>platform.mobile,android:()=>platform.os==='android'&&!preview,busy:()=>busy||recordingPhase!=='idle',searchText:()=>search,openLocal:entry=>{history=sortHistory([entry,...history.filter(item=>item.id!==entry.id)]);void loadHistory(entry.id);}}).then(()=>render());
-void initializeTransfers({refresh:refreshAfterTransfer,busy:()=>busy,setBusy:value=>{busy=value;render();},notice,confirm:(heading,message)=>confirmAction(heading,message,tr("Отключить"))});
 subscribe<null>('hearfolio-request-restart',()=>{void restartAfterUpdate(false);}).catch(error=>notice(errorText(error),true));
 setInterval(()=>{if(!preview&&Date.now()-lastUpdateCheck>=4*60*60*1000)void checkUpdates();},4*60*60*1000);
 document.addEventListener('visibilitychange',()=>{if(!preview&&document.visibilityState==='visible'&&Date.now()-lastUpdateCheck>=4*60*60*1000)void checkUpdates();});
@@ -1129,7 +1116,7 @@ document.addEventListener('keydown',event=>{
   if(key==='b'){event.preventDefault();setSidebar(!sidebarCollapsed);}
 });
 window.addEventListener('unhandledrejection',event=>{const reason=event.reason instanceof Error?event.reason.message:String(event.reason??'');if(reason.startsWith('errors.')){event.preventDefault();notice(errorText(reason),true);}});
-window.addEventListener('beforeunload',event=>{if(settingsDraft||settingsSaving||hasTransferDraft()||hasRuleDraft()||pendingRecording||busy||(text&&!resultSaved))event.preventDefault();});
+window.addEventListener('beforeunload',event=>{if(settingsDraft||settingsSaving||hasRuleDraft()||pendingRecording||busy||(text&&!resultSaved))event.preventDefault();});
 
 function updateCatalogViewport(){const viewport=window.visualViewport;document.documentElement.style.setProperty('--catalog-height',`${viewport?.height||window.innerHeight}px`);document.documentElement.style.setProperty('--catalog-top',`${viewport?.offsetTop||0}px`);}
 updateCatalogViewport();window.visualViewport?.addEventListener('resize',updateCatalogViewport);window.visualViewport?.addEventListener('scroll',updateCatalogViewport);window.addEventListener('resize',updateCatalogViewport);

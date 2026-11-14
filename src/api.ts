@@ -23,7 +23,7 @@ export type Progress = { kind: 'download' | 'transcribe' | 'postprocess' | 'impo
 export type Settings = {language:LanguagePreference;systemLanguage:'ru'|'en';openrouterUrl:string;hasToken:boolean;storageParent:string;storagePath:string;lastConfiguration:RecognitionConfig;chunkSeconds?:number};
 export type CloudModel = {id:string;name:string;modes:('streaming'|'transcription')[];preferredMode:'streaming'|'transcription'};
 export type RuntimePlatform = 'android'|'macos'|'linux'|'windows'|'ios'|'unknown';
-export type RuntimeCapabilities={transferMvp?:boolean;os:RuntimePlatform;mobile:boolean;localRecognition:boolean;customStorage:boolean;nativeAudio:boolean;audioRecording:boolean};
+export type RuntimeCapabilities={os:RuntimePlatform;mobile:boolean;localRecognition:boolean;customStorage:boolean;nativeAudio:boolean;audioRecording:boolean};
 export type AudioSelection={path:string;name?:string|null};
 export type AndroidRelease = {version:string;url:string;notes?:string;pub_date?:string;sha256?:string};
 export const preview = import.meta.env.DEV && !('__TAURI_INTERNALS__' in window);
@@ -76,18 +76,13 @@ export function observePendingOperation(snapshot:OperationSnapshot) {
 export type PartialTextEvent={text:string;recordId:string|null;operationId:string|null};
 /** Result of `cloud_resume_state`: committed cloud chunks of an unfinished attempt. */
 export type CloudResume={done:number;total:number;configuration:RecognitionConfig};
-export type TransferSnapshot={id?:string;direction?:'send'|'receive';state:'idle'|'running'|'finished'|'error'|'interrupted';stage?:string;current?:number;total?:number;error?:string|null;recordId?:string|null;result?:Entry|null};
-function transferOperation(snapshot:TransferSnapshot):OperationSnapshot{return {...snapshot,kind:snapshot.direction==='send'?'transfer_send':'transfer_receive',recordId:null};}
-export function observePendingTransfer(snapshot:TransferSnapshot){return observePendingOperation(transferOperation(snapshot));}
 async function invokeOperation<T>(command:string,args:Record<string,unknown>):Promise<T> {
-  const transfer=command==='transfer_send'||command==='transfer_receive';
-  const kind=command==='transcribe'?'transcribe':command==='apply_postprocess'?'postprocess':command==='import_audio'?'import':transfer?command:null;
+  const kind=command==='transcribe'?'transcribe':command==='apply_postprocess'?'postprocess':command==='import_audio'?'import':null;
   if(nativePlatform?.os!=='android'||!kind)return invoke<T>(command,args);
-  const snapshotCommand=transfer?'transfer_activity_snapshot':'operation_activity_snapshot';
-  const readSnapshot=()=>invoke<OperationSnapshot|TransferSnapshot>(snapshotCommand).then(snapshot=>transfer?transferOperation(snapshot as TransferSnapshot):snapshot as OperationSnapshot).catch(()=>null);
+  const readSnapshot=()=>invoke<OperationSnapshot>('operation_activity_snapshot').catch(()=>null);
   const before=await readSnapshot();
   return new Promise<T>((resolve,reject)=>{
-    const recordId=kind==='import'||transfer?null:String(args.id||'');
+    const recordId=kind==='import'?null:String(args.id||'');
     const request:Parameters<OperationMailbox['begin']>[0]={kind,recordId,excludedId:before?.id||'',resolve:value=>resolve(value as T),reject};
     const release=operationMailbox.begin(request);
     const finish=async(value:T|undefined,error?:unknown)=>{

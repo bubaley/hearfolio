@@ -4,7 +4,7 @@
 // module renders state and forwards user intent.
 import './org.css';
 import {convertFileSrc} from '@tauri-apps/api/core';
-import {call as nativeCall, preview, subscribe, type Entry} from './api';
+import {call as nativeCall, preview, subscribe, shareText, exportText, type Entry} from './api';
 import {errorText, locale, currentLanguage} from './i18n';
 import {icon, escapeHtml as esc} from './icons';
 import {mergeRows, uploadStatus, recordingStatus, RETENTION_CHOICES, type UploadView, type CloudRecording, type Row, type Status} from './org-status';
@@ -82,6 +82,8 @@ export function orgErrorText(error:unknown):string {
 // `?org=1` in the Vite preview: a connected demo organization with recordings in every state.
 const previewOrg=preview&&new URLSearchParams(location.search).get('org')==='1';
 let previewState:OrgState|null=null;
+// The preview "server": list responses never carry the transcript, the detail does.
+let previewItems:CloudRecording[]=[];
 function previewFixture():OrgState {
   const now=Date.now(),iso=(ms:number)=>new Date(ms).toISOString();
   const connection:Connection={id:'conn-demo',server:'https://cloud.example.com',serverName:'Hearfolio',serverVersion:'1.0.0',user:{id:'u1',email:'anna@example.com',name:'Анна'},organizations:[{id:'org-1',name:'Acme',key:'acme',role:'admin'},{id:'org-2',name:'Studio',key:'studio',role:'member'}],createdAt:now,secure:true,needsReauth:false};
@@ -90,11 +92,15 @@ function previewFixture():OrgState {
     {id:'r2',title:'Интервью с клиентом',recorded_at:iso(now-86400_000),duration_ms:2710_000,status:'transcribed',project:null,tags:[{id:'t2',name:'клиенты',color:'green'},{id:'t3',name:'исследование',color:'purple'}],visibility:'personal',transcript_words:4120,results_count:1,transcript_text:'Добрый день. Расскажите, как вы сейчас ведёте заметки после встреч?\n\nСейчас мы записываем на телефон, а потом кто-то вручную расшифровывает — это занимает полдня.'},
     {id:'r3',title:'Созвон с подрядчиком',recorded_at:iso(now-3*86400_000),duration_ms:600_000,status:'failed',error_message:'Модель не ответила. Повторите.',visibility:'organization',transcript_words:0},
   ];
-  libraries.set(libraryKey('conn-demo','org-1'),{items,syncedAt:now,loading:false,error:''});
+  previewItems=items;
+  libraries.set(libraryKey('conn-demo','org-1'),{items:items.map(item=>({...item,transcript_text:undefined})),syncedAt:now,loading:false,error:''});
   projects.set(libraryKey('conn-demo','org-1'),[{id:'p1',name:'Релиз 2.0',emoji:'🚀'},{id:'p2',name:'Исследования',emoji:'🔎',is_private:true}]);
   const uploads:UploadView[]=[
     {clientId:'u-1',connectionId:'conn-demo',organizationId:'org-1',remoteId:null,displayName:say('Запись','Recording')+' 13.11 10.05',recordedAt:now-120_000,durationMs:300_000,size:9_400_000,uploaded:4_230_000,phase:'uploading',error:null,waitingNetwork:false,nextAttemptAt:0,projectId:'p1',visibility:'organization',localRecordId:null,hasTranscript:false,createdAt:now},
     {clientId:'u-2',connectionId:'conn-demo',organizationId:'org-1',remoteId:null,displayName:say('Запись','Recording')+' 13.11 09.40',recordedAt:now-1800_000,durationMs:90_000,size:2_100_000,uploaded:0,phase:'failed',error:'errors.orgServer',waitingNetwork:false,nextAttemptAt:0,projectId:null,visibility:'organization',localRecordId:null,hasTranscript:false,createdAt:now-1},
+    {clientId:'u-3',connectionId:'conn-demo',organizationId:'org-1',remoteId:null,displayName:say('Запись','Recording')+' 13.11 09.12',recordedAt:now-2400_000,durationMs:754_000,size:12_800_000,uploaded:0,phase:'queued',error:null,waitingNetwork:false,nextAttemptAt:0,projectId:null,visibility:'organization',localRecordId:null,hasTranscript:false,createdAt:now-2},
+    {clientId:'u-4',connectionId:'conn-demo',organizationId:'org-1',remoteId:null,displayName:say('Интервью с очень длинным названием, которое не помещается в строку','An interview with a very long title that does not fit on one line'),recordedAt:now-3000_000,durationMs:3_905_000,size:61_000_000,uploaded:18_000_000,phase:'uploading',error:null,waitingNetwork:true,nextAttemptAt:0,projectId:'p2',visibility:'personal',localRecordId:null,hasTranscript:false,createdAt:now-3},
+    {clientId:'u-5',connectionId:'conn-demo',organizationId:'org-1',remoteId:null,displayName:say('Запись','Recording')+' 12.11 18.30',recordedAt:now-4000_000,durationMs:61_000,size:1_400_000,uploaded:0,phase:'uploading',error:'errors.orgStorageRejected',waitingNetwork:false,nextAttemptAt:now+60_000,projectId:null,visibility:'organization',localRecordId:null,hasTranscript:false,createdAt:now-4},
   ];
   return {connections:[connection],settings:{destination:{connectionId:'conn-demo',organizationId:'org-1',projectId:'p1',visibility:'organization'},retentionDays:30},uploads,cache:{files:4,bytes:57_000_000}};
 }
@@ -108,8 +114,8 @@ async function call<T>(command:string,args:Record<string,unknown>={}):Promise<T>
     case 'org_set_retention':s.settings.retentionDays=args.days as number|null;return structuredClone(s) as T;
     case 'org_clear_cache':s.cache={files:0,bytes:0};return structuredClone(s) as T;
     case 'org_projects':await wait(200);return (projects.get(libraryKey(String(args.connectionId),String(args.organizationId)))||[]) as T;
-    case 'org_library':case 'org_sync':{await wait(command==='org_sync'?400:0);const library=libraries.get(libraryKey(String(args.connectionId),String(args.organizationId)));return {items:library?.items.map(item=>({...item,transcript_text:undefined}))||[],syncedAt:Date.now()} as T;}
-    case 'org_recording':{await wait(150);const item=libraries.get(libraryKey(String(args.connectionId),String(args.organizationId)))?.items.find(row=>row.id===args.recordingId);return (item?{recording:item,results:item.id==='r2'?[{id:'res1',title:say('Краткое содержание','Summary'),status:'done',content:say('Клиент тратит полдня на ручную расшифровку встреч. Главная боль — потеря договорённостей.','The client spends half a day transcribing meetings by hand. The main pain is lost agreements.'),model:'google/gemini-2.5-flash'}]:[],audioCached:false,offline:null}:null) as T;}
+    case 'org_library':case 'org_sync':{await wait(command==='org_sync'?400:0);return {items:String(args.organizationId)==='org-1'?previewItems.map(item=>({...item,transcript_text:undefined})):[],syncedAt:Date.now()} as T;}
+    case 'org_recording':{await wait(150);const item=previewItems.find(row=>row.id===args.recordingId);return (item?{recording:{...item},results:item.id==='r2'?[{id:'res1',title:say('Краткое содержание','Summary'),status:'done',content:say('Клиент тратит полдня на ручную расшифровку встреч. Главная боль — потеря договорённостей.','The client spends half a day transcribing meetings by hand. The main pain is lost agreements.'),model:'google/gemini-2.5-flash'}]:[],audioCached:false,offline:null}:null) as T;}
     case 'org_connect_start':{await wait(500);const server=String(args.server).trim();if(!server||server.includes(' '))throw new Error('errors.orgUrlInvalid');if(server.startsWith('http://')&&!/localhost|127\.0\.0\.1/.test(server))throw new Error('errors.orgUrlInsecure');
       setTimeout(()=>{previewState=previewFixture();previewEmit('org-connection',{state:'connected',flow:'preview',connection:previewState.connections[0]});},1500);return {state:'preview',redirect:'deepLink'} as T;}
     case 'org_connect_cancel':return undefined as T;
@@ -119,7 +125,7 @@ async function call<T>(command:string,args:Record<string,unknown>={}):Promise<T>
     case 'org_cancel_upload':s.uploads=s.uploads.filter(item=>item.clientId!==args.clientId);return undefined as T;
     case 'org_enqueue_record':{const destination=args.destination as Destination,view:UploadView={clientId:crypto.randomUUID(),connectionId:destination.connectionId,organizationId:destination.organizationId,remoteId:null,displayName:say('Новая запись','New recording'),recordedAt:Date.now(),durationMs:3000,size:3_000_000,uploaded:0,phase:'queued',error:null,waitingNetwork:false,nextAttemptAt:0,projectId:destination.projectId,visibility:destination.visibility,localRecordId:null,hasTranscript:false,createdAt:Date.now()};s.uploads.push(view);simulateUpload(view.clientId);return structuredClone(view) as T;}
     case 'org_audio':throw new Error('errors.orgOffline');
-    case 'org_retry_recording':{const item=libraries.get(libraryKey(String(args.connectionId),String(args.organizationId)))?.items.find(row=>row.id===args.recordingId);if(item){item.status='queued';item.error_message=null;}return item as T;}
+    case 'org_retry_recording':{const item=previewItems.find(row=>row.id===args.recordingId);if(item){item.status='queued';item.error_message=null;}return item as T;}
     case 'org_wake':return undefined as T;
     default:throw new Error(`Preview command unavailable: ${command}`);
   }
@@ -178,7 +184,7 @@ function rerender(){
 }
 function patchUpload(upload:UploadView){
   const status=uploadStatus(upload,say);
-  document.querySelectorAll<HTMLElement>(`[data-upload-status="${CSS.escape(upload.clientId)}"]`).forEach(element=>{if(element.textContent!==status.label)element.textContent=status.label;});
+  document.querySelectorAll<HTMLElement>(`[data-upload-status="${CSS.escape(upload.clientId)}"]`).forEach(element=>{if(element.textContent!==status.label){element.textContent=status.label;element.closest('.record-state')?.setAttribute('title',status.label);}});
   document.querySelectorAll<HTMLElement>(`[data-upload-bar="${CSS.escape(upload.clientId)}"]`).forEach(element=>element.style.width=`${status.percent??0}%`);
 }
 async function refreshVisible(){
@@ -209,7 +215,8 @@ export function sourceTabsHtml():string {
   return `<div class="source-tabs" role="tablist" aria-label="${say('Где хранятся записи','Where recordings are')}">${tabs.map(tab=>`<button type="button" role="tab" class="source-tab" data-org-source="${esc(tab.id)}" aria-selected="${source===tab.id}">${tab.id==='local'?icon('file'):icon('cloud')}<span>${esc(tab.label)}</span>${tab.count?`<small class="source-count">${tab.count}</small>`:''}</button>`).join('')}</div>`;
 }
 function statusChip(status:Status,clientId?:string):string {
-  return `<span class="record-state org-state tone-${status.tone}" ${clientId?`data-upload-status="${esc(clientId)}"`:''}>${status.tone==='progress'?'<i aria-hidden="true"></i>':''}${esc(status.label)}</span>`;
+  // The label sits in its own element so live updates keep the status dot.
+  return `<span class="record-state org-state tone-${status.tone}" title="${esc(status.label)}">${status.tone==='progress'?'<i aria-hidden="true"></i>':''}<span ${clientId?`data-upload-status="${esc(clientId)}"`:''}>${esc(status.label)}</span></span>`;
 }
 function rows():Row[] {
   const current=cloudSource();if(!current)return [];
@@ -225,13 +232,14 @@ export function cloudListHtml():string {
   const offline=library?.error?`<div class="org-inline-note">${esc(library.error)}</div>`:'';
   if(!list.length){
     if(library?.loading||!library)return `${reauth}<div class="list-empty"><span class="spinner"></span>${say('Загружаем записи…','Loading recordings…')}</div>`;
-    return `${reauth}${offline}<div class="list-empty first-run"><strong>${query?say('Записи не найдены','No recordings found'):say('Здесь пока пусто','Nothing here yet')}</strong>${query?'':`<span>${say('Выберите эту организацию в «Куда записываем» — новые записи загрузятся сюда.','Choose this organization under “Record to” — new recordings will upload here.')}</span>`}</div>`;
+    return `${reauth}${offline}<div class="list-empty first-run"><span class="empty-symbol" aria-hidden="true">${icon('cloud')}</span><strong>${query?say('Записи не найдены','No recordings found'):say('Здесь пока пусто','Nothing here yet')}</strong>${query?'':`<span>${say('Выберите эту организацию в «Куда записываем» — новые записи загрузятся сюда.','Choose this organization under “Record to” — new recordings will upload here.')}</span>`}</div>`;
   }
   const selected=open?.recordingId||open?.clientId;
   return `${reauth}${offline}${list.map(row=>{
-    const id=row.item?.id||'',client=row.upload?.clientId||'',meta=[dateLabel(row.recordedAt),timeLabel(row.durationMs),row.item?.project?`${row.item.project.emoji||''} ${row.item.project.name}`.trim():''].filter(Boolean);
+    // A long status leaves no room for the date (the detail screen has it); a clipped date is worse than none.
+    const id=row.item?.id||'',client=row.upload?.clientId||'',date=row.status.label.length<=(ctx.mobile()?22:10)?dateLabel(row.recordedAt):'',duration=timeLabel(row.durationMs),project=row.item?.project?`${row.item.project.emoji||''} ${row.item.project.name}`.trim():'';
     const bar=row.status.tone==='progress'&&row.upload?`<span class="org-row-bar" aria-hidden="true"><i data-upload-bar="${esc(client)}" style="width:${row.status.percent??0}%"></i></span>`:'';
-    return `<div class="record-row org-row ${selected&&(selected===id||selected===client)?'selected':''}"><button class="record-link" data-org-open="${esc(id)}" data-org-client="${esc(client)}"><span class="record-title">${esc(row.title)}</span><span class="record-detail">${meta.map(part=>`<span>${esc(part)}</span>`).join('')}${row.item?.visibility==='personal'?`<span>${say('Личная','Personal')}</span>`:''}</span>${bar}</button>${statusChip(row.status,row.upload&&row.upload.phase!=='done'?client:undefined)}</div>`;
+    return `<div class="record-row org-row ${selected&&(selected===id||selected===client)?'selected':''}"><button class="record-link" data-org-open="${esc(id)}" data-org-client="${esc(client)}"><span class="record-title">${esc(row.title)}</span><span class="record-detail">${statusChip(row.status,row.upload&&row.upload.phase!=='done'?client:undefined)}${date?`<span class="record-date">${esc(date)}</span>`:''}${duration?`<span>${esc(duration)}</span>`:''}${project?`<span class="record-extra">${esc(project)}</span>`:''}${row.item?.visibility==='personal'?`<span class="record-extra">${say('Личная','Personal')}</span>`:''}</span>${bar}</button></div>`;
   }).join('')}${library?.loading?`<div class="org-list-sync"><span class="spinner"></span>${say('Обновляем…','Refreshing…')}</div>`:''}`;
 }
 
@@ -276,6 +284,33 @@ function audioHtml():string {
   if(audio?.loading)return `<div class="audio-bar org-audio-loading"><span class="spinner"></span><span>${say('Загружаем аудио','Loading audio')} <span data-org-audio-progress>${audio.progress?`${audio.progress}%`:''}</span></span></div>`;
   return `<div class="audio-bar org-audio-actions"><button type="button" class="secondary" id="org-play">${icon('play')}<span>${detail?.audioCached?say('Слушать','Listen'):say('Слушать онлайн','Stream audio')}</span></button>${audio?.error?`<span class="org-muted" role="alert">${esc(audio.error)}</span>`:detail?.audioCached?`<span class="org-muted">${say('Сохранено на устройстве','Saved on this device')}</span>`:''}</div>`;
 }
+/**
+ * Actions of the open cloud recording: the phone shows them in the app bar, the
+ * desktop in the record header. Renaming and deleting stay in the web version.
+ */
+export function detailToolsHtml(compact:boolean):string {
+  if(!open||!detail?.recording.transcript_text)return '';
+  const label=say('Поделиться','Share');
+  return compact?`<button type="button" class="icon-button" id="org-share" aria-haspopup="dialog" aria-label="${label}">${icon('share')}</button>`:`<button type="button" class="secondary" id="org-share" aria-haspopup="dialog">${icon('share')}<span>${label}</span></button>`;
+}
+let actionsDialog:HTMLDialogElement|null=null;
+function openDetailActions(){
+  const transcript=detail?.recording.transcript_text||'';if(!transcript||actionsDialog?.open)return;
+  const title=detailTitle(),trigger=document.querySelector<HTMLElement>('#org-share');
+  const dialog=document.createElement('dialog');actionsDialog=dialog;dialog.className='record-actions-dialog';dialog.setAttribute('aria-labelledby','org-actions-title');
+  const action=(name:string,label:string,glyph:string)=>`<button type="button" data-org-action="${name}">${icon(glyph)}<span>${label}</span></button>`;
+  dialog.innerHTML=`<div class="record-actions-heading"><h2 id="org-actions-title">${say('Поделиться','Share')}</h2><button type="button" class="icon-button" data-close aria-label="${say('Закрыть','Close')}">${icon('close')}</button></div><div class="record-actions-group">${action('share',say('Поделиться текстом','Share text'),'share')}${action('save',say('Сохранить текст','Save text'),'download')}${action('copy',say('Копировать текст','Copy text'),'copy')}</div>`;
+  dialog.querySelector('[data-close]')?.addEventListener('click',()=>dialog.close());
+  dialog.querySelectorAll<HTMLElement>('[data-org-action]').forEach(button=>button.onclick=()=>{
+    const choice=button.dataset.orgAction;dialog.close();
+    const done=choice==='share'?shareText(title,transcript):choice==='save'?exportText(title.replace(/[\/\\:\u0000-\u001f]/g,'-')+'.txt',transcript):copyTranscript(transcript);
+    void done.catch(error=>ctx.notice(errorText(error),true));
+  });
+  dialog.addEventListener('click',event=>{if(event.target===dialog){const rect=dialog.getBoundingClientRect();if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)dialog.close();}});
+  dialog.addEventListener('close',()=>{dialog.remove();if(actionsDialog===dialog)actionsDialog=null;if(trigger?.isConnected)trigger.focus({preventScroll:true});});
+  document.body.append(dialog);dialog.showModal();dialog.querySelector<HTMLElement>('[data-org-action]')?.focus();
+}
+async function copyTranscript(value:string){try{await navigator.clipboard.writeText(value);ctx.notice(say('Скопировано','Copied'));}catch{ctx.notice(say('Не удалось скопировать','Could not copy'),true);}}
 export function cloudDetailHtml():string {
   if(!open)return '';
   const upload=openUpload(),recording=detail?.recording,pendingUpload=upload&&upload.phase!=='done'?upload:null;
@@ -304,7 +339,7 @@ export function cloudDetailHtml():string {
     :transcript?`<article class="transcript" lang="${esc(recording.language||currentLanguage())}">${esc(transcript)}</article>`
     :`<div class="org-empty">${recording.status==='failed'?say('Расшифровка не получилась.','Transcription failed.'):say('Текст появится после расшифровки.','Text will appear after transcription.')}</div>`;
   const offline=detail?.offline?`<div class="org-inline-note">${esc(orgErrorText(detail.offline))}</div>`:'';
-  return `<section class="workspace org-detail"><header class="record-header"><div class="record-heading"><div class="record-name-row"><h1>${esc(detailTitle())}</h1></div><div class="record-meta">${meta.map(part=>`<span>${esc(part)}</span>`).join('')}</div>${tags}</div></header>${offline}${banner}${audioHtml()}${tabs}<div class="transcript-scroll">${body}</div></section>`;
+  return `<section class="workspace org-detail"><header class="record-header"><div class="record-heading"><div class="record-name-row"><h1>${esc(detailTitle())}</h1></div><div class="record-meta">${meta.map(part=>`<span>${esc(part)}</span>`).join('')}</div>${tags}</div>${ctx.mobile()?'':`<div class="record-tools">${detailToolsHtml(false)}</div>`}</header>${offline}${banner}${audioHtml()}${tabs}<div class="transcript-scroll">${body}</div></section>`;
 }
 
 // ---------------------------------------------------------------- audio
@@ -345,6 +380,12 @@ export function destinationChipHtml(compact=false):string {
   if(!hasOrganizations())return '';
   const cloud=Boolean(state.settings.destination);
   return `<button type="button" class="destination-chip ${cloud?'is-cloud':''} ${compact?'compact':''}" data-org-destination aria-haspopup="dialog" ${ctx.busy()?'disabled':''}><span class="destination-label">${say('Куда','To')}</span>${icon(cloud?'cloud':'file')}<span class="destination-value">${esc(destinationLabel())}</span>${icon('chevron')}</button>`;
+}
+/** The same choice as a slot of the phone's bottom dock, opposite "File". */
+export function destinationDockHtml():string {
+  if(!hasOrganizations())return '';
+  const value=state.settings.destination,org=value?organization(value.connectionId,value.organizationId).organization:null;
+  return `<button type="button" class="dock-side dock-destination ${org?'is-cloud':''}" data-org-destination aria-haspopup="dialog" aria-label="${esc(`${say('Куда записываем','Record to')}: ${destinationLabel()}`)}" ${ctx.busy()?'disabled':''}>${icon(org?'cloud':'file')}<span>${esc(org?org.name:say('Устройство','Device'))}</span></button>`;
 }
 async function ensureProjects(connectionId:string,organizationId:string){
   const key=libraryKey(connectionId,organizationId);if(projects.has(key))return projects.get(key)!;
@@ -460,7 +501,8 @@ export function bindOrg(){
   document.querySelector('#org-play')?.addEventListener('click',()=>{void playAudio();});
   document.querySelector('#org-native-play')?.addEventListener('click',async()=>{try{if(nativePlaying)await nativeCall('pause_native_playback');else await nativeCall('play_native_playback');nativePlaying=!nativePlaying;rerender();}catch(error){ctx.notice(errorText(error),true);}});
   document.querySelectorAll<HTMLElement>('[data-org-tab]').forEach(button=>button.onclick=()=>{detailTab=button.dataset.orgTab as typeof detailTab;ctx.render();});
-  document.querySelector('#org-copy')?.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(detail?.recording.transcript_text||'');ctx.notice(say('Скопировано','Copied'));}catch{ctx.notice(say('Не удалось скопировать','Could not copy'),true);}});
+  document.querySelector('#org-copy')?.addEventListener('click',()=>{void copyTranscript(detail?.recording.transcript_text||'');});
+  document.querySelector('#org-share')?.addEventListener('click',openDetailActions);
   const form=document.querySelector<HTMLFormElement>('#org-connect-form');
   form?.addEventListener('input',()=>{serverDraft=String(new FormData(form).get('server')||'');});
   form?.addEventListener('submit',event=>{event.preventDefault();void connect(String(new FormData(form).get('server')||''));});

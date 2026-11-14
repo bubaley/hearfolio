@@ -11,7 +11,6 @@ mod records;
 mod restart;
 mod resume;
 mod storage;
-mod transfer;
 use cloud::RecognitionConfig;
 use records::{
     delete_entries_at, read_history_at, rename_entry_at, save_transcript_at,
@@ -726,7 +725,6 @@ fn import_audio_with_id(
     }
     let entry = HistoryEntry {
         id,
-        transfer_source_id: None,
         name,
         input_path: target.to_string_lossy().into_owned(),
         output_path: None,
@@ -1107,7 +1105,7 @@ fn stream_nemotron(
         };
         let mut chunk = [0u8; 32_000];
         let mut sent = 0u64;
-        let transfer = Instant::now();
+        let sending = Instant::now();
         loop {
             background::check_current()?;
             let n = reader
@@ -1126,7 +1124,7 @@ fn stream_nemotron(
                 "progress.streamRecognition",
                 sent,
                 total,
-                transfer.elapsed().as_secs(),
+                sending.elapsed().as_secs(),
             );
             loop {
                 match socket.read() {
@@ -1162,7 +1160,7 @@ fn stream_nemotron(
                 "progress.finishRecognition",
                 0,
                 0,
-                transfer.elapsed().as_secs(),
+                sending.elapsed().as_secs(),
             );
         }
         if !finished.get() {
@@ -1225,6 +1223,31 @@ fn remove_interrupted_scratch(root: &Path, now: SystemTime) {
             && (name.contains("-compact-") || name.ends_with("-import.audio"))
         {
             let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+/// Device-to-device transfer was removed from the app. Whatever an older
+/// version left behind (partial incoming files can be large, saved pairings
+/// hold tokens) is deleted; nothing reads these files any more.
+fn remove_retired_transfer_files(root: &Path) {
+    for entry in fs::read_dir(root.join("temp"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let retired = name.starts_with("transfer-")
+            || name.starts_with("inbox-")
+            || name == "lan-network-state.json"
+            || name == "background-transfer-result.json";
+        if retired && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    if let Ok(config) = storage::config_dir() {
+        for name in ["transfer.json", "transfer-local.json"] {
+            let _ = fs::remove_file(config.join(name));
         }
     }
 }
@@ -1635,8 +1658,6 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init());
     #[cfg(target_os = "android")]
     let builder = builder.plugin(tauri_plugin_recording::init());
-    #[cfg(mobile)]
-    let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
     #[cfg(desktop)]
     let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1652,7 +1673,7 @@ pub fn run() {
                 if !JOB_ACTIVE.load(Ordering::Acquire) {
                     remove_interrupted_scratch(&root, SystemTime::now());
                 }
-                transfer::cleanup_partial_files(&root);
+                remove_retired_transfer_files(&root);
                 app.asset_protocol_scope()
                     .allow_directory(root.join("input"), false)?;
             }
@@ -1660,10 +1681,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            transfer::transfer_discovery,
-            transfer::transfer_api,
-            transfer::transfer_send,
-            transfer::transfer_receive,
             restart::restart_application,
             recording::start_audio_recording,
             recording::append_audio_recording,
@@ -1699,9 +1716,6 @@ pub fn run() {
             model_status,
             list_history,
             import_audio,
-            background::transfer_background,
-            background::transfer_activity_snapshot,
-            background::cancel_transfer_activity,
             recording::recording_activity_snapshot,
             recording::pause_audio_recording,
             recording::resume_audio_recording,
@@ -1755,6 +1769,33 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_removes_what_the_retired_device_transfer_left_behind() {
+        let root = std::env::temp_dir().join(format!("hearfolio-retired-{}", uuid::Uuid::new_v4()));
+        let temp = root.join("temp");
+        fs::create_dir_all(&temp).unwrap();
+        let retired = [
+            "transfer-6f2c1c1e-5a0b-4f58-9f0e-2f4d5a3b1c7d.part",
+            "transfer-parts-abc.part",
+            "transfer-parts-abc.json",
+            "transfer-active.json",
+            "inbox-native.json",
+            "lan-network-state.json",
+            "background-transfer-result.json",
+        ];
+        let kept = ["hearing-1-compact-run.flac", "operation-control-1.json"];
+        for name in retired.iter().chain(&kept) {
+            fs::write(temp.join(name), b"x").unwrap();
+        }
+        remove_retired_transfer_files(&root);
+        for name in retired {
+            assert!(!temp.join(name).exists(), "{name}");
+        }
+        for name in kept {
+            assert!(temp.join(name).exists(), "{name}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn startup_removes_only_the_scratch_of_an_interrupted_job() {
         let root = std::env::temp_dir().join(format!("hearfolio-scratch-{}", uuid::Uuid::new_v4()));

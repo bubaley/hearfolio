@@ -177,7 +177,7 @@ mod tests {
             })
         );
         assert_eq!(parse_callback("hearfolio://oauth/callback?code=abc"), None);
-        assert_eq!(parse_callback("hearfolio-transfer://pair?code=1"), None);
+        assert_eq!(parse_callback("other-scheme://pair?code=1"), None);
         assert_eq!(
             parse_callback("hearfolio://other/callback?code=a&state=b"),
             None

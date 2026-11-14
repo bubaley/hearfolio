@@ -830,7 +830,7 @@ fn android_service(_jobs: &[Job]) {
         if let Some(app) = super::APP.get() {
             let _ = app
                 .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
-                .transfer::<Value>(
+                .invoke::<Value>(
                     "uploadService",
                     json!({"count": active.len(), "current": sent, "total": total}),
                 );

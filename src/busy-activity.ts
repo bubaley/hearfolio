@@ -1,18 +1,17 @@
 // Turns the native "busy" answer into what the user sees: what is running,
 // how far it got, and what can be done about it. Pure, so it is testable.
 export type BusyActivity = {
-  kind: 'idle' | 'transcribe' | 'postprocess' | 'import' | 'recording' | 'transfer' | 'download' | 'storage' | 'archive' | 'restart' | string;
+  kind: 'idle' | 'transcribe' | 'postprocess' | 'import' | 'recording' | 'download' | 'storage' | 'archive' | 'restart' | string;
   seconds?: number;
   stopping?: boolean;
   operation?: {id: string; kind: string; recordId?: string | null; progress?: {stage?: string; current?: number; total?: number} | null} | null;
-  transfer?: {id: string; direction?: string | null} | null;
 };
 export type BusyNotice = {
   message: string;
   /** Where "Open" leads; absent when there is nothing to show. */
-  open?: {target: 'record'; recordId: string} | {target: 'recorder' | 'devices' | 'models' | 'settings'};
+  open?: {target: 'record'; recordId: string} | {target: 'recorder' | 'models' | 'settings'};
   /** What "Stop" stops; absent when the work cannot be stopped safely. */
-  stop?: {target: 'operation'; id: string} | {target: 'recording'} | {target: 'transfer'; id: string};
+  stop?: {target: 'operation'; id: string} | {target: 'recording'};
 };
 
 /** Progress in whole percent, or null while it is not measurable yet. */
@@ -48,14 +47,6 @@ export function describeBusy(activity: BusyActivity, recordName: (id: string) =>
       return {message: `${say('Запись сохраняется в архив', 'A recording is being saved to the archive')}${suffix}. ${say('Это займёт немного времени.', 'This takes a moment.')}`, open, stop};
     case 'recording':
       return {message: say('Идёт запись на диктофон. Завершите её, чтобы продолжить.', 'The recorder is recording. Finish it to continue.'), open: {target: 'recorder'}, stop: {target: 'recording'}};
-    case 'transfer': {
-      const receiving = activity.transfer?.direction === 'receive';
-      return {
-        message: `${receiving ? say('Идёт приём записи с другого устройства.', 'A recording is being received from another device.') : say('Идёт передача записи на другое устройство.', 'A recording is being sent to another device.')} ${waitOrStop}`,
-        open: {target: 'devices'},
-        stop: activity.transfer?.id ? {target: 'transfer', id: activity.transfer.id} : undefined,
-      };
-    }
     case 'download':
       return {message: say('Скачивается модель распознавания. Дождитесь окончания.', 'A transcription model is downloading. Wait for it to finish.'), open: {target: 'models'}};
     case 'storage':

@@ -13,7 +13,6 @@ use tauri_plugin_fs::FsExt;
 #[serde(rename_all = "camelCase")]
 pub struct RuntimePlatform {
     os: &'static str,
-    transfer_mvp: bool,
     mobile: bool,
     local_recognition: bool,
     custom_storage: bool,
@@ -24,7 +23,6 @@ pub struct RuntimePlatform {
 pub fn get_runtime_platform() -> RuntimePlatform {
     RuntimePlatform {
         os: std::env::consts::OS,
-        transfer_mvp: cfg!(feature = "transfer-mvp"),
         mobile: cfg!(mobile),
         local_recognition: !cfg!(mobile),
         custom_storage: !cfg!(mobile),
@@ -506,7 +504,6 @@ mod tests {
         fs::write(&path, b"synthetic").unwrap();
         let mut entry = crate::records::HistoryEntry {
             id: id.into(),
-            transfer_source_id: None,
             name: "Fixture.wav".into(),
             input_path: path.to_string_lossy().into_owned(),
             output_path: None,

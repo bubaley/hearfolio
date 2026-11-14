@@ -48,7 +48,7 @@ pub fn store(id: &str, token: &str) -> Result<bool, String> {
         use tauri::Manager;
         let app = APP.get().ok_or("errors.orgSecretStore")?;
         app.state::<tauri_plugin_recording::Recording<tauri::Wry>>()
-            .transfer::<serde_json::Value>(
+            .invoke::<serde_json::Value>(
                 "secretPut",
                 serde_json::json!({"name": format!("org-{id}"), "value": token}),
             )
@@ -93,7 +93,7 @@ pub fn load(id: &str) -> Result<String, String> {
         let app = APP.get().ok_or("errors.orgSecretStore")?;
         let value = app
             .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
-            .transfer::<serde_json::Value>(
+            .invoke::<serde_json::Value>(
                 "secretGet",
                 serde_json::json!({"name": format!("org-{id}")}),
             )
@@ -136,7 +136,7 @@ pub fn delete(id: &str) {
         if let Some(app) = APP.get() {
             let _ = app
                 .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
-                .transfer::<serde_json::Value>(
+                .invoke::<serde_json::Value>(
                     "secretDelete",
                     serde_json::json!({"name": format!("org-{id}")}),
                 );

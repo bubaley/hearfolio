@@ -279,10 +279,28 @@ pub fn encode_flac(source: &Path, output: &Path) -> Result<u64, String> {
     result
 }
 
+fn hash_file(path: &Path) -> Result<(String, u64), String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut hash = Sha256::new();
+    let mut size = 0;
+    let mut buffer = [0; 65536];
+    loop {
+        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+        size += count as u64;
+    }
+    Ok((format!("{:x}", hash.finalize()), size))
+}
+
 /// Whether an archived input is the same recording as a retained source. A
 /// compacted archive cannot match by hash, so equal decoded duration is used.
 pub fn archived_matches(source: &Path, archived: &Path) -> Result<bool, String> {
-    if crate::transfer::hash_file(source)? == crate::transfer::hash_file(archived)? {
+    if hash_file(source)? == hash_file(archived)? {
         return Ok(true);
     }
     let same_format = source.extension() == archived.extension();

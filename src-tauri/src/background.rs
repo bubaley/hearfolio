@@ -1,490 +1,7 @@
-//! Keep a user-started transfer alive while the Android activity is paused.
+//! Keep a user-started operation alive while the Android activity is paused.
 use tauri::AppHandle;
 #[cfg(target_os = "android")]
 use tauri::Manager;
-
-#[cfg(target_os = "android")]
-fn journal_path(name: &str) -> Result<std::path::PathBuf, String> {
-    Ok(crate::base()?.join("temp").join(format!("{name}.json")))
-}
-#[cfg(target_os = "android")]
-fn write_journal(path: &std::path::Path, value: &serde_json::Value) -> Result<(), String> {
-    use std::io::Write;
-    let temp = path.with_extension("json.tmp");
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&temp)
-        .map_err(|_| "errors.transferBackgroundUnavailable")?;
-    file.write_all(&serde_json::to_vec(value).map_err(|_| "errors.transferBackgroundUnavailable")?)
-        .and_then(|_| file.sync_all())
-        .map_err(|_| "errors.transferBackgroundUnavailable")?;
-    std::fs::rename(temp, path).map_err(|_| "errors.transferBackgroundUnavailable".into())
-}
-#[cfg(target_os = "android")]
-fn read_journal(path: &std::path::Path) -> Option<serde_json::Value> {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-}
-#[cfg(target_os = "android")]
-fn inbox_active() -> bool {
-    if !INBOX.lock().is_ok_and(|preferences| preferences.enabled) {
-        return false;
-    }
-    journal_path("inbox-native")
-        .ok()
-        .and_then(|path| read_journal(&path))
-        .is_some_and(|value| value["active"] == true)
-}
-#[cfg(target_os = "android")]
-static ACTIVE_TRANSFER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-#[cfg(target_os = "android")]
-static CANCELLED_TRANSFER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-pub(crate) fn network_waiting(_waiting: bool) {
-    #[cfg(target_os = "android")]
-    if let Ok(path) = journal_path("lan-network-state") {
-        let _ = write_journal(&path, &serde_json::json!({"waiting":_waiting}));
-    }
-}
-pub(crate) fn check_transfer_cancelled() -> Result<(), String> {
-    #[cfg(target_os = "android")]
-    if let Some(id) = ACTIVE_TRANSFER
-        .lock()
-        .map_err(|_| "errors.transferBackgroundUnavailable")?
-        .clone()
-    {
-        if CANCELLED_TRANSFER
-            .lock()
-            .is_ok_and(|c| c.as_deref() == Some(&id))
-            || read_journal(&journal_path(&format!("transfer-control-{id}"))?)
-                .is_some_and(|v| v["id"] == id && v["cancelled"] == true)
-        {
-            return Err("errors.transferCancelled".into());
-        }
-    }
-    Ok(())
-}
-pub(crate) struct TransferGuard {
-    #[cfg(target_os = "android")]
-    id: String,
-    #[cfg(target_os = "android")]
-    state_path: std::path::PathBuf,
-    #[cfg(target_os = "android")]
-    control_path: std::path::PathBuf,
-    #[cfg(target_os = "android")]
-    started: std::time::Instant,
-    #[cfg(target_os = "android")]
-    last_update: std::time::Instant,
-    #[cfg(target_os = "android")]
-    snapshot: serde_json::Value,
-    success: bool,
-}
-impl TransferGuard {
-    pub fn start(_app: &AppHandle, _direction: &str) -> Result<Self, String> {
-        crate::transfer::network_restored();
-        #[cfg(target_os = "android")]
-        {
-            let id = uuid::Uuid::new_v4().to_string();
-            let state_path = journal_path(&format!("transfer-state-{id}"))?;
-            let control_path = journal_path(&format!("transfer-control-{id}"))?;
-            let snapshot = serde_json::json!({"id":id,"direction":_direction,"state":"running","stage":"waiting","current":0,"total":0,"error":null,"recordId":null,"result":null});
-            write_journal(&state_path, &snapshot)?;
-            write_journal(
-                &journal_path("transfer-active")?,
-                &serde_json::json!({"id":id,"direction":_direction}),
-            )?;
-            *ACTIVE_TRANSFER
-                .lock()
-                .map_err(|_| "errors.transferBackgroundUnavailable")? = Some(id.clone());
-            // A guard exists before native startup, so denied/failed startup also
-            // leaves a terminal snapshot and clears the runtime ownership token.
-            let guard = Self {
-                id: id.clone(),
-                state_path: state_path.clone(),
-                control_path: control_path.clone(),
-                started: std::time::Instant::now(),
-                last_update: std::time::Instant::now(),
-                snapshot,
-                success: false,
-            };
-            let payload = serde_json::json!({"id":id,"direction":_direction,"snapshotPath":state_path,"controlPath":control_path});
-            if inbox_active() {
-                write_journal(&journal_path("inbox-transfer")?, &payload)?;
-                let start = std::time::Instant::now();
-                while !read_journal(&control_path).is_some_and(|value| value["ready"] == true) {
-                    if !inbox_active() || start.elapsed() > std::time::Duration::from_secs(10) {
-                        return Err("errors.transferBackgroundUnavailable".into());
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-            } else if !bounded_bridge(
-                _app,
-                "beginTransfer",
-                payload,
-                std::time::Duration::from_secs(120),
-            ) {
-                // A lost permission callback must not hold the job lock forever.
-                return Err("errors.transferBackgroundUnavailable".into());
-            }
-            Ok(guard)
-        }
-        #[cfg(not(target_os = "android"))]
-        Ok(Self { success: false })
-    }
-    pub fn check(&mut self) -> Result<(), String> {
-        #[cfg(target_os = "android")]
-        if CANCELLED_TRANSFER
-            .lock()
-            .is_ok_and(|cancelled| cancelled.as_deref() == Some(self.id.as_str()))
-            || self.started.elapsed() >= MAX_TRANSFER
-            || read_journal(&self.control_path)
-                .is_some_and(|value| value["id"] == self.id && value["cancelled"] == true)
-        {
-            return Err("errors.transferCancelled".into());
-        }
-        Ok(())
-    }
-    pub fn progress(&mut self, _stage: &str, _current: u64, _total: u64) {
-        #[cfg(target_os = "android")]
-        if self.last_update.elapsed() >= std::time::Duration::from_secs(1) {
-            self.snapshot["stage"] = serde_json::json!(_stage);
-            self.snapshot["current"] = serde_json::json!(_current);
-            self.snapshot["total"] = serde_json::json!(_total);
-            let _ = write_journal(&self.state_path, &self.snapshot);
-            self.last_update = std::time::Instant::now();
-        }
-    }
-    pub fn finish<T: serde::Serialize>(&mut self, _result: &Result<T, String>) {
-        crate::transfer::network_restored();
-        self.success = _result.is_ok();
-        #[cfg(target_os = "android")]
-        {
-            self.snapshot["state"] =
-                serde_json::json!(if self.success { "finished" } else { "error" });
-            self.snapshot["error"] = serde_json::json!(_result.as_ref().err());
-            self.snapshot["result"] = _result
-                .as_ref()
-                .ok()
-                .and_then(|result| serde_json::to_value(result).ok())
-                .unwrap_or(serde_json::Value::Null);
-            self.snapshot["recordId"] = self.snapshot["result"]["id"].clone();
-        }
-    }
-    pub fn complete(&mut self) {
-        self.success = true;
-    }
-}
-impl Drop for TransferGuard {
-    fn drop(&mut self) {
-        #[cfg(target_os = "android")]
-        {
-            self.snapshot["state"] =
-                serde_json::json!(if self.success { "finished" } else { "error" });
-            self.snapshot["success"] = serde_json::json!(self.success);
-            if !self.success && self.snapshot["error"].is_null() {
-                self.snapshot["error"] = serde_json::json!("errors.transferBackgroundUnavailable");
-            }
-            let _ = write_journal(&self.state_path, &self.snapshot);
-            if let Ok(mut active) = ACTIVE_TRANSFER.lock() {
-                if active.as_deref() == Some(self.id.as_str()) {
-                    *active = None;
-                }
-            }
-        }
-    }
-}
-
-// UUID validation computes the private journal path; no persisted path is trusted.
-#[cfg(any(target_os = "android", test))]
-fn transfer_state_name(pointer: &serde_json::Value) -> Result<String, String> {
-    let id = pointer["id"]
-        .as_str()
-        .and_then(|value| uuid::Uuid::parse_str(value).ok())
-        .ok_or("errors.transferBackgroundUnavailable")?;
-    Ok(format!("transfer-state-{id}"))
-}
-#[cfg(any(target_os = "android", test))]
-fn restored_transfer(mut snapshot: serde_json::Value, active: Option<&str>) -> serde_json::Value {
-    if snapshot["state"] == "running" && snapshot["id"].as_str() != active {
-        snapshot["state"] = serde_json::json!("interrupted");
-        snapshot["error"] = serde_json::json!("errors.transferInterrupted");
-        snapshot["result"] = serde_json::Value::Null;
-    }
-    snapshot
-}
-#[tauri::command]
-pub async fn transfer_activity_snapshot() -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        #[cfg(target_os = "android")]
-        {
-            let Some(pointer) = read_journal(&journal_path("transfer-active")?) else {
-                return Ok(serde_json::json!({"state":"idle"}));
-            };
-            let snapshot = read_journal(&journal_path(&transfer_state_name(&pointer)?)?)
-                .ok_or("errors.transferBackgroundUnavailable")?;
-            let active = ACTIVE_TRANSFER
-                .lock()
-                .map_err(|_| "errors.transferBackgroundUnavailable")?;
-            Ok(restored_transfer(snapshot, active.as_deref()))
-        }
-        #[cfg(not(target_os = "android"))]
-        Ok(serde_json::json!({"state":"idle"}))
-    })
-    .await
-    .map_err(|_| "errors.transferBackgroundUnavailable".to_owned())?
-}
-
-#[tauri::command]
-pub async fn cancel_transfer_activity(id: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(target_os = "android")]
-        {
-            uuid::Uuid::parse_str(&id).map_err(|_| "errors.transferBackgroundUnavailable")?;
-            let active = ACTIVE_TRANSFER
-                .lock()
-                .map_err(|_| "errors.transferBackgroundUnavailable")?;
-            if active.as_deref() != Some(id.as_str()) {
-                return Ok(());
-            }
-            *CANCELLED_TRANSFER
-                .lock()
-                .map_err(|_| "errors.transferBackgroundUnavailable")? = Some(id.clone());
-            write_journal(
-                &journal_path(&format!("transfer-control-{id}"))?,
-                &serde_json::json!({"id":id,"ready":true,"cancelled":true}),
-            )?;
-        }
-        #[cfg(not(target_os = "android"))]
-        let _ = id;
-        Ok(())
-    })
-    .await
-    .map_err(|_| "errors.transferBackgroundUnavailable".to_owned())?
-}
-
-// A native polling loop continues without WebView timers. All acceptance still
-// uses the ordinary authenticated protocol and the same exclusive job guard.
-#[derive(Clone, serde::Deserialize, serde::Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct InboxPreferences {
-    enabled: bool,
-    auto_pair: bool,
-    auto_receive: bool,
-}
-#[cfg(target_os = "android")]
-static INBOX: std::sync::Mutex<InboxPreferences> = std::sync::Mutex::new(InboxPreferences {
-    enabled: false,
-    auto_pair: false,
-    auto_receive: false,
-});
-#[cfg(target_os = "android")]
-static WATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-#[tauri::command]
-pub async fn transfer_background(
-    app: AppHandle,
-    preferences: Option<InboxPreferences>,
-) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(target_os = "android")]
-        {
-            use std::sync::atomic::Ordering;
-            let bridge = app.state::<tauri_plugin_recording::Recording<tauri::Wry>>();
-            if let Some(p) = preferences {
-                if p.enabled {
-                    bridge.transfer::<()>("startInbox", serde_json::json!({"id":"inbox","snapshotPath":journal_path("inbox-native")?,"controlPath":journal_path("inbox-offers")?}))?;
-                } else {
-                    bridge.transfer::<()>("stopInbox", serde_json::json!({}))?;
-                }
-                *INBOX.lock().map_err(|_| "errors.operationFailed")? = p;
-            }
-            let status: serde_json::Value =
-                bridge.transfer("inboxStatus", serde_json::json!({}))?;
-            if status["active"] == true && !WATCHING.swap(true, Ordering::AcqRel) {
-                let handle = app.clone();
-                std::thread::spawn(move || watch_inbox(handle));
-            }
-            Ok(serde_json::json!({"enabled":status["active"] == true,"error":status["error"],"result":journal_path("background-transfer-result").ok().and_then(|path|read_journal(&path))}))
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            let _ = (app, preferences);
-            Ok(serde_json::json!({"enabled":false}))
-        }
-    })
-    .await
-    .map_err(|_| "errors.operationFailed".to_owned())?
-}
-
-#[cfg(target_os = "android")]
-fn watch_inbox(app: AppHandle) {
-    use std::collections::HashSet;
-    use std::sync::atomic::Ordering;
-    use tauri::Emitter;
-    let mut attempted = HashSet::<String>::new();
-    let mut known = HashSet::<String>::new();
-    loop {
-        let p = match INBOX.lock() {
-            Ok(p) => p.clone(),
-            Err(_) => break,
-        };
-        let active = inbox_active();
-        if !p.enabled || !active {
-            break;
-        }
-        let state = tauri::async_runtime::block_on(crate::transfer::transfer_api(
-            "poll".into(),
-            serde_json::json!({}),
-        ));
-        if let Ok(state) = state {
-            // Recheck policy after a potentially slow request: disabling automatic
-            // acceptance must apply before we accept a newly discovered offer.
-            let p = match INBOX.lock() {
-                Ok(p) => p.clone(),
-                Err(_) => break,
-            };
-            let active = inbox_active();
-            if !p.enabled || !active {
-                break;
-            }
-
-            let pairs = state["pairRequests"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let offers = state["offers"].as_array().cloned().unwrap_or_default();
-            let ids: HashSet<String> = pairs
-                .iter()
-                .chain(offers.iter())
-                .filter_map(|v| v["id"].as_str().map(str::to_owned))
-                .collect();
-            attempted.retain(|id| ids.contains(id));
-            let fresh = ids.iter().any(|id| !known.contains(id));
-            if let Ok(path) = journal_path("inbox-offers") {
-                let _ = write_journal(
-                    &path,
-                    &serde_json::json!({"current":ids.len(),"success":fresh,"revision":crate::clock()}),
-                );
-            }
-            known = ids;
-            let (pairs, receive) = incoming_actions(
-                &state,
-                &p,
-                crate::JOB_ACTIVE.load(Ordering::Acquire),
-                &attempted,
-            );
-            for id in pairs {
-                let _ = tauri::async_runtime::block_on(crate::transfer::transfer_api(
-                    "confirmPair".into(),
-                    serde_json::json!({"id":id,"accept":true}),
-                ));
-            }
-            if let Some(id) = receive {
-                let result = tauri::async_runtime::block_on(crate::transfer::transfer_receive(
-                    app.clone(),
-                    id.clone(),
-                ));
-                if !matches!(&result,Err(e) if e=="errors.operationBusy") {
-                    attempted.insert(id.clone());
-                    let payload =
-                        serde_json::json!({"id":id,"ok":result.is_ok(),"error":result.err()});
-                    if let Ok(path) = journal_path("background-transfer-result") {
-                        let _ = write_journal(&path, &payload);
-                    }
-                    let _ = app.emit("background-transfer-result", payload);
-                }
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_secs(5));
-    }
-    WATCHING.store(false, Ordering::Release);
-}
-
-#[cfg(any(target_os = "android", test))]
-fn incoming_actions(
-    state: &serde_json::Value,
-    p: &InboxPreferences,
-    busy: bool,
-    attempted: &std::collections::HashSet<String>,
-) -> (Vec<String>, Option<String>) {
-    if !p.enabled {
-        return (vec![], None);
-    }
-    let ids = |key: &str| {
-        state[key]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v["id"].as_str().map(str::to_owned))
-            .collect::<Vec<_>>()
-    };
-    let pairs = if p.auto_pair {
-        ids("pairRequests")
-    } else {
-        vec![]
-    };
-    let receive = if p.auto_receive && !busy {
-        ids("offers").into_iter().find(|id| !attempted.contains(id))
-    } else {
-        None
-    };
-    (pairs, receive)
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn background_requires_explicit_consent_and_respects_independent_confirmation_flags() {
-        let state = serde_json::json!({"pairRequests":[{"id":"pair"}],"offers":[{"id":"file"}]});
-        let attempted = std::collections::HashSet::new();
-        let mut p = InboxPreferences::default();
-        assert_eq!(
-            incoming_actions(&state, &p, false, &attempted),
-            (vec![], None)
-        );
-        p.enabled = true;
-        assert_eq!(
-            incoming_actions(&state, &p, false, &attempted),
-            (vec![], None)
-        );
-        p.auto_pair = true;
-        assert_eq!(
-            incoming_actions(&state, &p, false, &attempted),
-            (vec!["pair".into()], None)
-        );
-        p.auto_receive = true;
-        assert_eq!(
-            incoming_actions(&state, &p, false, &attempted),
-            (vec!["pair".into()], Some("file".into()))
-        );
-        p.enabled = false;
-        assert_eq!(
-            incoming_actions(&state, &p, false, &attempted),
-            (vec![], None)
-        );
-    }
-    #[test]
-    fn busy_recording_defers_incoming_and_failed_offer_does_not_loop() {
-        let state = serde_json::json!({"offers":[{"id":"failed"},{"id":"next"}]});
-        let p = InboxPreferences {
-            enabled: true,
-            auto_receive: true,
-            auto_pair: false,
-        };
-        let attempted = std::collections::HashSet::from(["failed".into()]);
-        assert_eq!(incoming_actions(&state, &p, true, &attempted).1, None);
-        assert_eq!(
-            incoming_actions(&state, &p, false, &attempted).1,
-            Some("next".into())
-        );
-    }
-}
 
 // Operation state is owned by Rust and stored before native work starts. A
 // recreated WebView can read the result; a restarted process sees interruption
@@ -546,8 +63,6 @@ const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 /// Extra time past the watchdog limits before a silent job is reaped: a job
 /// that is alive times itself out at its next check well within this.
 const STALE_GRACE: std::time::Duration = std::time::Duration::from_secs(2 * 60);
-#[cfg(target_os = "android")]
-const MAX_TRANSFER: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 #[cfg(target_os = "android")]
 fn operation_control_path(id: &str) -> Result<std::path::PathBuf, String> {
     Ok(crate::base()?
@@ -628,7 +143,7 @@ fn bounded_bridge(
     std::thread::spawn(move || {
         let result = app
             .state::<tauri_plugin_recording::Recording<tauri::Wry>>()
-            .transfer::<()>(command, payload)
+            .invoke::<()>(command, payload)
             .is_ok();
         let _ = sender.send(result);
     });
@@ -1068,22 +583,7 @@ pub async fn busy_activity() -> Result<serde_json::Value, String> {
                 active.stop_requested.is_some(),
             )
         });
-        #[cfg(target_os = "android")]
-        let transfer = ACTIVE_TRANSFER
-            .lock()
-            .ok()
-            .and_then(|id| id.clone())
-            .map(|id| {
-                let direction = journal_path("transfer-active")
-                    .ok()
-                    .and_then(|path| read_journal(&path))
-                    .filter(|pointer| pointer["id"] == id.as_str())
-                    .and_then(|pointer| pointer["direction"].as_str().map(str::to_owned));
-                serde_json::json!({"id":id,"direction":direction})
-            });
-        #[cfg(not(target_os = "android"))]
-        let transfer: Option<serde_json::Value> = None;
-        Ok(busy_description(crate::job_holder(), operation, transfer))
+        Ok(busy_description(crate::job_holder(), operation))
     })
     .await
     .map_err(|_| "errors.operationFailed".to_owned())?
@@ -1091,7 +591,6 @@ pub async fn busy_activity() -> Result<serde_json::Value, String> {
 fn busy_description(
     holder: Option<(&'static str, std::time::Duration)>,
     operation: Option<(OperationSnapshot, bool)>,
-    transfer: Option<serde_json::Value>,
 ) -> serde_json::Value {
     let Some((kind, held)) = holder else {
         return serde_json::json!({"kind":"idle"});
@@ -1105,7 +604,6 @@ fn busy_description(
         "seconds": held.as_secs(),
         "operation": operation,
         "stopping": stopping,
-        "transfer": if kind == "transfer" { transfer } else { None },
     })
 }
 fn acknowledge_operation_at(path: &std::path::Path, id: &str) -> Result<(), String> {
@@ -1499,7 +997,7 @@ mod operation_tests {
     #[test]
     fn busy_answer_names_the_running_work_and_its_progress() {
         let _serial = serial();
-        assert_eq!(busy_description(None, None, None)["kind"], "idle");
+        assert_eq!(busy_description(None, None)["kind"], "idle");
         let snapshot = OperationSnapshot {
             id: "job".into(),
             kind: "transcribe".into(),
@@ -1517,23 +1015,13 @@ mod operation_tests {
         let busy = busy_description(
             Some(("transcribe", std::time::Duration::from_secs(75))),
             Some((snapshot, false)),
-            None,
         );
         assert_eq!(busy["kind"], "transcribe");
         assert_eq!(busy["seconds"], 75);
         assert_eq!(busy["operation"]["recordId"], "record");
         assert_eq!(busy["operation"]["progress"]["current"], 4);
         assert_eq!(busy["stopping"], false);
-        let transfer = busy_description(
-            Some(("transfer", std::time::Duration::from_secs(3))),
-            None,
-            Some(serde_json::json!({"id":"t","direction":"receive"})),
-        );
-        assert_eq!(transfer["kind"], "transfer");
-        assert_eq!(transfer["transfer"]["direction"], "receive");
-        assert!(transfer["operation"].is_null());
-        let recording =
-            busy_description(Some(("recording", std::time::Duration::ZERO)), None, None);
+        let recording = busy_description(Some(("recording", std::time::Duration::ZERO)), None);
         assert_eq!(recording["kind"], "recording");
     }
     #[test]
@@ -1546,28 +1034,5 @@ mod operation_tests {
         let bytes =
             |current: u64| serde_json::json!({"stage":"a","current":current,"total":1_000_000});
         assert!(!progress_milestone(Some(&bytes(1)), &bytes(2)));
-    }
-}
-
-#[cfg(test)]
-mod transfer_snapshot_tests {
-    use super::*;
-    #[test]
-    fn only_allocated_uuid_journals_can_be_loaded_and_running_work_requires_runtime_owner() {
-        let id = uuid::Uuid::new_v4().to_string();
-        let pointer = serde_json::json!({"id":id,"statePath":"/foreign/file.json"});
-        assert_eq!(
-            transfer_state_name(&pointer).unwrap(),
-            format!("transfer-state-{id}")
-        );
-        assert!(transfer_state_name(&serde_json::json!({"id":"../../foreign"})).is_err());
-        let running = serde_json::json!({"id":id,"direction":"receive","state":"running","stage":"receiving","current":5,"total":10});
-        assert_eq!(
-            restored_transfer(running.clone(), Some(&id))["state"],
-            "running"
-        );
-        assert_eq!(restored_transfer(running, None)["state"], "interrupted");
-        let terminal = serde_json::json!({"id":id,"state":"finished","result":{"id":"saved-record"},"recordId":"saved-record"});
-        assert_eq!(restored_transfer(terminal.clone(), None), terminal);
     }
 }

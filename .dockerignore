@@ -1,8 +1,0 @@
-*
-!scripts/Dockerfile.transfer-build
-!server/
-server/*
-!server/Dockerfile
-!server/relay.mjs
-
-!server/multipart.mjs

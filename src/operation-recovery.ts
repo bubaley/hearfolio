@@ -1,5 +1,5 @@
 export type OperationSnapshot = {
-  id?: string; kind?: 'transcribe' | 'postprocess' | 'import' | 'transfer_send' | 'transfer_receive'; recordId?: string | null;
+  id?: string; kind?: 'transcribe' | 'postprocess' | 'import'; recordId?: string | null;
   state: 'idle' | 'running' | 'finished' | 'error' | 'cancelled' | 'interrupted';
   progress?: {kind: string; stage: string; current: number; total: number; elapsed: number} | null;
   error?: string | null; result?: unknown;

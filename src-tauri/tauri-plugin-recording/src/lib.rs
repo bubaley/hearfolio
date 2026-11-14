@@ -5,7 +5,7 @@ use tauri::{
 
 pub struct Recording<R: Runtime>(PluginHandle<R>);
 impl<R: Runtime> Recording<R> {
-    pub fn transfer<T: serde::de::DeserializeOwned>(
+    pub fn invoke<T: serde::de::DeserializeOwned>(
         &self,
         command: &str,
         payload: serde_json::Value,

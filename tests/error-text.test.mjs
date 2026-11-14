@@ -28,7 +28,7 @@ test('system text is replaced by a plain message, app text is kept and translate
   assert.equal(errorText('No such file or directory (os error 2)'),generic);
   assert.equal(errorText(new TypeError("Cannot read properties of undefined (reading 'id')")),generic);
   assert.equal(errorText('errors.somethingNew'),generic);
-  assert.equal(errorText('Укажите имя этого устройства.'),'Укажите имя этого устройства.');
+  assert.equal(errorText('Заполните название и инструкцию'),'Заполните название и инструкцию');
   assert.equal(errorText('progress.prepareAudio'),'Подготавливаем аудио');
   setLanguage('en');
   assert.doesNotMatch(errorText('Не удалось прочитать файл /data/x'),/[А-Яа-я]/);

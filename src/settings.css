@@ -1,19 +1,20 @@
-.settings-layout { display: grid; grid-template-columns: 190px minmax(0,1fr); gap: 32px; min-width: 0; }
+.settings-layout { display: grid; grid-template-columns: 220px minmax(0,1fr); gap: 32px; min-width: 0; }
 .settings-navigation { min-width: 0; }
 .settings-navigation h1 { font-size: 19px; margin: 0 0 22px 9px; }
 .settings-navigation nav { display: grid; gap: 4px; }
-.settings-nav-item { justify-content: flex-start; text-align: left; width: 100%; padding: 12px 10px; border-radius: 7px; gap: 10px; min-height: 60px; }
+.settings-nav-item { justify-content: flex-start; text-align: left; width: 100%; padding: 10px 12px; border-radius: var(--radius-s); gap: 12px; min-height: 56px; }
 .settings-nav-item:hover { background: var(--hover); }
 .settings-nav-item:active { background: var(--selected); }
 .settings-nav-item.selected { background: var(--selected); }
 .settings-nav-item>svg:first-child { width: 16px; height: 16px; color: var(--muted); }
-.settings-nav-item span { min-width: 0; }
-.settings-nav-item strong { display: block; font-size: 12px; font-weight: 500; }
-.settings-nav-item small { display: block; margin-top: 3px; font-size: 11px; line-height: 1.5; color: var(--muted); }
+.settings-nav-item span { min-width: 0; flex: 1; }
+.settings-nav-item>svg:last-child { display: none; width: 16px; height: 16px; color: var(--faint); }
+.settings-nav-item strong { display: block; font-size: var(--text-s); font-weight: 550; }
+.settings-nav-item small { display: block; margin-top: 2px; font-size: var(--text-xs); line-height: 1.4; color: var(--muted); }
 .settings-detail { min-width: 0; max-width: 650px; }
 .settings-detail-heading { margin-bottom: 26px; }
 .settings-detail-heading h1 { font-size: 21px; }
-.settings-detail-heading p { color: var(--muted); font-size: 12px; margin-top: 6px; }
+.settings-detail-heading p { color: var(--muted); font-size: var(--text-s); margin-top: 6px; }
 .settings-back { display: none; }
 .settings-layout fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
 .settings-layout .settings-panel { max-width: none; }
@@ -24,17 +25,22 @@
 .settings-layout .field input,.settings-layout .field select { width: 100%; min-width: 0; }
 .settings-layout .field small,.settings-layout .archive-path code { overflow-wrap: anywhere; }
 .settings-layout .settings-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; border-top: 1px solid var(--line); padding-top: 18px; margin-top: 0; }
-.settings-layout .settings-actions span { color: var(--muted); font-size: 11px; }
+.settings-layout .settings-actions span { color: var(--muted); font-size: var(--text-xs); }
 .settings-layout .settings-rule-link { margin-top: 25px; padding-top: 23px; border-top: 1px solid var(--line); }
-.settings-rule-link p,.settings-device-link p { font-size: 12px; color: var(--muted); margin: 8px 0 14px; line-height: 1.65; }
-.settings-layout .settings-section .settings-footnote { color: var(--muted); font-size: 11px; margin: 18px 0 0; }
+.settings-rule-link p { font-size: 12px; color: var(--muted); margin: 8px 0 14px; line-height: 1.65; }
+.settings-layout .settings-section .settings-footnote { color: var(--muted); font-size: var(--text-xs); margin: 18px 0 0; }
 .settings-layout .settings-error { margin-top: 16px; color: var(--error); font-size: 12px; overflow-wrap: anywhere; }
-.settings-device-link { border-top: 1px solid var(--line); padding-top: 20px; margin-top: 3px; }
 .settings-layout .about-section { margin-top: 0; padding-top: 0; border: 0; }
 .settings-layout .setting-row { flex-wrap: wrap; gap: 14px; }
 .settings-layout .archive-path { min-width: 0; align-items: baseline; }
 .settings-layout .archive-path>span { flex: none; max-width: 40%; }
 .settings-layout .archive-path code { min-width: 0; }
+/* A narrow window with the record list open: the section list shrinks to names so the form keeps a usable width. */
+@media (min-width: 761px) and (max-width: 1000px) {
+  .settings-layout:not(.settings-mobile) { grid-template-columns: 168px minmax(0,1fr); gap: 24px; }
+  .settings-layout:not(.settings-mobile) .settings-nav-item { min-height: var(--control-h); padding: 8px 10px; }
+  .settings-layout:not(.settings-mobile) .settings-nav-item small { display: none; }
+}
 @media (max-width: 760px) {
   .settings-layout { display: block; }
   .settings-layout.has-selection .settings-navigation { display: none; }
@@ -48,10 +54,9 @@
   .settings-back svg { transform: rotate(180deg); width: 16px; }
   .settings-detail-heading h1 { font-size: 24px; }
   .settings-layout .secondary,.settings-layout .primary,.settings-layout .text-button { min-height: 44px; white-space: normal; text-align: center; }
-  .settings-layout .field input,.settings-layout .field select { min-height: 44px; font-size: 16px; }
+  .settings-layout .field input,.settings-layout .field select,.settings-layout .field .app-select { min-height: 44px; font-size: 16px; }
   .settings-layout .settings-actions { align-items: flex-start; flex-direction: column; }
   .settings-layout .settings-actions .primary { width: 100%; }
-  .settings-layout .transfer-setting { align-items: flex-start; }
   .settings-layout .archive-path { flex-direction: column; gap: 3px; }
   .settings-layout .archive-path>span { max-width: none; }
 }
@@ -60,4 +65,13 @@
 .settings-mobile:not(.has-selection) .settings-detail { display: none; }
 .settings-mobile .settings-back { display: inline-flex; min-height: 44px; color: var(--accent); }
 .settings-mobile .settings-back svg { transform: rotate(180deg); }
-.settings-mobile .settings-nav-item { min-height: 70px; padding: 14px 4px; }
+.settings-mobile .settings-navigation nav { gap: 0; }
+.settings-mobile .settings-nav-item { min-height: 68px; padding: 12px 0; border-radius: 0; border-bottom: 1px solid var(--line); }
+.settings-mobile .settings-nav-item:hover, .settings-mobile .settings-nav-item.selected { background: none; }
+.settings-mobile .settings-nav-item:active { background: var(--subtle); }
+.settings-mobile .settings-nav-item strong { font-size: 16px; }
+.settings-mobile .settings-nav-item>svg:first-child { width: 22px; height: 22px; }
+.settings-mobile .settings-nav-item>svg:last-child { display: block; }
+.settings-mobile .settings-detail-heading { margin-bottom: 20px; }
+.settings-mobile .settings-detail-heading p { margin-top: 0; }
+.settings-mobile .settings-actions { position: sticky; bottom: 0; background: var(--canvas); padding-bottom: calc(12px + env(safe-area-inset-bottom)); }

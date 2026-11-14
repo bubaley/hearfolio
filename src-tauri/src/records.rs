@@ -11,8 +11,6 @@ use std::{
 #[serde(rename_all = "camelCase")]
 pub struct HistoryEntry {
     pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transfer_source_id: Option<String>,
     pub name: String,
     pub input_path: String,
     pub output_path: Option<String>,
@@ -308,6 +306,23 @@ pub fn delete_entries_at(dir: &Path, id: Option<&str>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn history_written_by_a_version_with_device_transfer_still_loads() {
+        let dir = fixture();
+        fs::write(
+            dir.join("history.json"),
+            r#"[{"id":"hearing-1","transferSourceId":"hearing-origin","name":"audio.wav",
+                "inputPath":"/missing/hearing-1.wav","outputPath":null,"model":null,"createdAt":1}]"#,
+        )
+        .unwrap();
+        let entries = read_history_at(&dir).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "hearing-1");
+        assert!(!serde_json::to_string(&entries)
+            .unwrap()
+            .contains("transferSourceId"));
+        fs::remove_dir_all(dir).unwrap();
+    }
     fn fixture() -> PathBuf {
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = SystemTime::now()
@@ -327,7 +342,6 @@ mod tests {
     fn entry(dir: &Path, id: &str) -> HistoryEntry {
         HistoryEntry {
             id: id.into(),
-            transfer_source_id: None,
             name: "audio.wav".into(),
             input_path: dir
                 .join("input")

@@ -34,19 +34,6 @@ impl Default for RecognitionConfig {
     }
 }
 impl RecognitionConfig {
-    /// Validate portable archive metadata without requiring this device to run the model.
-    pub fn validate_metadata(&self) -> Result<(), String> {
-        if self.model.trim().is_empty()
-            || self.model.len() > 200
-            || self.model.chars().any(char::is_control)
-        {
-            return Err("Invalid recognition metadata".into());
-        }
-        match (self.provider.as_str(), self.mode.as_str()) {
-            ("local", "local") | ("openrouter", "streaming" | "transcription") => Ok(()),
-            _ => Err("Invalid recognition metadata".into()),
-        }
-    }
     pub fn validate(&mut self) -> Result<(), String> {
         self.model = self.model.trim().to_owned();
         super::platform::validate_configuration(self)?;
@@ -1063,6 +1050,26 @@ pub fn transcribe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn settings_written_by_a_version_with_device_transfer_still_load() {
+        let dir = std::env::temp_dir().join(format!("hearfolio-settings-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        fs::write(
+            &path,
+            r#"{"language":"ru","openrouterUrl":"https://openrouter.ai/api/v1","chunkSeconds":120,
+                "relayUrl":"https://relay.example","deviceName":"Phone",
+                "pairedDevices":[{"id":"a","name":"Laptop"}],
+                "transfer":{"enabled":true,"autoPair":true,"autoReceive":false}}"#,
+        )
+        .unwrap();
+        let settings = load_at(&path, &dir.join("missing.json")).unwrap();
+        assert_eq!(settings.language, "ru");
+        assert_eq!(settings.chunk_seconds, 120);
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert!(saved.get("relayUrl").is_none() && saved.get("transfer").is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn text_catalog_only_offers_text_input_and_output_and_deduplicates() {
         let body = serde_json::json!({"data":[

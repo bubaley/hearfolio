@@ -60,21 +60,13 @@ pub fn config_dir() -> Result<PathBuf, String> {
     {
         let home = home_dir()?;
         #[cfg(target_os = "macos")]
-        let path = home.join(if cfg!(feature = "transfer-mvp") {
-            "Library/Application Support/HearfolioTransferMVP"
-        } else {
-            "Library/Application Support/Hearfolio"
-        });
+        let path = home.join("Library/Application Support/Hearfolio");
         #[cfg(not(target_os = "macos"))]
         let path = std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
             .unwrap_or_else(|| home.join(".config"))
-            .join(if cfg!(feature = "transfer-mvp") {
-                "HearfolioTransferMVP"
-            } else {
-                "Hearfolio"
-            });
+            .join("Hearfolio");
         fs::create_dir_all(&path).map_err(|e| format!("errors.settingsSave|{e}"))?;
         Ok(path)
     }
@@ -138,13 +130,9 @@ pub fn active_root_at(home: &Path, config: &Path) -> Result<PathBuf, String> {
             Ok(location.root)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let root = home.join(if cfg!(feature = "transfer-mvp") {
-                ".hearfolio-transfer-mvp"
-            } else {
-                ".hearfolio"
-            });
+            let root = home.join(".hearfolio");
             let legacy = home.join(".hearing");
-            if !cfg!(feature = "transfer-mvp") && legacy.is_dir() {
+            if legacy.is_dir() {
                 // Read before copying so an invalid history never replaces the active archive.
                 migrate_at(&legacy, home, &pointer, |_, _| {})
             } else {
@@ -238,11 +226,7 @@ pub fn migrate_at(
     if !parent.is_dir() {
         return Err("errors.storageParentInvalid".into());
     }
-    let target = parent.join(if cfg!(feature = "transfer-mvp") {
-        ".hearfolio-transfer-mvp"
-    } else {
-        ".hearfolio"
-    });
+    let target = parent.join(".hearfolio");
     if target == source {
         return Ok(source);
     }

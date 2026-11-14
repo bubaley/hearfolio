@@ -23,15 +23,13 @@ test('a stop in progress is not offered again and the record name is optional', 
 
 test('every holder gets a plain message; only stoppable work offers Stop', () => {
   for (const language of ['ru', 'en']) {
-    for (const kind of ['idle', 'transcribe', 'postprocess', 'import', 'recording', 'transfer', 'download', 'storage', 'archive', 'restart', 'something-new']) {
+    for (const kind of ['idle', 'transcribe', 'postprocess', 'import', 'recording', 'download', 'storage', 'archive', 'restart', 'something-new']) {
       const notice = describeBusy({kind}, names, language);
       assert.ok(notice.message.length > 10, `${language}:${kind}`);
       assert.doesNotMatch(notice.message, /errors\.|undefined|null|NaN/);
     }
   }
   assert.deepEqual(describeBusy({kind: 'recording'}, names, 'ru').stop, {target: 'recording'});
-  assert.deepEqual(describeBusy({kind: 'transfer', transfer: {id: 't', direction: 'receive'}}, names, 'ru').stop, {target: 'transfer', id: 't'});
-  assert.match(describeBusy({kind: 'transfer', transfer: {id: 't', direction: 'receive'}}, names, 'ru').message, /приём/);
   assert.equal(describeBusy({kind: 'download'}, names, 'ru').stop, undefined);
   assert.equal(describeBusy({kind: 'archive'}, names, 'ru').stop, undefined);
   assert.equal(describeBusy({kind: 'idle'}, names, 'ru').open, undefined);

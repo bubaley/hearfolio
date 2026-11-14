@@ -84,7 +84,7 @@ pub struct Job {
 pub enum Failure {
     /// No connection: wait without limit, retrying soon.
     Offline,
-    /// 5xx, 429, timeouts mid-transfer, an incomplete object: retry with
+    /// 5xx, 429, timeouts mid-upload, an incomplete object: retry with
     /// backoff (capped at 5 minutes) without giving up.
     Transient(String),
     /// The server rejected the uploaded object (size mismatch): upload again.

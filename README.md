@@ -25,7 +25,6 @@ Releases use SemVer derived from Conventional Commits, with a changelog and down
 - Connect OpenRouter using a base URL and API token, then choose an audio model from the searchable catalog in the recording. The supported endpoint is selected automatically.
 - See processing stages, elapsed time, and partial transcripts. Available progress details depend on the engine.
 - Browse and search recordings by name, play the original audio, and rename the title with its audio extension preserved.
-- Pair your devices through your own relay server using an invitation code or QR, then accept incoming recordings and track transfer progress.
 - Copy or export transcripts as `.txt` files. Renamed recordings use the new name when exporting text.
 - Run transcription again with another model. A failed retry preserves the previous saved transcript.
 - Create reusable post-processing rules, such as a brief summary, meeting decisions, or action items. Apply a rule with a text model from OpenRouter and keep its result alongside the original transcript.
@@ -114,11 +113,9 @@ Android source builds require the [Tauri Android prerequisites](https://v2.tauri
 
 Android playback uses the system media player, including seeking and duration, rather than depending on WebView audio codecs. The system share sheet lets you send a recording to installed apps such as Telegram. Hearfolio grants the selected recipient temporary access to the shared file; the original remains in its private archive.
 
-## Settings and device transfers
+## Settings
 
 On a phone, Settings opens a list of categories with a back button inside each category. On desktop, categories remain visible beside the selected settings. Unsaved connection and language edits are protected when switching sections.
-
-Open **Devices**, enter your own relay URL and this device's name, and connect to the server. There is no preset relay domain. Use **Pair a device** to show a short-lived invitation QR/code, then scan or enter it on your other device and confirm the request. Both devices must use the same relay. Incoming recordings show the sender and file size; sending shows the recipient, progress, and cancellation. Pausing transfers retains the saved connection and archive.
 
 ## Organizations (Hearfolio Cloud)
 
@@ -128,13 +125,13 @@ Choose **To** on the start screen or in the recorder: this device, or an organiz
 
 ## Microphone recording
 
-Select **Record audio** on the new recording screen. Allow microphone access when the operating system asks, then use **Pause**, **Resume**, or **Save recording**. Cancel discards the capture after you confirm it; stopping a recording longer than five minutes also asks first, and the microphone keeps recording while the question is open. A failed archive save keeps the recording available for another attempt. Open **Share** on a saved recording to send its audio or text, transfer it to another device, save a copy, or copy the transcript. Text actions appear once a transcript is available.
+Select **Record audio** on the new recording screen. Allow microphone access when the operating system asks, then use **Pause**, **Resume**, or **Save recording**. Cancel discards the capture after you confirm it; stopping a recording longer than five minutes also asks first, and the microphone keeps recording while the question is open. A failed archive save keeps the recording available for another attempt. Open **Share** on a saved recording to send its audio or text, save a copy, or copy the transcript. Text actions appear once a transcript is available.
 
 The recorder shows measured audio history to the left of the current-time marker. On Android, its timer and waveform come from captured PCM, survive returning from the background, and exclude paused time. Recoverable microphone failures recreate the audio input while keeping the same WAV file and sample rate. If recovery fails, the captured audio is preserved with an interruption warning. A pending disk write must finish before the recording becomes available for playback or export.
 
-Android uses foreground services with persistent notifications for recording, transcription, text processing, and transfers. You can lock the screen after starting an operation. Returning to Hearfolio restores its progress or committed result without repeating a cloud request. If the process is killed, recoverable WAV audio is retained and unfinished processing is reported once as interrupted: the recording list shows how many segments are done, **Archive** lists audio that was never saved, and temporary files of the interrupted job are removed at the next start. Recording audio does not send it to OpenRouter until you start transcription with that service selected.
+Android uses foreground services with persistent notifications for recording, transcription, text processing, and uploads to an organization. You can lock the screen after starting an operation. Returning to Hearfolio restores its progress or committed result without repeating a cloud request. If the process is killed, recoverable WAV audio is retained and unfinished processing is reported once as interrupted: the recording list shows how many segments are done, **Archive** lists audio that was never saved, and temporary files of the interrupted job are removed at the next start. Recording audio does not send it to OpenRouter until you start transcription with that service selected.
 
-Android capture is limited to four hours, cloud processing and transfers to two hours, and background transfer waiting to twelve hours per session. System restrictions can stop work earlier. **Settings → Background tasks** links to the app's Android battery settings if the device interrupts recording. Force-stopping the app ends its work; it does not restart paid processing automatically.
+Android capture is limited to four hours per session and background processing to twelve hours. System restrictions can stop work earlier. **Settings → Background tasks** links to the app's Android battery settings if the device interrupts recording. Force-stopping the app ends its work; it does not restart paid processing automatically.
 
 Android captures uncompressed mono samples through `AudioRecord`, using the standard `MIC` source with device preprocessing and a `DEFAULT` fallback. System automatic gain control is enabled when available; devices without it can still record. The waveform shows measured microphone input. Silence or quiet speech does not trigger a microphone warning. On macOS, Hearfolio explicitly requests microphone permission before starting capture. If access was previously denied, enable Hearfolio under **System Settings → Privacy & Security → Microphone**.
 
