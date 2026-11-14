@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.0 (2026-11-14)
+
+### Features
+
+- unify the app UI and remove device-to-device transfer ([cfb86df](https://github.com/bubaley/hearfolio/commit/cfb86df09c4972cb082bd4abd0ad208cafa2cedb))
+
 ## 0.11.2 (2026-11-13)
 
 ### Fixes and performance
