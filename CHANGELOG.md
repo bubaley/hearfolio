@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.0 (2026-11-15)
+
+### Features
+
+- **transcription:** keep phrase timings and speakers from speech-to-text models ([c8dcd1c](https://github.com/bubaley/hearfolio/commit/c8dcd1c15ff6d5d6048a1255bd2326d3abac66c0))
+
 ## 0.12.0 (2026-11-14)
 
 ### Features
