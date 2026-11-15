@@ -1,3 +1,4 @@
+use crate::phrases::Phrase;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -107,6 +108,19 @@ pub fn rename_entry_at(dir: &Path, id: &str, name: &str) -> Result<HistoryEntry,
 }
 
 pub fn save_transcript_at(dir: &Path, id: &str, model: String, text: &str) -> Result<(), String> {
+    save_timed_transcript_at(dir, id, model, text, &[])
+}
+/// Saves the text with its timed phrases. The text stays the transcript every
+/// feature uses; the phrases are kept beside it (`<id>.segments.json`) and are
+/// only believed while they belong to exactly this text. Failing to keep them
+/// never fails the transcript.
+pub fn save_timed_transcript_at(
+    dir: &Path,
+    id: &str,
+    model: String,
+    text: &str,
+    phrases: &[Phrase],
+) -> Result<(), String> {
     let mut entries = read_history_at(dir)?;
     let entry = entries
         .iter_mut()
@@ -116,7 +130,63 @@ pub fn save_transcript_at(dir: &Path, id: &str, model: String, text: &str) -> Re
     entry.completed_at = Some(crate::clock());
     // A new transcript starts without the gaps of the previous one.
     entry.incomplete_ranges.clear();
-    replace_transcript_at(dir, entry.clone(), text)
+    replace_transcript_at(dir, entry.clone(), text)?;
+    let output = dir.join("output").join(format!("{id}.txt"));
+    if phrases.is_empty() {
+        let _ = fs::remove_file(phrases_path(&output));
+    } else if let Err(error) = write_phrases(&output, text, phrases) {
+        eprintln!("Фразы с временем не сохранены для {id}: {error}");
+    }
+    Ok(())
+}
+
+/// Timed phrases of a transcript file, kept beside it.
+fn phrases_path(output: &Path) -> PathBuf {
+    output.with_extension("segments.json")
+}
+#[derive(Serialize, Deserialize)]
+struct PhrasesFile {
+    /// SHA-256 of the transcript text these phrases belong to.
+    text_sha256: String,
+    segments: Vec<Phrase>,
+}
+fn text_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+fn write_phrases(output: &Path, text: &str, phrases: &[Phrase]) -> std::io::Result<()> {
+    let target = phrases_path(output);
+    let temp = target.with_extension("json.tmp");
+    let bytes = serde_json::to_vec(&PhrasesFile {
+        text_sha256: text_hash(text),
+        segments: phrases.to_vec(),
+    })?;
+    let written = (|| {
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, &target)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    written
+}
+/// The timed phrases saved with `text`, or nothing when there are none or they
+/// belong to another text (an older transcript, an edited file).
+pub fn read_phrases(output: &Path, text: &str) -> Vec<Phrase> {
+    let path = phrases_path(output);
+    if fs::metadata(&path).map_or(true, |metadata| {
+        !metadata.is_file() || metadata.len() > 64 * 1024 * 1024
+    }) {
+        return Vec::new();
+    }
+    fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PhrasesFile>(&bytes).ok())
+        .filter(|file| file.text_sha256 == text_hash(text))
+        .map(|file| file.segments)
+        .unwrap_or_default()
 }
 pub fn set_incomplete_ranges_at(dir: &Path, id: &str, ranges: Vec<[u64; 2]>) -> Result<(), String> {
     let mut entries = read_history_at(dir)?;
@@ -266,6 +336,10 @@ pub fn delete_entries_at(dir: &Path, id: Option<&str>) -> Result<(), String> {
         }
         if let Some(output) = &entry.output_path {
             if let Some(path) = managed_file(dir, &entry, output, "output") {
+                let phrases = phrases_path(&path);
+                if fs::symlink_metadata(&phrases).is_ok_and(|metadata| metadata.is_file()) {
+                    paths.insert(phrases);
+                }
                 paths.insert(path);
             }
         }
@@ -505,6 +579,56 @@ mod tests {
             Some("openrouter/new-model")
         );
         assert_eq!(fs::read_dir(dir.join("temp")).unwrap().count(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn timed_phrases_live_beside_the_text_and_only_count_for_that_text() {
+        let dir = fixture();
+        let record = entry(&dir, "hearing-1");
+        fs::write(&record.input_path, b"audio").unwrap();
+        write_history_at(&dir, std::slice::from_ref(&record)).unwrap();
+        let phrases = vec![Phrase {
+            start_ms: 0,
+            end_ms: 1500,
+            text: "Hello.".into(),
+            speaker: Some("0:1".into()),
+        }];
+        save_timed_transcript_at(
+            &dir,
+            &record.id,
+            "openrouter/x-ai/grok-stt-2.0".into(),
+            "Hello.",
+            &phrases,
+        )
+        .unwrap();
+        let output = PathBuf::from(
+            read_history_at(&dir).unwrap()[0]
+                .output_path
+                .clone()
+                .unwrap(),
+        );
+        assert_eq!(
+            fs::read_to_string(&output).unwrap(),
+            "Hello.",
+            "the text file is unchanged in form"
+        );
+        assert_eq!(read_phrases(&output, "Hello."), phrases);
+        // The history itself carries no phrases: old builds read it as before.
+        assert!(!fs::read_to_string(dir.join("history.json"))
+            .unwrap()
+            .contains("segments"));
+        // An edited text no longer matches its phrases.
+        assert!(read_phrases(&output, "Hello, edited.").is_empty());
+        // A transcript without times removes the old phrases.
+        save_transcript_at(&dir, &record.id, "whisper-base".into(), "Other.").unwrap();
+        assert!(!dir.join("output/hearing-1.segments.json").exists());
+        assert!(read_phrases(&output, "Other.").is_empty());
+        // Deleting the record deletes its phrases too.
+        save_timed_transcript_at(&dir, &record.id, "m".into(), "Hello.", &phrases).unwrap();
+        assert!(dir.join("output/hearing-1.segments.json").exists());
+        delete_entries_at(&dir, Some(&record.id)).unwrap();
+        assert!(!dir.join("output/hearing-1.segments.json").exists());
+        assert!(!output.exists());
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

@@ -383,6 +383,10 @@ fn create_body(job: &Job) -> Value {
     {
         body["transcript_text"] = json!(text);
         body["transcription_model"] = json!(job.transcription_model);
+        // `speaker` is optional; a server without it ignores the field.
+        if !job.transcript_segments.is_empty() {
+            body["transcript_segments"] = json!(job.transcript_segments);
+        }
     }
     body
 }

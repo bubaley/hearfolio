@@ -50,6 +50,10 @@ pub struct Job {
     pub visibility: String,
     #[serde(default)]
     pub transcript_text: Option<String>,
+    /// Timed phrases of `transcript_text`, when the local model gave times.
+    /// Sent as `transcript_segments`, which the server already accepts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript_segments: Vec<crate::phrases::Phrase>,
     #[serde(default)]
     pub transcription_model: Option<String>,
     #[serde(default)]
@@ -324,6 +328,7 @@ pub(crate) fn sample(size: u64) -> Job {
         project_id: None,
         visibility: "organization".into(),
         transcript_text: None,
+        transcript_segments: Vec::new(),
         transcription_model: None,
         local_record_id: None,
         phase: Phase::Queued,

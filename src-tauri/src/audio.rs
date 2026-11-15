@@ -276,9 +276,15 @@ struct ChunkWriter<'a> {
     writer: Option<hound::WavWriter<std::io::BufWriter<fs::File>>>,
     in_chunk: u64,
     chunks: Vec<PathBuf>,
+    /// Samples before the first piece (audio an earlier attempt already did).
+    skip: u64,
 }
 impl ChunkWriter<'_> {
     fn push(&mut self, value: f32) -> Result<(), String> {
+        if self.skip > 0 {
+            self.skip -= 1;
+            return Ok(());
+        }
         if self.in_chunk == self.rate as u64 * u64::from(self.seconds) {
             if let Some(writer) = self.writer.take() {
                 writer
@@ -337,7 +343,7 @@ pub fn prepare_cloud_chunks(
     seconds: u32,
     progress: impl FnMut(u64, u64),
 ) -> Result<Vec<PathBuf>, String> {
-    prepare_cloud_chunks_sliced(input, destination, seconds, SLICING, progress)
+    prepare_cloud_chunks_sliced(input, destination, seconds, SLICING, 0, progress)
 }
 
 /// How a recording is cut into pieces. Finished pieces of an interrupted run
@@ -345,11 +351,24 @@ pub fn prepare_cloud_chunks(
 /// the version it started with.
 /// 1: a piece every `seconds`. 2: a last piece of a few seconds joins the one before.
 pub const SLICING: u32 = 2;
+/// Pieces of the audio after its first `start_ms` milliseconds (the end of the
+/// parts an interrupted attempt finished), cut with the current slicing. Empty
+/// when nothing is left after a non-zero start.
+pub fn prepare_cloud_chunks_from(
+    input: &Path,
+    destination: &Path,
+    seconds: u32,
+    start_ms: u64,
+    progress: impl FnMut(u64, u64),
+) -> Result<Vec<PathBuf>, String> {
+    prepare_cloud_chunks_sliced(input, destination, seconds, SLICING, start_ms, progress)
+}
 pub fn prepare_cloud_chunks_sliced(
     input: &Path,
     destination: &Path,
     seconds: u32,
     slicing: u32,
+    start_ms: u64,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<Vec<PathBuf>, String> {
     let mut probed = probe(input)?;
@@ -406,6 +425,7 @@ pub fn prepare_cloud_chunks_sliced(
                     writer: None,
                     in_chunk: 0,
                     chunks: Vec::new(),
+                    skip: start_ms * u64::from(rate) / 1000,
                 },
                 Resampler::new(sample_rate, rate),
             )
@@ -441,6 +461,9 @@ pub fn prepare_cloud_chunks_sliced(
     }
     let mut chunks = writer.finish()?;
     if chunks.is_empty() {
+        if start_ms > 0 {
+            return Ok(chunks);
+        }
         return Err("errors.audioEmpty".into());
     }
     if slicing >= 2 {
@@ -583,6 +606,39 @@ mod tests {
         directory
     }
     #[test]
+    fn a_resumed_cut_continues_sample_for_sample_where_the_finished_parts_end() {
+        let dir = fixture();
+        let input = dir.join("source.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&input, spec).unwrap();
+        for index in 0..16000 * 25 {
+            writer.write_sample((index % 20_000) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        let samples = |path: &Path| {
+            hound::WavReader::open(path)
+                .unwrap()
+                .samples::<i16>()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        };
+        let whole = dir.join("whole");
+        fs::create_dir_all(&whole).unwrap();
+        let first = prepare_cloud_chunks(&input, &whole, 10, |_, _| {}).unwrap();
+        let rest = dir.join("rest");
+        fs::create_dir_all(&rest).unwrap();
+        let resumed = prepare_cloud_chunks_from(&input, &rest, 15, 10_000, |_, _| {}).unwrap();
+        assert_eq!(resumed.len(), 1);
+        let expected: Vec<i16> = first[1..].iter().flat_map(|piece| samples(piece)).collect();
+        assert_eq!(samples(&resumed[0]), expected);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn decoder_splits_stereo_into_bounded_mono_chunks_without_ffmpeg() {
         let dir = fixture();
         let input = dir.join("source.wav");
@@ -613,7 +669,7 @@ mod tests {
         // Pieces of a run started before the remainder was joined keep their cut.
         let legacy = dir.join("legacy");
         fs::create_dir_all(&legacy).unwrap();
-        let old = prepare_cloud_chunks_sliced(&input, &legacy, 30, 1, |_, _| {}).unwrap();
+        let old = prepare_cloud_chunks_sliced(&input, &legacy, 30, 1, 0, |_, _| {}).unwrap();
         assert_eq!(old.len(), 2);
         assert_eq!(hound::WavReader::open(&old[1]).unwrap().duration(), 16000);
         // A remainder long enough to carry speech stays a piece of its own.
@@ -635,6 +691,26 @@ mod tests {
             16000 * 31
         );
         assert_eq!(detect_extension(&input).unwrap(), "wav");
+        // A resumed run cuts the rest from where the finished parts end, in
+        // pieces of the length it uses now.
+        let rest = dir.join("rest");
+        fs::create_dir_all(&rest).unwrap();
+        let pieces = prepare_cloud_chunks_from(&input, &rest, 10, 20_000, |_, _| {}).unwrap();
+        assert_eq!(
+            pieces
+                .iter()
+                .map(|piece| hound::WavReader::open(piece).unwrap().duration())
+                .collect::<Vec<_>>(),
+            [16000 * 11],
+            "11 s remain; the 1 s tail joins the piece before it"
+        );
+        let after = dir.join("after");
+        fs::create_dir_all(&after).unwrap();
+        assert!(
+            prepare_cloud_chunks_from(&input, &after, 10, 31_000, |_, _| {})
+                .unwrap()
+                .is_empty()
+        );
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

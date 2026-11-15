@@ -5,6 +5,7 @@
 //! it is kept as a gap the user is told about. Only a failure that repeating cannot fix reaches the user, and
 //! it never costs the pieces that are already done.
 use crate::cloud::{transient, Recognized};
+use crate::phrases::{coarse, Phrase};
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -24,9 +25,22 @@ pub fn backoff(failures: u32) -> Duration {
 
 /// What the job needs from the outside world; tests replace it with a script.
 pub trait Backend {
-    /// One request. `live` receives the text of this request as it grows.
-    fn recognize(&mut self, audio: &Path, live: &mut dyn FnMut(&str))
-        -> Result<Recognized, String>;
+    /// One request for `audio`, which starts `offset_ms` into the recording.
+    /// `live` receives the text of this request as it grows.
+    fn recognize(
+        &mut self,
+        audio: &Path,
+        offset_ms: u64,
+        live: &mut dyn FnMut(&str),
+    ) -> Result<Recognized, String>;
+    /// Length of a piece in milliseconds, when it can be read.
+    fn duration_ms(&mut self, audio: &Path) -> Option<u64>;
+    /// Longer than the user's segment length (a model that tells speakers
+    /// apart gets long pieces): a request that times out is divided instead
+    /// of repeated.
+    fn oversized(&mut self, _audio: &Path) -> bool {
+        false
+    }
     /// A pause that ends early with an error when the user cancels.
     fn wait(&mut self, delay: Duration) -> Result<(), String>;
     /// Two halves of `audio`, or `None` when it is too short to divide.
@@ -45,6 +59,20 @@ pub struct Outcome {
     /// for audible audio; `text` is what it did write. The transcript
     /// continues, the passage is reported.
     pub incomplete: bool,
+    /// Timed phrases of the piece, in milliseconds from the start of the
+    /// recording; one phrase for the piece when the model gave no times.
+    pub phrases: Vec<Phrase>,
+}
+
+/// Failures that can mean the request took too long.
+fn timed_out(error: &str) -> bool {
+    let code = error.split('|').next().unwrap_or(error);
+    matches!(
+        code,
+        "errors.cloudConnect" | "errors.cloudResponseRead" | "errors.cloudInterrupted"
+    ) || ["HTTP 408", "HTTP 504", "HTTP 524"]
+        .iter()
+        .any(|status| error.contains(status))
 }
 
 fn join(first: &str, second: &str) -> String {
@@ -60,46 +88,70 @@ fn join(first: &str, second: &str) -> String {
 pub fn recognize(
     backend: &mut dyn Backend,
     audio: &Path,
+    offset_ms: u64,
     live: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
-    piece(backend, audio, "", live)
+    piece(backend, audio, offset_ms, "", live)
+}
+
+/// Both halves in order; the second starts where the first ends.
+fn halves(
+    backend: &mut dyn Backend,
+    (first, second): (PathBuf, PathBuf),
+    offset_ms: u64,
+    before: &str,
+    live: &mut dyn FnMut(&str),
+) -> Result<Outcome, String> {
+    backend.stage("progress.splitCloudChunk");
+    let middle = offset_ms + backend.duration_ms(&first).unwrap_or(0);
+    let head = piece(backend, &first, offset_ms, before, live)?;
+    let tail = piece(backend, &second, middle, &join(before, &head.text), live)?;
+    let mut phrases = head.phrases;
+    phrases.extend(tail.phrases);
+    Ok(Outcome {
+        text: join(&head.text, &tail.text),
+        incomplete: head.incomplete || tail.incomplete,
+        phrases,
+    })
 }
 
 fn piece(
     backend: &mut dyn Backend,
     audio: &Path,
+    offset_ms: u64,
     before: &str,
     live: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
     let mut failures = 0;
     let mut unanswered = false;
     loop {
-        let result = backend.recognize(audio, &mut |text| live(&join(before, text)));
+        let result = backend.recognize(audio, offset_ms, &mut |text| live(&join(before, text)));
         match result {
             Ok(recognized) if !recognized.truncated => {
+                let phrases = if recognized.phrases.is_empty() {
+                    coarse(offset_ms, backend.duration_ms(audio), &recognized.text)
+                } else {
+                    recognized.phrases
+                };
                 return Ok(Outcome {
                     text: recognized.text,
                     incomplete: false,
-                })
+                    phrases,
+                });
             }
             // The same audio would hit the same limit again. Shorter audio
             // needs less text and breaks a model out of repeating itself.
             Ok(recognized) => {
-                let Some((first, second)) = backend.split(audio)? else {
+                let Some(parts) = backend.split(audio)? else {
                     let text = collapse_repetition(&recognized.text);
                     live(&join(before, &text));
                     return Ok(Outcome {
+                        phrases: coarse(offset_ms, backend.duration_ms(audio), &text),
                         text,
                         incomplete: true,
                     });
                 };
-                backend.stage("progress.splitCloudChunk");
-                let head = piece(backend, &first, before, live)?;
-                let tail = piece(backend, &second, &join(before, &head.text), live)?;
-                return Ok(Outcome {
-                    text: join(&head.text, &tail.text),
-                    incomplete: head.incomplete || tail.incomplete,
-                });
+                return halves(backend, parts, offset_ms, before, live);
             }
             // Nothing came back. For a pause in a meeting or a recorder left
             // running that is the right answer, and the samples prove it. For
@@ -111,11 +163,34 @@ fn piece(
                 }
                 if unanswered {
                     return Ok(Outcome {
-                        text: String::new(),
                         incomplete: true,
+                        ..Outcome::default()
                     });
                 }
                 unanswered = true;
+            }
+            // Too much audio for one request body: two shorter requests.
+            Err(error) if error.starts_with("errors.audioTooLarge") => {
+                let Some(parts) = backend.split(audio)? else {
+                    return Err(error);
+                };
+                live(before);
+                return halves(backend, parts, offset_ms, before, live);
+            }
+            // A long piece that timed out would time out again: two shorter
+            // requests instead (normal chunking).
+            Err(error) if transient(&error) && timed_out(&error) && backend.oversized(audio) => {
+                if let Some(parts) = backend.split(audio)? {
+                    live(before);
+                    return halves(backend, parts, offset_ms, before, live);
+                }
+                if failures + 1 >= ATTEMPTS {
+                    return Err(error);
+                }
+                failures += 1;
+                backend.stage("progress.retryCloudChunk");
+                backend.wait(backoff(failures))?;
+                live(before);
             }
             Err(error) if transient(&error) && failures + 1 < ATTEMPTS => {
                 failures += 1;
@@ -149,29 +224,21 @@ pub fn verdict(parts: &[String], incomplete: &[u64], finished: bool) -> Result<(
     }
     Ok(())
 }
-/// Passages to check by ear, in whole seconds of the recording, from the real
-/// length of every piece. Neighbouring gaps become one passage.
-pub fn passages(incomplete: &[u64], seconds: &[f64]) -> Vec<[u64; 2]> {
-    let mut starts = Vec::with_capacity(seconds.len() + 1);
-    let mut offset = 0.0;
-    for length in seconds {
-        starts.push(offset);
-        offset += length.max(0.0);
-    }
-    starts.push(offset);
+/// Passages to check by ear, in whole seconds of the recording, from where
+/// every piece ends (milliseconds; each starts where the one before ends).
+/// Neighbouring gaps become one passage.
+pub fn passages(incomplete: &[u64], ends_ms: &[u64]) -> Vec<[u64; 2]> {
     let mut passages: Vec<[u64; 2]> = Vec::new();
     let mut indexes: Vec<usize> = incomplete
         .iter()
         .map(|index| *index as usize)
-        .filter(|index| *index < seconds.len())
+        .filter(|index| *index < ends_ms.len())
         .collect();
     indexes.sort_unstable();
     indexes.dedup();
     for index in indexes {
-        let range = [
-            starts[index].floor() as u64,
-            starts[index + 1].ceil() as u64,
-        ];
+        let start = if index == 0 { 0 } else { ends_ms[index - 1] };
+        let range = [start / 1000, ends_ms[index].max(start).div_ceil(1000)];
         match passages.last_mut() {
             Some(last) if last[1] >= range[0] => last[1] = range[1],
             _ => passages.push(range),
@@ -229,11 +296,13 @@ mod tests {
     struct Script {
         replies: VecDeque<Result<Recognized, String>>,
         requests: Vec<String>,
+        offsets: Vec<u64>,
         waits: Vec<Duration>,
         stages: Vec<&'static str>,
         cancel_during_wait: bool,
         splittable: bool,
         quiet: bool,
+        oversized: bool,
     }
     impl Script {
         fn new(replies: Vec<Result<Recognized, String>>) -> Self {
@@ -248,9 +317,11 @@ mod tests {
         fn recognize(
             &mut self,
             audio: &Path,
+            offset_ms: u64,
             live: &mut dyn FnMut(&str),
         ) -> Result<Recognized, String> {
             self.requests.push(audio.to_string_lossy().into_owned());
+            self.offsets.push(offset_ms);
             let reply = self.replies.pop_front().expect("unexpected request");
             if let Ok(recognized) = &reply {
                 live(&recognized.text);
@@ -278,6 +349,13 @@ mod tests {
         fn silent(&mut self, _audio: &Path) -> bool {
             self.quiet
         }
+        // "chunk" lasts 120 s; every halving halves it.
+        fn duration_ms(&mut self, audio: &Path) -> Option<u64> {
+            Some(120_000 >> audio.to_string_lossy().matches('-').count())
+        }
+        fn oversized(&mut self, audio: &Path) -> bool {
+            self.oversized && !audio.to_string_lossy().contains('-')
+        }
         fn stage(&mut self, stage: &'static str) {
             self.stages.push(stage);
         }
@@ -285,14 +363,23 @@ mod tests {
     fn full(text: &str) -> Result<Recognized, String> {
         Ok(Recognized {
             text: text.into(),
-            truncated: false,
+            ..Recognized::default()
         })
     }
     fn cut(text: &str) -> Result<Recognized, String> {
         Ok(Recognized {
             text: text.into(),
             truncated: true,
+            ..Recognized::default()
         })
+    }
+    fn phrase(start_ms: u64, end_ms: u64, text: &str) -> Phrase {
+        Phrase {
+            start_ms,
+            end_ms,
+            text: text.into(),
+            speaker: None,
+        }
     }
     fn fail(error: &str) -> Result<Recognized, String> {
         Err(error.into())
@@ -307,7 +394,7 @@ mod tests {
             full("the whole piece"),
         ]);
         let mut seen = Vec::new();
-        let outcome = recognize(&mut script, Path::new("chunk"), &mut |text| {
+        let outcome = recognize(&mut script, Path::new("chunk"), 0, &mut |text| {
             seen.push(text.to_owned())
         })
         .unwrap();
@@ -326,7 +413,7 @@ mod tests {
     fn a_passing_failure_is_reported_after_the_last_attempt_and_a_lasting_one_at_once() {
         let mut script = Script::new((0..ATTEMPTS).map(|_| fail("errors.cloudConnect")).collect());
         assert_eq!(
-            recognize(&mut script, Path::new("chunk"), &mut |_| {}).unwrap_err(),
+            recognize(&mut script, Path::new("chunk"), 0, &mut |_| {}).unwrap_err(),
             "errors.cloudConnect"
         );
         assert_eq!(script.requests.len(), ATTEMPTS as usize);
@@ -339,7 +426,7 @@ mod tests {
         ] {
             let mut script = Script::new(vec![fail(error)]);
             assert_eq!(
-                recognize(&mut script, Path::new("chunk"), &mut |_| {}).unwrap_err(),
+                recognize(&mut script, Path::new("chunk"), 0, &mut |_| {}).unwrap_err(),
                 error
             );
             assert!(script.waits.is_empty(), "{error} is never retried");
@@ -351,7 +438,7 @@ mod tests {
         let mut script = Script::new(vec![fail("errors.cloudConnect")]);
         script.cancel_during_wait = true;
         assert_eq!(
-            recognize(&mut script, Path::new("chunk"), &mut |_| {}).unwrap_err(),
+            recognize(&mut script, Path::new("chunk"), 0, &mut |_| {}).unwrap_err(),
             "errors.operationCancelled"
         );
         assert_eq!(script.requests.len(), 1);
@@ -366,7 +453,7 @@ mod tests {
             full("second half"),
         ]);
         let mut seen = Vec::new();
-        let outcome = recognize(&mut script, Path::new("chunk"), &mut |text| {
+        let outcome = recognize(&mut script, Path::new("chunk"), 0, &mut |text| {
             seen.push(text.to_owned())
         })
         .unwrap();
@@ -392,7 +479,7 @@ mod tests {
             full("middle"),
             cut(&looped),
         ]);
-        let outcome = recognize(&mut script, Path::new("chunk"), &mut |_| {}).unwrap();
+        let outcome = recognize(&mut script, Path::new("chunk"), 0, &mut |_| {}).unwrap();
         assert_eq!(
             script.requests,
             ["chunk", "chunk-a", "chunk-b", "chunk-b-a", "chunk-b-b"]
@@ -405,7 +492,7 @@ mod tests {
         // Without anything to divide the text is kept as it came.
         let mut script = Script::new(vec![cut("only the beginning of")]);
         script.splittable = false;
-        let outcome = recognize(&mut script, Path::new("chunk"), &mut |_| {}).unwrap();
+        let outcome = recognize(&mut script, Path::new("chunk"), 0, &mut |_| {}).unwrap();
         assert_eq!(outcome.text, "only the beginning of");
         assert!(outcome.incomplete);
     }
@@ -415,7 +502,7 @@ mod tests {
         // The samples are silent: the empty answer is believed, nothing is repeated.
         let mut script = Script::new(vec![fail("errors.emptyTranscript")]);
         script.quiet = true;
-        let outcome = recognize(&mut script, Path::new("chunk"), &mut |_| {}).unwrap();
+        let outcome = recognize(&mut script, Path::new("chunk"), 0, &mut |_| {}).unwrap();
         assert_eq!(outcome, Outcome::default());
         assert_eq!(script.requests.len(), 1);
         // Audible audio and two empty answers (a refusal, a null body): the
@@ -424,18 +511,18 @@ mod tests {
             fail("errors.emptyTranscript"),
             fail("errors.emptyTranscript"),
         ]);
-        let outcome = recognize(&mut script, Path::new("chunk"), &mut |_| {}).unwrap();
+        let outcome = recognize(&mut script, Path::new("chunk"), 0, &mut |_| {}).unwrap();
         assert_eq!(
             outcome,
             Outcome {
-                text: String::new(),
-                incomplete: true
+                incomplete: true,
+                ..Outcome::default()
             }
         );
         assert!(script.waits.is_empty());
         // A hiccup: the second request does hear speech.
         let mut script = Script::new(vec![fail("errors.emptyTranscript"), full("speech")]);
-        let outcome = recognize(&mut script, Path::new("chunk"), &mut |_| {}).unwrap();
+        let outcome = recognize(&mut script, Path::new("chunk"), 0, &mut |_| {}).unwrap();
         assert_eq!(outcome.text, "speech");
         assert!(!outcome.incomplete);
     }
@@ -497,13 +584,87 @@ mod tests {
     }
 
     #[test]
-    fn passages_use_the_real_length_of_each_piece_and_join_neighbours() {
+    fn passages_use_the_real_end_of_each_piece_and_join_neighbours() {
         // Three pieces of 120 s and a last one of 127.4 s (a short remainder joined to it).
-        let seconds = [120.0, 120.0, 120.0, 127.4];
-        assert_eq!(passages(&[3], &seconds), [[360, 488]]);
-        assert_eq!(passages(&[0, 2], &seconds), [[0, 120], [240, 360]]);
-        assert_eq!(passages(&[2, 1, 1], &seconds), [[120, 360]]);
-        assert!(passages(&[9], &seconds).is_empty());
-        assert!(passages(&[], &seconds).is_empty());
+        let ends = [120_000, 240_000, 360_000, 487_400];
+        assert_eq!(passages(&[3], &ends), [[360, 488]]);
+        assert_eq!(passages(&[0, 2], &ends), [[0, 120], [240, 360]]);
+        assert_eq!(passages(&[2, 1, 1], &ends), [[120, 360]]);
+        assert!(passages(&[9], &ends).is_empty());
+        assert!(passages(&[], &ends).is_empty());
+        // Pieces of different lengths (a run resumed with another segment length).
+        assert_eq!(passages(&[1], &[120_000, 600_000]), [[120, 600]]);
+    }
+
+    #[test]
+    fn halves_are_timed_from_where_they_start_in_the_recording() {
+        let mut script = Script::new(vec![
+            cut("too much"),
+            full("first half"),
+            Ok(Recognized {
+                text: "second half".into(),
+                phrases: vec![phrase(250_000, 251_000, "second half")],
+                ..Recognized::default()
+            }),
+        ]);
+        let outcome = recognize(&mut script, Path::new("chunk"), 180_000, &mut |_| {}).unwrap();
+        assert_eq!(script.offsets, [180_000, 180_000, 240_000]);
+        // A model without times gets one phrase for its half; timed phrases are kept.
+        assert_eq!(
+            outcome.phrases,
+            [
+                phrase(180_000, 240_000, "first half"),
+                phrase(250_000, 251_000, "second half")
+            ]
+        );
+        // Without a split: one phrase for the piece; silence has none.
+        let mut script = Script::new(vec![full("all of it")]);
+        let outcome = recognize(&mut script, Path::new("chunk"), 0, &mut |_| {}).unwrap();
+        assert_eq!(outcome.phrases, [phrase(0, 120_000, "all of it")]);
+        let mut script = Script::new(vec![fail("errors.emptyTranscript")]);
+        script.quiet = true;
+        let outcome = recognize(&mut script, Path::new("chunk"), 0, &mut |_| {}).unwrap();
+        assert!(outcome.phrases.is_empty());
+    }
+
+    #[test]
+    fn a_long_piece_that_times_out_is_divided_instead_of_repeated() {
+        let mut script = Script::new(vec![
+            fail("errors.cloudHttp|HTTP 504: upstream timeout"),
+            full("head"),
+            full("tail"),
+        ]);
+        script.oversized = true;
+        let outcome = recognize(&mut script, Path::new("chunk"), 0, &mut |_| {}).unwrap();
+        assert_eq!(outcome.text, "head tail");
+        assert_eq!(script.requests, ["chunk", "chunk-a", "chunk-b"]);
+        assert!(
+            script.waits.is_empty(),
+            "no pause before the shorter requests"
+        );
+        // A body over the provider's limit is divided before anything is sent again.
+        let mut script = Script::new(vec![
+            fail("errors.audioTooLarge"),
+            full("head"),
+            full("tail"),
+        ]);
+        let outcome = recognize(&mut script, Path::new("chunk"), 0, &mut |_| {}).unwrap();
+        assert_eq!(outcome.text, "head tail");
+        assert!(script.waits.is_empty());
+        let mut script = Script::new(vec![fail("errors.audioTooLarge")]);
+        script.splittable = false;
+        assert_eq!(
+            recognize(&mut script, Path::new("chunk"), 0, &mut |_| {}).unwrap_err(),
+            "errors.audioTooLarge"
+        );
+        // Rate limiting is not about length: the same piece is repeated.
+        let mut script = Script::new(vec![fail("errors.cloudHttp|HTTP 429: slow"), full("all")]);
+        script.oversized = true;
+        recognize(&mut script, Path::new("chunk"), 0, &mut |_| {}).unwrap();
+        assert_eq!(script.requests, ["chunk", "chunk"]);
+        // An ordinary piece that times out is repeated as before.
+        let mut script = Script::new(vec![fail("errors.cloudConnect"), full("all")]);
+        recognize(&mut script, Path::new("chunk"), 0, &mut |_| {}).unwrap();
+        assert_eq!(script.requests, ["chunk", "chunk"]);
     }
 }

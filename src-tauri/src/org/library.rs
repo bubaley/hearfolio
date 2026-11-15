@@ -302,6 +302,33 @@ mod tests {
     }
 
     #[test]
+    fn timed_segments_with_speakers_and_unknown_fields_are_kept_as_sent() {
+        let dir = std::env::temp_dir().join(format!("hearfolio-library-{}", uuid::Uuid::new_v4()));
+        let segments = json!([
+            {"start_ms":0,"end_ms":5722,"text":"Привет.","speaker":"0:0"},
+            {"start_ms":7323,"end_ms":13326,"text":"Согласен.","speaker":1,"confidence":0.9},
+            {"start_ms":14866,"end_ms":18888,"text":"Отлично."}
+        ]);
+        let mut recording = item("a", "2026-01-01T10:00:00Z", "A");
+        recording["transcript_segments"] = segments.clone();
+        let page: SyncPage = serde_json::from_value(json!({
+            "items": [recording], "deleted_ids": [], "next_cursor": null, "has_more": false,
+            "some_future_field": true
+        }))
+        .unwrap();
+        let mut index = LibraryIndex::default();
+        let mut change = Change::default();
+        merge(&mut index, page, 1, &mut change);
+        apply_change(&dir, &change).unwrap();
+        assert_eq!(
+            read_detail(&dir, "a").unwrap().recording["transcript_segments"],
+            segments
+        );
+        assert!(index.items["a"].get("transcript_segments").is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn stale_copies_never_overwrite_newer_ones() {
         let mut index = LibraryIndex::default();
         let mut change = Change::default();

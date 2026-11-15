@@ -118,7 +118,9 @@ fn fake_cloud(
                 let ok = sent["client_id"] == "c1"
                     && sent["audio_size"] == 20
                     && sent["visibility"] == "personal"
-                    && sent["transcript_text"] == "hello";
+                    && sent["transcript_text"] == "hello"
+                    && sent["transcript_segments"]
+                        == json!([{"start_ms":0,"end_ms":900,"text":"hello","speaker":"0:1"}]);
                 if ok {
                     respond(
                         201,
@@ -191,6 +193,12 @@ fn multipart_upload_resumes_after_a_failed_part_and_lands_in_the_cache() {
         job.file = pending.clone();
         job.visibility = "personal".into();
         job.transcript_text = Some("hello".into());
+        job.transcript_segments = vec![crate::phrases::Phrase {
+            start_ms: 0,
+            end_ms: 900,
+            text: "hello".into(),
+            speaker: Some("0:1".into()),
+        }];
         super::super::write_queue(&[job]).unwrap();
     }
     super::super::secrets::store("conn", "secret").unwrap();

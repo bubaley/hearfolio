@@ -4,6 +4,7 @@ mod cloud;
 mod cloud_job;
 mod compact;
 mod org;
+mod phrases;
 mod platform;
 mod postprocess;
 mod recording;
@@ -128,6 +129,10 @@ struct HistoryDetail {
     entry: HistoryEntry,
     text: String,
     warning: Option<String>,
+    /// Timed phrases of `text` (`start_ms`, `end_ms`, `text`, optional
+    /// `speaker`), when the model gave times.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    segments: Vec<phrases::Phrase>,
 }
 
 const MODELS: [(&str, &str, u64); 4] = [
@@ -794,10 +799,16 @@ fn get_history(id: String) -> Result<HistoryDetail, String> {
         },
         None => (String::new(), None),
     };
+    let segments = entry
+        .output_path
+        .as_ref()
+        .map(|path| records::read_phrases(Path::new(path), &text))
+        .unwrap_or_default();
     Ok(HistoryDetail {
         entry,
         text,
         warning,
+        segments,
     })
 }
 #[tauri::command]
@@ -878,15 +889,11 @@ fn clear_history() -> Result<(), String> {
 /// or null. Starting `transcribe` with that configuration skips them.
 #[tauri::command]
 fn unfinished_transcriptions() -> Result<Vec<resume::Unfinished>, String> {
-    Ok(resume::unfinished(&base()?, cloud::load()?.chunk_seconds))
+    Ok(resume::unfinished(&base()?))
 }
 #[tauri::command]
 fn cloud_resume_state(id: String) -> Result<Option<serde_json::Value>, String> {
-    Ok(resume::resumable(
-        &base()?,
-        &id,
-        cloud::load()?.chunk_seconds,
-    ))
+    Ok(resume::resumable(&base()?, &id))
 }
 #[tauri::command]
 async fn download_model(app: tauri::AppHandle, id: String) -> Result<(), String> {
@@ -1269,9 +1276,17 @@ struct CloudBackend<'a> {
     promoted: &'a mut bool,
     /// The model's own output limit, when the catalog states one.
     output_limit: Option<u64>,
+    /// Seconds of the pieces this run cuts.
+    chunk_seconds: u32,
     index: u64,
     total: u64,
     start: Instant,
+}
+/// Length of a prepared piece in milliseconds.
+fn piece_ms(audio: &Path) -> Option<u64> {
+    audio::wav_seconds(audio)
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| (seconds * 1000.0).round() as u64)
 }
 /// A piece is divided only while both halves keep enough context to be worth sending.
 const SHORTEST_PIECE_SECONDS: u32 = 30;
@@ -1279,15 +1294,17 @@ impl cloud_job::Backend for CloudBackend<'_> {
     fn recognize(
         &mut self,
         audio: &Path,
+        offset_ms: u64,
         live: &mut dyn FnMut(&str),
     ) -> Result<cloud::Recognized, String> {
         background::check_current()?;
-        let seconds = audio::wav_seconds(audio).unwrap_or(f64::from(self.settings.chunk_seconds));
+        let seconds = audio::wav_seconds(audio).unwrap_or(f64::from(self.chunk_seconds));
         let budget = cloud::completion_budget(seconds, self.output_limit);
         cloud::transcribe(
             self.settings,
             self.configuration,
             audio,
+            offset_ms,
             Some(budget),
             |text| {
                 if !*self.promoted && !text.trim().is_empty() {
@@ -1318,6 +1335,15 @@ impl cloud_job::Backend for CloudBackend<'_> {
     }
     fn silent(&mut self, audio: &Path) -> bool {
         audio::wav_is_silent(audio)
+    }
+    fn duration_ms(&mut self, audio: &Path) -> Option<u64> {
+        piece_ms(audio)
+    }
+    fn oversized(&mut self, audio: &Path) -> bool {
+        // Longer than the user's own segment length: a long piece for a model
+        // that tells speakers apart.
+        audio::wav_seconds(audio)
+            .is_some_and(|seconds| seconds > f64::from(self.settings.chunk_seconds) + 1.0)
     }
     fn stage(&mut self, stage: &'static str) {
         emit(
@@ -1384,57 +1410,42 @@ async fn transcribe(
                 fs::create_dir_all(&chunk_dir).map_err(|_| "errors.audioPrepare")?;
                 let result = (|| {
                     emit(&app, "transcribe", "progress.prepareAudio", 0, 0, 0);
-                    // Parts finished by an earlier attempt are continued with the
-                    // cut that produced them, also across an app update.
-                    let slicing = resume::slicing(
-                        &base()?,
-                        &id,
-                        &configuration,
-                        &input,
-                        settings.chunk_seconds,
-                    );
-                    let chunks = audio::prepare_cloud_chunks_sliced(
-                        &input,
-                        &chunk_dir,
-                        settings.chunk_seconds,
-                        slicing,
-                        |current, total| {
-                            emit(
-                                &app,
-                                "transcribe",
-                                "progress.prepareAudio",
-                                current,
-                                total,
-                                start.elapsed().as_secs(),
-                            )
-                        },
-                    )?;
-                    if chunks.is_empty() {
+                    let root = base()?;
+                    let chunk_seconds = cloud::chunk_seconds_for(&settings, &configuration);
+                    // Parts finished by an earlier attempt of this record,
+                    // configuration and audio are kept; the rest of the audio is
+                    // cut from where they end. `begin` may reset the record's
+                    // resume file; a reaped run must not reset its retry's.
+                    let mut progress = background::commit(|| {
+                        resume::CloudProgress::begin(&root, &id, &configuration, &input)
+                    })?;
+                    let chunks = if progress.complete() {
+                        Vec::new()
+                    } else {
+                        audio::prepare_cloud_chunks_from(
+                            &input,
+                            &chunk_dir,
+                            chunk_seconds,
+                            progress.resume_ms(),
+                            |current, total| {
+                                emit(
+                                    &app,
+                                    "transcribe",
+                                    "progress.prepareAudio",
+                                    current,
+                                    total,
+                                    start.elapsed().as_secs(),
+                                )
+                            },
+                        )?
+                    };
+                    if chunks.is_empty() && progress.parts().is_empty() {
                         return Err("errors.audioEmpty".into());
                     }
-                    let root = base()?;
-                    // `begin` may reset the record's resume file; a reaped run
-                    // must not reset its retry's.
-                    let mut progress = background::commit(|| {
-                        resume::CloudProgress::begin(
-                            &root,
-                            &id,
-                            &configuration,
-                            &input,
-                            settings.chunk_seconds,
-                            chunks.len() as u64,
-                            slicing,
-                        )
-                    })?;
-                    let lengths: Vec<f64> = chunks
-                        .iter()
-                        .map(|chunk| {
-                            audio::wav_seconds(chunk)
-                                .unwrap_or(f64::from(settings.chunk_seconds))
-                        })
-                        .collect();
+                    progress.plan(chunk_seconds, chunks.len() as u64);
                     let mut parts = progress.parts().to_vec();
-                    let total = chunks.len() as u64;
+                    let done = parts.len();
+                    let total = (done + chunks.len()) as u64;
                     if !parts.is_empty() {
                         partial(&app, &join_parts(&parts));
                         emit(
@@ -1447,7 +1458,9 @@ async fn transcribe(
                         );
                     }
                     let mut promoted = false;
-                    for (index, chunk) in chunks.iter().enumerate().skip(parts.len()) {
+                    let mut offset_ms = progress.resume_ms();
+                    for (number, chunk) in chunks.iter().enumerate() {
+                        let index = done + number;
                         background::check_current()?;
                         emit(
                             &app,
@@ -1458,34 +1471,45 @@ async fn transcribe(
                             start.elapsed().as_secs(),
                         );
                         let prior = join_parts(&parts);
+                        let length_ms = piece_ms(chunk)
+                            .unwrap_or(u64::from(chunk_seconds) * 1000);
                         let mut backend = CloudBackend {
                             app: &app,
                             settings: &settings,
                             configuration: &configuration,
                             promoted: &mut promoted,
                             output_limit,
+                            chunk_seconds,
                             index: index as u64,
                             total,
                             start,
                         };
-                        let outcome = cloud_job::recognize(&mut backend, chunk, &mut |text| {
-                            partial(
-                                &app,
-                                &format!(
-                                    "{}{}{}",
-                                    prior,
-                                    if prior.is_empty() || text.is_empty() {
-                                        ""
-                                    } else {
-                                        "\n"
-                                    },
-                                    text
-                                ),
-                            );
-                        })?;
+                        let outcome =
+                            cloud_job::recognize(&mut backend, chunk, offset_ms, &mut |text| {
+                                partial(
+                                    &app,
+                                    &format!(
+                                        "{}{}{}",
+                                        prior,
+                                        if prior.is_empty() || text.is_empty() {
+                                            ""
+                                        } else {
+                                            "\n"
+                                        },
+                                        text
+                                    ),
+                                );
+                            })?;
+                        offset_ms += length_ms;
                         // Paid work is durable before the next request starts.
                         background::commit(|| {
-                            progress.commit(&root, outcome.text.clone(), outcome.incomplete)
+                            progress.commit(
+                                &root,
+                                outcome.text.clone(),
+                                outcome.incomplete,
+                                offset_ms,
+                                outcome.phrases.clone(),
+                            )
                         })?;
                         parts.push(outcome.text);
                         cloud_job::verdict(&parts, progress.incomplete(), false)?;
@@ -1499,9 +1523,10 @@ async fn transcribe(
                         );
                     }
                     cloud_job::verdict(&parts, progress.incomplete(), true)?;
-                    Ok::<(String, Vec<[u64; 2]>), String>((
+                    Ok::<(String, Vec<[u64; 2]>, Vec<phrases::Phrase>), String>((
                         join_parts(&parts),
-                        cloud_job::passages(progress.incomplete(), &lengths),
+                        cloud_job::passages(progress.incomplete(), progress.ends_ms()),
+                        progress.phrases(),
                     ))
                 })();
                 let _ = fs::remove_dir_all(chunk_dir);
@@ -1515,17 +1540,18 @@ async fn transcribe(
                         Ok(())
                     });
                 }
-                let (text, passages) = result?;
+                let (text, passages, phrases) = result?;
                 cloud::mark_working(&configuration)?;
                 background::check_current()?;
                 background::commit(|| {
                     let _lock = history_lock()?;
                     let root = base()?;
-                    save_transcript_at(
+                    records::save_timed_transcript_at(
                         &root,
                         &id,
                         format!("openrouter/{}", configuration.model),
                         &text,
+                        &phrases,
                     )?;
                     resume::remove(&root, &id);
                     if !passages.is_empty() {

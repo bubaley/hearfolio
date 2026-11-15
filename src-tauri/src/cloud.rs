@@ -792,10 +792,13 @@ fn normalize_from_models(
 }
 /// Text returned by one request. `truncated` means the model stopped before
 /// finishing (output limit or content filter): the text is real but incomplete.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Recognized {
     pub text: String,
     pub truncated: bool,
+    /// Timed phrases when the model returned times (dedicated speech-to-text
+    /// models); empty for chat models, which return text only.
+    pub phrases: Vec<crate::phrases::Phrase>,
 }
 /// Output budget for `seconds` of audio. Fast speech is about ten tokens a
 /// second; four times that, plus room for a reasoning model's own thinking, is
@@ -921,15 +924,210 @@ fn consume_sse_lines(
     Ok(Recognized {
         text: text.trim().into(),
         truncated,
+        ..Recognized::default()
     })
 }
-/// Sends one piece of audio and returns what the model wrote. `budget` is the
-/// output limit to ask for (see `completion_budget`). Whether to retry, split
+/// How much structure a speech-to-text request asks for. Every model gets the
+/// richest level first; a level the provider rejects is not asked again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Detail {
+    /// Word and segment times plus the provider's diarization option.
+    Speakers,
+    /// Word and segment times (`verbose_json`).
+    Timed,
+    /// Exactly the request of earlier versions: text only.
+    Plain,
+}
+/// Diarization options by OpenRouter provider slug, for models whose author is
+/// that provider. Verified live: xAI. From OpenRouter docs: Deepgram, Azure.
+fn speaker_options(model: &str) -> Option<(&'static str, serde_json::Value)> {
+    let slug = match model.split('/').next()? {
+        "x-ai" | "xai" => "xai",
+        "deepgram" => "deepgram",
+        "azure" | "microsoft" => "azure",
+        _ => return None,
+    };
+    Some((
+        slug,
+        match slug {
+            "azure" => serde_json::json!({"diarization": {"enabled": true}}),
+            _ => serde_json::json!({"diarize": true}),
+        },
+    ))
+}
+/// Whether the model is asked to tell speakers apart. Speaker labels only hold
+/// within one request, so such a model gets longer pieces.
+pub fn diarizes(configuration: &RecognitionConfig) -> bool {
+    configuration.provider == "openrouter"
+        && configuration.mode == "transcription"
+        && speaker_options(&configuration.model).is_some()
+}
+/// xAI speech-to-text: speaker labels hold within one request and long audio
+/// is accepted (Deepgram refuses large inputs), so it gets long pieces, sent
+/// as FLAC.
+fn long_pieces(configuration: &RecognitionConfig) -> bool {
+    diarizes(configuration)
+        && speaker_options(&configuration.model).is_some_and(|(slug, _)| slug == "xai")
+}
+/// Seconds of audio per request for xAI speech-to-text: a typical meeting in
+/// two or three requests. Measured live: 8 minutes answered in under 9 s (most
+/// of it the upload), far inside OpenRouter's 60 s. The app has no compact
+/// lossy encoder; lossless FLAC of 16 kHz speech is about half of WAV, so 15
+/// minutes is about 20 MB of base64 for clean speech. A noisier piece over
+/// `MAX_AUDIO_BASE64`, or one that times out, is divided (see `cloud_job`).
+pub const SPEAKER_CHUNK_SECONDS: u32 = 900;
+/// Base64 audio a request may carry: under the 25 MB most providers accept.
+const MAX_AUDIO_BASE64: usize = 24 * 1000 * 1000;
+/// Seconds per request for this configuration.
+pub fn chunk_seconds_for(settings: &Settings, configuration: &RecognitionConfig) -> u32 {
+    if long_pieces(configuration) {
+        settings.chunk_seconds.max(SPEAKER_CHUNK_SECONDS)
+    } else {
+        settings.chunk_seconds
+    }
+}
+/// The level that last worked per API URL and model, for this run of the app:
+/// later pieces do not pay again for a request the provider rejected.
+static DETAIL: Mutex<Option<std::collections::HashMap<String, Detail>>> = Mutex::new(None);
+fn detail_key(s: &Settings, model: &str) -> String {
+    format!("{}\n{model}", s.openrouter_url)
+}
+fn remembered_detail(s: &Settings, model: &str) -> Detail {
+    let first = if speaker_options(model).is_some() {
+        Detail::Speakers
+    } else {
+        Detail::Timed
+    };
+    DETAIL
+        .lock()
+        .ok()
+        .and_then(|cache| cache.as_ref()?.get(&detail_key(s, model)).copied())
+        .map_or(first, |known| known.max(first))
+}
+fn remember_detail(s: &Settings, model: &str, detail: Detail) {
+    if let Ok(mut cache) = DETAIL.lock() {
+        cache
+            .get_or_insert_with(Default::default)
+            .insert(detail_key(s, model), detail);
+    }
+}
+/// The bytes and format of a piece for `/audio/transcriptions`. xAI gets FLAC
+/// (lossless, about half the size; verified live); anything else, or a failed
+/// encoding, sends the file as it is.
+fn transcription_audio(
+    configuration: &RecognitionConfig,
+    audio: &Path,
+) -> Result<(Vec<u8>, String), String> {
+    let format = audio.extension().and_then(|e| e.to_str()).unwrap_or("wav");
+    if long_pieces(configuration) && format.eq_ignore_ascii_case("wav") {
+        let flac = audio.with_extension("request.flac");
+        let _ = fs::remove_file(&flac);
+        let encoded = crate::compact::encode_flac(audio, &flac)
+            .ok()
+            .and_then(|_| fs::read(&flac).ok());
+        let _ = fs::remove_file(&flac);
+        if let Some(bytes) = encoded.filter(|bytes| !bytes.is_empty()) {
+            return Ok((bytes, "flac".into()));
+        }
+    }
+    Ok((
+        fs::read(audio).map_err(|_| "errors.audioRead")?,
+        format.into(),
+    ))
+}
+fn transcription_body(model: &str, data: &str, format: &str, detail: Detail) -> serde_json::Value {
+    let mut body =
+        serde_json::json!({"model": model, "input_audio": {"data": data, "format": format}});
+    if detail <= Detail::Timed {
+        body["response_format"] = "verbose_json".into();
+        body["timestamp_granularities"] = serde_json::json!(["segment", "word"]);
+    }
+    if detail == Detail::Speakers {
+        if let Some((slug, options)) = speaker_options(model) {
+            body["provider"] = serde_json::json!({"options": {slug: options}});
+        }
+    }
+    body
+}
+/// A refusal of the request's shape (an unknown parameter or format), as
+/// opposed to a passing failure (429, 5xx, the network) or one about the
+/// account (401, 402, 403). Only these step down to a simpler request.
+fn rejects_shape(status: u16, body: &str) -> bool {
+    match status {
+        400 | 422 => true,
+        // OpenRouter: "No endpoints found that support the requested parameters".
+        404 => api_error(body, "").to_lowercase().contains("parameter"),
+        _ => false,
+    }
+}
+/// One speech-to-text request, stepping down from the remembered level when
+/// the provider rejects its shape: at most one request per level, never a loop.
+fn transcription_request(
+    s: &Settings,
+    model: &str,
+    data: &str,
+    format: &str,
+    timeout: u64,
+) -> Result<serde_json::Value, String> {
+    let mut detail = remembered_detail(s, model);
+    loop {
+        crate::background::check_current()?;
+        let request = client()?
+            .post(format!("{}/audio/transcriptions", s.openrouter_url))
+            .bearer_auth(&s.token)
+            .timeout(Duration::from_secs(timeout))
+            .json(&transcription_body(model, data, format, detail));
+        let (status, body) = cancellable(move || {
+            let response = request.send().map_err(|_| "errors.cloudConnect")?;
+            let status = response.status();
+            let body = read_limited_response(response, 16 * 1024 * 1024)
+                .map_err(|_| "errors.cloudResponseRead")?;
+            Ok::<_, String>((status, body))
+        })??;
+        let value = serde_json::from_str::<serde_json::Value>(&body).ok();
+        // An error object inside a 200 carries the upstream status in `code`.
+        let status = match value.as_ref().map(|value| &value["error"]) {
+            Some(error) if status.is_success() && !error.is_null() => error["code"]
+                .as_u64()
+                .and_then(|code| u16::try_from(code).ok())
+                .filter(|code| (400..=599).contains(code)),
+            _ => Some(status.as_u16()),
+        };
+        let Some(status) = status else {
+            return Err(service_error(&body, &s.token));
+        };
+        if (200..300).contains(&status) {
+            let value = value.ok_or("errors.cloudResponseInvalid")?;
+            remember_detail(s, model, detail);
+            return Ok(value);
+        }
+        let simpler = match detail {
+            Detail::Speakers => Some(Detail::Timed),
+            Detail::Timed => Some(Detail::Plain),
+            Detail::Plain => None,
+        };
+        match simpler {
+            // Remembered only once the simpler request works: a refusal of
+            // the audio itself fails at every level and changes nothing.
+            Some(simpler) if rejects_shape(status, &body) => detail = simpler,
+            _ => {
+                return Err(format!(
+                    "errors.cloudHttp|HTTP {status}: {}",
+                    api_error(&body, &s.token)
+                ))
+            }
+        }
+    }
+}
+/// Sends one piece of audio that starts `offset_ms` into the recording and
+/// returns what the model wrote. `budget` is the output limit to ask for (see
+/// `completion_budget`). Whether to retry, split
 /// or accept the result is decided by `cloud_job`.
 pub fn transcribe(
     s: &Settings,
     configuration: &RecognitionConfig,
     audio: &Path,
+    offset_ms: u64,
     budget: Option<u64>,
     mut update: impl FnMut(&str),
 ) -> Result<Recognized, String> {
@@ -943,34 +1141,25 @@ pub fn transcribe(
     if size > 100 * 1024 * 1024 {
         return Err("errors.audioTooLarge".into());
     }
-    let data = base64::engine::general_purpose::STANDARD
-        .encode(fs::read(audio).map_err(|_| "errors.audioRead")?);
-    let format = audio.extension().and_then(|e| e.to_str()).unwrap_or("wav");
     if configuration.mode == "transcription" {
-        let request=client()?.post(format!("{}/audio/transcriptions",s.openrouter_url)).bearer_auth(&s.token).timeout(Duration::from_secs(60 + u64::from(s.chunk_seconds))).json(&serde_json::json!({"model":configuration.model,"input_audio":{"data":data,"format":format}}));
-        let (status, body) = cancellable(move || {
-            let response = request.send().map_err(|_| "errors.cloudConnect")?;
-            let status = response.status();
-            let body = read_limited_response(response, 16 * 1024 * 1024)
-                .map_err(|_| "errors.cloudResponseRead")?;
-            Ok::<_, String>((status, body))
-        })??;
-        if !status.is_success() {
-            return Err(format!(
-                "errors.cloudHttp|HTTP {}: {}",
-                status.as_u16(),
-                api_error(&body, &s.token)
-            ));
+        let duration_ms = crate::audio::wav_seconds(audio)
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+            .map(|seconds| (seconds * 1000.0).round() as u64);
+        let (bytes, format) = transcription_audio(configuration, audio)?;
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        // Most providers refuse a larger body; the job divides the piece.
+        if data.len() > MAX_AUDIO_BASE64 {
+            return Err("errors.audioTooLarge".into());
         }
-        let value: serde_json::Value =
-            serde_json::from_str(&body).map_err(|_| "errors.cloudResponseInvalid")?;
-        if !value["error"].is_null() {
-            return Err(service_error(&body, &s.token));
-        }
-        let text = value["text"]
-            .as_str()
-            .ok_or("errors.emptyTranscript")?
-            .trim();
+        let timeout = 60 + duration_ms.map_or(u64::from(s.chunk_seconds), |ms| ms.div_ceil(1000));
+        let value = transcription_request(s, &configuration.model, &data, &format, timeout)?;
+        let parsed = crate::phrases::parse(&value);
+        let text = if parsed.text.is_empty() {
+            crate::phrases::fallback_text(&parsed)
+        } else {
+            parsed.text.clone()
+        };
+        let text = text.trim();
         if text.is_empty() {
             return Err("errors.emptyTranscript".into());
         }
@@ -978,8 +1167,17 @@ pub fn transcribe(
         return Ok(Recognized {
             text: text.into(),
             truncated: false,
+            // Text without times: the job gives the piece one phrase.
+            phrases: if parsed.timed() {
+                crate::phrases::build(offset_ms, duration_ms, &parsed)
+            } else {
+                Vec::new()
+            },
         });
     }
+    let data = base64::engine::general_purpose::STANDARD
+        .encode(fs::read(audio).map_err(|_| "errors.audioRead")?);
+    let format = audio.extension().and_then(|e| e.to_str()).unwrap_or("wav");
     let mut body = serde_json::json!({"model":configuration.model,"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"Transcribe all speech in this audio accurately in its original language. Return only the transcript, without commentary, summaries, or invented content."},{"type":"input_audio","input_audio":{"data":data,"format":format}}]}]});
     if let Some(budget) = budget {
         body["max_tokens"] = serde_json::json!(budget);
@@ -1044,6 +1242,7 @@ pub fn transcribe(
         Ok(Recognized {
             text: text.into(),
             truncated,
+            ..Recognized::default()
         })
     }
 }
@@ -1104,7 +1303,7 @@ mod tests {
             consume_sse(stream.as_bytes(), "", |s| updates.push(s.to_owned())).unwrap(),
             Recognized {
                 text: "Привет мир".into(),
-                truncated: false
+                ..Recognized::default()
             }
         );
         assert_eq!(updates.len(), 2);
@@ -1118,7 +1317,8 @@ mod tests {
                 consume_sse(stream.as_bytes(), "", |_| {}).unwrap(),
                 Recognized {
                     text: "one two".into(),
-                    truncated: true
+                    truncated: true,
+                    ..Recognized::default()
                 }
             );
         }
@@ -1225,7 +1425,8 @@ mod tests {
             model: "test/model".into(),
             mode: "streaming".into(),
         };
-        let recognized = transcribe(&settings, &configuration, &path, Some(9000), |_| {}).unwrap();
+        let recognized =
+            transcribe(&settings, &configuration, &path, 0, Some(9000), |_| {}).unwrap();
         assert_eq!(recognized.text, "hello");
         assert_eq!(server.join().unwrap(), [Some(9000), None]);
         fs::remove_file(path).unwrap();
@@ -1361,7 +1562,7 @@ mod tests {
         ));
         fs::write(&path, b"sample").unwrap();
         assert_eq!(
-            transcribe(&settings, &configuration, &path, Some(4496), |_| {})
+            transcribe(&settings, &configuration, &path, 0, Some(4496), |_| {})
                 .unwrap()
                 .text,
             "hello"
@@ -1637,5 +1838,296 @@ mod tests {
         config.model = "text/only".into();
         assert!(normalize_from_models(&mut config, &models).is_err());
         server.join().unwrap();
+    }
+
+    /// Answers each request with the next `(status, body)` and returns the
+    /// JSON bodies it received.
+    fn scripted_server(
+        replies: Vec<(&'static str, String)>,
+    ) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+        use std::{io::Write, net::TcpListener};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            for (status, reply) in replies {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                received.push(serde_json::from_slice(&body).unwrap());
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            }
+            received
+        });
+        (url, handle)
+    }
+    fn stt(model: &str) -> RecognitionConfig {
+        RecognitionConfig {
+            provider: "openrouter".into(),
+            model: model.into(),
+            mode: "transcription".into(),
+        }
+    }
+    fn sample_audio() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("hearfolio-stt-{}.wav", uuid::Uuid::new_v4()));
+        fs::write(&path, b"sample").unwrap();
+        path
+    }
+    #[test]
+    fn grok_is_asked_for_word_times_and_speakers_and_its_answer_becomes_phrases() {
+        let reply = include_str!("../tests/fixtures/grok-speakers.json").to_owned();
+        let (url, server) = scripted_server(vec![("200 OK", reply)]);
+        let settings = Settings {
+            token: "test-token".into(),
+            openrouter_url: url,
+            ..Settings::default()
+        };
+        let path = sample_audio();
+        let mut seen = String::new();
+        let recognized = transcribe(
+            &settings,
+            &stt("x-ai/grok-stt-2.0"),
+            &path,
+            60_000,
+            None,
+            |text| seen = text.to_owned(),
+        )
+        .unwrap();
+        let request = &server.join().unwrap()[0];
+        assert_eq!(request["response_format"], "verbose_json");
+        assert_eq!(
+            request["timestamp_granularities"],
+            serde_json::json!(["segment", "word"])
+        );
+        assert_eq!(
+            request["provider"],
+            serde_json::json!({"options": {"xai": {"diarize": true}}})
+        );
+        assert_eq!(request["input_audio"]["data"], "c2FtcGxl");
+        assert!(recognized.text.starts_with("Привет, давай") && recognized.text == seen);
+        assert_eq!(
+            recognized
+                .phrases
+                .iter()
+                .map(|phrase| (phrase.start_ms, phrase.speaker.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (60_060, Some("60000:0")),
+                (67_323, Some("60000:1")),
+                (74_866, Some("60000:0"))
+            ]
+        );
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn xai_pieces_travel_as_flac_and_others_as_they_are() {
+        let path =
+            std::env::temp_dir().join(format!("hearfolio-flac-{}.wav", uuid::Uuid::new_v4()));
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for index in 0..16000 {
+            writer.write_sample(((index % 100) * 50) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        let (bytes, format) = transcription_audio(&stt("x-ai/grok-stt-2.0"), &path).unwrap();
+        assert_eq!(format, "flac");
+        assert!(bytes.starts_with(b"fLaC"));
+        assert!(
+            !path.with_extension("request.flac").exists(),
+            "no leftovers"
+        );
+        let (bytes, format) = transcription_audio(&stt("openai/whisper-1"), &path).unwrap();
+        assert_eq!(format, "wav");
+        assert!(bytes.starts_with(b"RIFF"));
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn a_rejected_request_shape_steps_down_once_and_is_remembered_for_the_model() {
+        let rejected =
+            r#"{"error":{"code":400,"message":"Unsupported parameter: provider.options"}}"#;
+        let (url, server) = scripted_server(vec![
+            ("400 Bad Request", rejected.to_owned()),
+            (
+                "400 Bad Request",
+                r#"{"error":{"message":"response_format is not supported"}}"#.to_owned(),
+            ),
+            ("200 OK", r#"{"text":"plain words"}"#.to_owned()),
+            // The next piece starts at the level that worked.
+            ("200 OK", r#"{"text":"second piece"}"#.to_owned()),
+        ]);
+        let settings = Settings {
+            token: "test-token".into(),
+            openrouter_url: url,
+            ..Settings::default()
+        };
+        let path = sample_audio();
+        let model = stt("deepgram/ladder-test");
+        let first = transcribe(&settings, &model, &path, 0, None, |_| {}).unwrap();
+        assert_eq!(first.text, "plain words");
+        // No times: no phrases here; the job gives the piece one phrase.
+        assert!(first.phrases.is_empty());
+        let second = transcribe(&settings, &model, &path, 0, None, |_| {}).unwrap();
+        assert_eq!(second.text, "second piece");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 4, "one request per level, never a loop");
+        assert_eq!(
+            requests[0]["provider"]["options"]["deepgram"]["diarize"],
+            true
+        );
+        assert!(requests[1].get("provider").is_none());
+        assert_eq!(requests[1]["response_format"], "verbose_json");
+        // The last level is exactly the request of earlier versions.
+        for plain in &requests[2..] {
+            let keys: Vec<&String> = plain.as_object().unwrap().keys().collect();
+            assert_eq!(keys, ["input_audio", "model"]);
+        }
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn passing_failures_and_a_refused_audio_do_not_change_the_request() {
+        let mut settings = Settings {
+            token: "test-token".into(),
+            ..Settings::default()
+        };
+        let path = sample_audio();
+        // A rate limit or an outage is not about the request's shape: reported
+        // for the job to retry, the same rich request next time.
+        let (url, server) = scripted_server(vec![
+            (
+                "429 Too Many Requests",
+                r#"{"error":{"message":"slow down"}}"#.to_owned(),
+            ),
+            (
+                "200 OK",
+                r#"{"error":{"code":503,"message":"overloaded"}}"#.to_owned(),
+            ),
+            (
+                "200 OK",
+                r#"{"text":"ok","words":[{"word":"ok","start":0.1,"end":0.4}]}"#.to_owned(),
+            ),
+        ]);
+        settings.openrouter_url = url;
+        let model = stt("x-ai/passing-test");
+        let error = transcribe(&settings, &model, &path, 0, None, |_| {}).unwrap_err();
+        assert!(error.starts_with("errors.cloudHttp|HTTP 429") && transient(&error));
+        let error = transcribe(&settings, &model, &path, 0, None, |_| {}).unwrap_err();
+        assert!(error.starts_with("errors.cloudHttp|HTTP 503") && transient(&error));
+        let ok = transcribe(&settings, &model, &path, 0, None, |_| {}).unwrap();
+        assert_eq!(ok.phrases[0].start_ms, 100);
+        let requests = server.join().unwrap();
+        assert!(requests
+            .iter()
+            .all(|request| request["provider"]["options"]["xai"]["diarize"] == true));
+        // Audio refused at every level: the last refusal is reported and the
+        // model keeps its rich request for the next piece.
+        let refusal = r#"{"error":{"message":"audio is corrupt"}}"#.to_owned();
+        let (url, server) = scripted_server(vec![
+            ("400 Bad Request", refusal.clone()),
+            ("400 Bad Request", refusal.clone()),
+            ("400 Bad Request", refusal),
+            ("200 OK", r#"{"text":"fine"}"#.to_owned()),
+        ]);
+        settings.openrouter_url = url;
+        let model = stt("x-ai/refusal-test");
+        let error = transcribe(&settings, &model, &path, 0, None, |_| {}).unwrap_err();
+        assert_eq!(error, "errors.cloudHttp|HTTP 400: audio is corrupt");
+        assert!(!transient(&error));
+        transcribe(&settings, &model, &path, 0, None, |_| {}).unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[3].get("provider").is_some());
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn only_known_providers_get_speaker_options_and_longer_pieces() {
+        assert_eq!(speaker_options("x-ai/grok-stt-2.0").unwrap().0, "xai");
+        assert_eq!(
+            speaker_options("azure/speech").unwrap().1,
+            serde_json::json!({"diarization": {"enabled": true}})
+        );
+        assert!(speaker_options("openai/whisper-1").is_none());
+        // Deepgram is asked for speakers but refuses large audio: ordinary pieces.
+        assert!(diarizes(&stt("deepgram/nova-3")));
+        assert_eq!(
+            chunk_seconds_for(&Settings::default(), &stt("deepgram/nova-3")),
+            Settings::default().chunk_seconds
+        );
+        let settings = Settings::default();
+        assert_eq!(
+            chunk_seconds_for(&settings, &stt("x-ai/grok-stt-2.0")),
+            SPEAKER_CHUNK_SECONDS
+        );
+        assert_eq!(
+            chunk_seconds_for(&settings, &stt("openai/whisper-1")),
+            settings.chunk_seconds
+        );
+        // A chat model listening to audio stays text-only.
+        let mut chat = stt("x-ai/grok-stt-2.0");
+        chat.mode = "streaming".into();
+        assert!(!diarizes(&chat));
+        assert_eq!(chunk_seconds_for(&settings, &chat), settings.chunk_seconds);
+    }
+    /// Real request to OpenRouter with Grok STT: `OR_KEY=... cargo test live_grok -- --ignored`.
+    /// Costs about $0.0005 (19 s of audio).
+    #[test]
+    #[ignore]
+    fn live_grok_stt_gives_timed_phrases_with_speakers() {
+        let Ok(key) = std::env::var("OR_KEY") else {
+            panic!("set OR_KEY to an OpenRouter key");
+        };
+        let audio =
+            std::env::var("LIVE_AUDIO").expect("LIVE_AUDIO: a short dialog recording (wav)");
+        let settings = Settings {
+            token: key,
+            ..Settings::default()
+        };
+        let (flac, _) = transcription_audio(&stt("x-ai/grok-stt-2.0"), Path::new(&audio)).unwrap();
+        println!(
+            "FLAC {} bytes for {} bytes of WAV",
+            flac.len(),
+            fs::metadata(&audio).unwrap().len()
+        );
+        let recognized = transcribe(
+            &settings,
+            &stt("x-ai/grok-stt-2.0"),
+            Path::new(&audio),
+            0,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        for phrase in &recognized.phrases {
+            println!(
+                "{:>6}–{:>6} [{}] {}",
+                phrase.start_ms,
+                phrase.end_ms,
+                phrase.speaker.as_deref().unwrap_or("-"),
+                phrase.text
+            );
+        }
+        assert!(recognized.phrases.len() > 1);
+        assert!(recognized
+            .phrases
+            .iter()
+            .any(|phrase| phrase.speaker.is_some()));
     }
 }

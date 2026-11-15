@@ -520,7 +520,7 @@ pub async fn org_enqueue_record(
     blocking(move || {
         super::validate_destination(&super::read_connections()?, &destination)?;
         let root = crate::base()?;
-        let (entry, transcript) = {
+        let (entry, transcript, segments) = {
             let _history = crate::history_lock()?;
             let entry = crate::records::read_history_at(&root)?
                 .into_iter()
@@ -535,7 +535,11 @@ pub async fn org_enqueue_record(
                     .and_then(|path| fs::read_to_string(path).ok())
                     .filter(|text| !text.trim().is_empty())
             };
-            (entry, transcript)
+            let segments = match (&transcript, &entry.output_path) {
+                (Some(text), Some(path)) => crate::records::read_phrases(Path::new(path), text),
+                _ => Vec::new(),
+            };
+            (entry, transcript, segments)
         };
         // Copying twice to the same organization returns the first copy.
         if !move_local {
@@ -591,6 +595,7 @@ pub async fn org_enqueue_record(
             visibility: destination.visibility.clone(),
             transcription_model: transcript.as_ref().and(entry.model.clone()),
             transcript_text: transcript,
+            transcript_segments: segments,
             local_record_id: (!move_local).then(|| id.clone()),
             phase: Phase::Queued,
             remote_id: None,
