@@ -25,12 +25,14 @@ pub struct Phrase {
 
 // Rules and thresholds mirror Hearfolio Cloud
 // (`backend/app/domains/ai/utils/transcript_phrases.py`); keep both identical.
+// Phrases are paragraphs: one speaker's continuous speech reads as one text.
 /// A pause of at least this long after the end of a sentence starts a phrase.
-pub const SENTENCE_PAUSE_MS: u64 = 800;
+pub const SENTENCE_PAUSE_MS: u64 = 2000;
 /// A pause of at least this long starts a phrase anyway.
-pub const HARD_PAUSE_MS: u64 = 1500;
-/// A longer phrase is divided at its last sentence end, else at its largest gap.
-pub const MAX_PHRASE_MS: u64 = 30_000;
+pub const HARD_PAUSE_MS: u64 = 4000;
+/// A longer phrase is divided at its last sentence end, else at its largest gap,
+/// so a monologue still has timestamps to jump to.
+pub const MAX_PHRASE_MS: u64 = 90_000;
 /// Share of the provider text's words the phrases must carry to be trusted.
 pub const MIN_COVERAGE: f64 = 0.9;
 /// Bound on parsed entries: a 3-hour piece has about 40 000 words.
@@ -349,31 +351,36 @@ pub fn coarse(offset_ms: u64, duration_ms: Option<u64>, text: &str) -> Vec<Phras
     }]
 }
 
+/// Words or segments grouped into paragraphs (speaker change, pauses, cap).
+fn paragraphs(units: &[Timed]) -> Vec<Timed> {
+    group_words(units)
+        .into_iter()
+        .map(|group| Timed {
+            text: group
+                .iter()
+                .map(|unit| unit.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            start: group[0].start,
+            end: group.iter().map(|unit| unit.end).max().unwrap_or(0),
+            speaker: group[0].speaker.clone(),
+        })
+        .collect()
+}
+
 /// Phrases of one piece that starts `offset_ms` into the recording and lasts
 /// `duration_ms` (when known; otherwise the provider's `duration` bounds it).
 pub fn build(offset_ms: u64, duration_ms: Option<u64>, parsed: &Parsed) -> Vec<Phrase> {
     let limit = duration_ms.or(parsed.duration_ms);
     if let Some(words) = &parsed.words {
-        let groups: Vec<Timed> = group_words(words)
-            .into_iter()
-            .map(|group| Timed {
-                text: group
-                    .iter()
-                    .map(|word| word.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                start: group[0].start,
-                end: group.iter().map(|word| word.end).max().unwrap_or(0),
-                speaker: group[0].speaker.clone(),
-            })
-            .collect();
-        let phrases = place(offset_ms, limit, groups);
+        let phrases = place(offset_ms, limit, paragraphs(words));
         if !phrases.is_empty() && covers(&phrases, &parsed.text) {
             return scoped(offset_ms, phrases);
         }
     }
+    // A provider's segments are often single sentences: grouped by the same rules.
     if let Some(segments) = &parsed.segments {
-        let phrases = place(offset_ms, limit, segments.clone());
+        let phrases = place(offset_ms, limit, paragraphs(segments));
         if !phrases.is_empty() && covers(&phrases, &parsed.text) {
             return scoped(offset_ms, phrases);
         }
@@ -421,19 +428,19 @@ mod tests {
     const GROK_SPEAKERS: &str = include_str!("../tests/fixtures/grok-speakers.json");
 
     #[test]
-    fn grok_words_become_three_sentences_at_the_pauses() {
+    fn grok_words_of_one_voice_read_as_one_paragraph() {
+        // ~1.5 s pauses between sentences of the same voice do not break the text apart.
         let value: Value = serde_json::from_str(GROK_WORDS).unwrap();
         let result = build(0, Some(19_188), &parse(&value));
-        assert_eq!(result.len(), 3);
+        assert_eq!(result.len(), 1);
         assert_eq!(
             (result[0].start_ms, result[0].end_ms),
-            (60, 5722),
+            (60, 18_888),
             "first word start to last word end"
         );
-        assert!(result[0].text.starts_with("Привет, давай") && result[0].text.ends_with("месяца."));
-        assert_eq!((result[1].start_ms, result[1].end_ms), (7323, 13_326));
-        assert_eq!((result[2].start_ms, result[2].end_ms), (14_866, 18_888));
-        assert!(result.iter().all(|phrase| phrase.speaker.is_none()));
+        assert!(result[0].text.starts_with("Привет, давай"));
+        assert!(result[0].text.ends_with("первые результаты."));
+        assert!(result[0].speaker.is_none());
     }
 
     #[test]
@@ -466,25 +473,25 @@ mod tests {
         let result =
             phrases(json!({"text":"a b","words":[spoken("a",0.0,1.0,0),spoken("b",1.0,2.0,1)]}));
         assert_eq!(texts(&result), ["a", "b"]);
-        // 0.8 s after a sentence end splits; 0.79 s does not.
+        // 2 s after a sentence end splits; 1.99 s does not.
         let result = phrases(json!({"text":"One. Two. three","words":[
-            word("One.",0.0,1.0), word("Two.",1.8,2.0), word("three",2.79,3.0)]}));
+            word("One.",0.0,1.0), word("Two.",3.0,3.2), word("three",5.19,5.4)]}));
         assert_eq!(texts(&result), ["One.", "Two. three"]);
-        // Without a sentence end only 1.5 s splits; quotes/brackets after the stop still count.
+        // Without a sentence end only 4 s splits; quotes/brackets after the stop still count.
         let result = phrases(json!({"text":"a b c «d.»","words":[
-            word("a",0.0,1.0), word("b",2.4,2.5), word("c",4.0,4.1), word("«d.»",4.2,4.3)]}));
+            word("a",0.0,1.0), word("b",4.9,5.0), word("c",9.0,9.1), word("«d.»",9.2,9.3)]}));
         assert_eq!(texts(&result), ["a b", "c «d.»"]);
         let result = phrases(json!({"text":"Ask? Yes… «Ok.» (fine.) end","words":[
-            word("Ask?",0.0,0.5), word("Yes…",1.5,1.75), word("«Ok.»",2.75,3.0), word("(fine.)",4.0,4.25), word("end",5.25,5.5)]}));
+            word("Ask?",0.0,0.5), word("Yes…",2.5,2.75), word("«Ok.»",4.75,5.0), word("(fine.)",7.0,7.25), word("end",9.25,9.5)]}));
         assert_eq!(texts(&result), ["Ask?", "Yes…", "«Ok.»", "(fine.)", "end"]);
     }
 
     #[test]
     fn a_long_phrase_is_cut_at_its_last_sentence_end_else_at_its_largest_gap() {
-        // 40 words, 1 s each, no pauses; a sentence ends at word 9 and word 24.
-        let words: Vec<Value> = (0..40)
+        // 120 words, 1 s each, no pauses; a sentence ends at word 9 and word 74.
+        let words: Vec<Value> = (0..120)
             .map(|i| {
-                let text = if i == 9 || i == 24 {
+                let text = if i == 9 || i == 74 {
                     format!("w{i}.")
                 } else {
                     format!("w{i}")
@@ -498,15 +505,15 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let result = phrases(json!({"text": text, "words": words}));
-        // The last sentence end within 30 s is w24 (ends at 25 s).
+        // The last sentence end within 90 s is w74 (ends at 75 s).
         assert_eq!(result.len(), 2);
-        assert!(result[0].text.ends_with("w24."));
-        assert_eq!((result[0].start_ms, result[0].end_ms), (0, 25_000));
-        assert_eq!((result[1].start_ms, result[1].end_ms), (25_000, 40_000));
-        // No sentence end: the largest gap within the limit (after w12), later on a tie.
-        let words: Vec<Value> = (0..40)
+        assert!(result[0].text.ends_with("w74."));
+        assert_eq!((result[0].start_ms, result[0].end_ms), (0, 75_000));
+        assert_eq!((result[1].start_ms, result[1].end_ms), (75_000, 120_000));
+        // No sentence end: the largest gap within the limit (after w40), later on a tie.
+        let words: Vec<Value> = (0..120)
             .map(|i| {
-                let start = i as f64 * 1.0 + if i > 12 { 0.5 } else { 0.0 };
+                let start = i as f64 * 1.0 + if i > 40 { 0.5 } else { 0.0 };
                 word(&format!("w{i}"), start, start + 0.9)
             })
             .collect();
@@ -516,10 +523,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let result = phrases(json!({"text": text, "words": words}));
-        assert!(result[0].text.ends_with("w12"), "{:?}", texts(&result));
-        assert!(result.iter().all(|p| p.end_ms - p.start_ms <= 30_000));
-        // Even gaps everywhere: the latest gap inside the limit wins (w59 ends at 29.75 s).
-        let words: Vec<Value> = (0..70)
+        assert!(result[0].text.ends_with("w40"), "{:?}", texts(&result));
+        assert!(result
+            .iter()
+            .all(|p| p.end_ms - p.start_ms <= MAX_PHRASE_MS));
+        // Even gaps everywhere: the latest gap inside the limit wins (w179 ends at 89.75 s).
+        let words: Vec<Value> = (0..200)
             .map(|i| word(&format!("w{i}"), i as f64 * 0.5, i as f64 * 0.5 + 0.25))
             .collect();
         let text = words
@@ -529,10 +538,33 @@ mod tests {
             .join(" ");
         let result = phrases(json!({"text": text, "words": words}));
         assert_eq!(result.len(), 2);
-        assert!(result[0].text.ends_with("w59"));
+        assert!(result[0].text.ends_with("w179"));
         // One endless word stays whole.
-        let result = phrases(json!({"text":"long","words":[word("long",0.0,45.0)]}));
-        assert_eq!((result[0].start_ms, result[0].end_ms), (0, 45_000));
+        let result = phrases(json!({"text":"long","words":[word("long",0.0,120.0)]}));
+        assert_eq!((result[0].start_ms, result[0].end_ms), (0, 120_000));
+    }
+
+    #[test]
+    fn segments_of_one_speaker_close_together_become_one_paragraph() {
+        let segments = json!([
+            {"start":0.0,"end":1.0,"text":"Первый.","speaker":0},
+            {"start":1.5,"end":2.0,"text":"Ещё.","speaker":0},
+            {"start":2.1,"end":3.0,"text":"Второй.","speaker":1},
+            {"start":6.0,"end":7.0,"text":"После паузы.","speaker":1}
+        ]);
+        let value = json!({"text":"Первый. Ещё. Второй. После паузы.","segments":segments});
+        let result = build(0, None, &parse(&value));
+        assert_eq!(
+            result
+                .iter()
+                .map(|p| (p.text.as_str(), p.speaker.as_deref().unwrap()))
+                .collect::<Vec<_>>(),
+            [
+                ("Первый. Ещё.", "0:0"),
+                ("Второй.", "0:1"),
+                ("После паузы.", "0:1")
+            ]
+        );
     }
 
     #[test]
@@ -658,7 +690,7 @@ mod tests {
         // Qwen3-ASR: words without punctuation or case next to a punctuated text.
         let value = json!({"text":"Привет, как дела? Хорошо. Спасибо!","words":[
             word("привет",0.0,0.5), word("как",0.6,0.8), word("дела",0.9,1.2),
-            word("хорошо",2.2,2.6), word("спасибо",3.6,4.0)]});
+            word("хорошо",3.2,3.6), word("спасибо",5.6,6.0)]});
         assert_eq!(
             texts(&phrases(value)),
             ["Привет, как дела?", "Хорошо.", "Спасибо!"]
