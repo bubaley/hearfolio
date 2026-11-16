@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.14.0 (2026-11-16)
+
+### Features
+
+- **transcription:** one speaker's continuous speech reads as one paragraph ([5b1b764](https://github.com/bubaley/hearfolio/commit/5b1b764c5d6db763cb33687feb2377add831e3d0))
+
 ## 0.13.0 (2026-11-15)
 
 ### Features
