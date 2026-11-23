@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.14.1 (2026-11-23)
+
+### Fixes and performance
+
+- **recording:** survive long recordings and keep the UI free while transcribing ([35307cc](https://github.com/bubaley/hearfolio/commit/35307cc94d9a0d1bdb3e3510312daf6b9984ebb9))
+
 ## 0.14.0 (2026-11-16)
 
 ### Features
