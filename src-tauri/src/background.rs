@@ -502,6 +502,34 @@ pub(crate) fn operation_progress(kind: &str, progress: serde_json::Value) {
         active.dirty = false;
     }
 }
+/// The record the calling thread's operation works on.
+pub(crate) fn current_record_id() -> Option<String> {
+    let current = thread_operation()?;
+    operation_state()
+        .as_ref()
+        .filter(|active| active.snapshot.id == current)
+        .and_then(|active| active.snapshot.record_id.clone())
+}
+/// Asks the running transcription of `record` to stop; false when it is not running.
+pub(crate) fn request_stop_record(record: &str) -> Result<bool, String> {
+    let id = operation_state()
+        .as_ref()
+        .filter(|active| {
+            active.snapshot.kind == "transcribe"
+                && active.snapshot.record_id.as_deref() == Some(record)
+        })
+        .map(|active| active.snapshot.id.clone());
+    let Some(id) = id else { return Ok(false) };
+    let stopped = request_stop(&id)?;
+    if stopped {
+        // A job that ignores the stop is reaped, so the queue always moves on.
+        std::thread::spawn(|| {
+            std::thread::sleep(STOP_GRACE + std::time::Duration::from_secs(1));
+            reap_stale_operation();
+        });
+    }
+    Ok(stopped)
+}
 /// Records live text for snapshot readers and returns `(operationId, recordId)`.
 pub(crate) fn operation_partial(kind: &str, text: &str) -> Option<(String, Option<String>)> {
     let current = thread_operation()?;
@@ -768,7 +796,13 @@ mod operation_tests {
             crate::job_holder().map(|(kind, _)| kind),
             Some("transcribe")
         );
-        assert!(crate::JobGuard::acquire("import").is_err());
+        // A short archive step may run next to the transcription; another
+        // long job may not.
+        assert!(crate::JobGuard::acquire("storage").is_err());
+        assert!(crate::JobGuard::acquire("transcribe").is_err());
+        let import = crate::JobGuard::acquire("import").expect("light step beside a transcription");
+        assert!(crate::JobGuard::acquire("archive").is_err());
+        drop(import);
         drop(next);
         assert!(crate::job_holder().is_none());
         std::fs::remove_file(path).unwrap();

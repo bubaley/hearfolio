@@ -19,7 +19,11 @@ export type Entry = {
   /** Passages `[fromSeconds,toSeconds]` the model could not transcribe in full. */
   incompleteRanges?:[number,number][];
 };
-export type Progress = { kind: 'download' | 'transcribe' | 'postprocess' | 'import' | 'storage' | 'update'; stage: string; current: number; total: number; elapsed: number };
+export type Progress = { kind: 'download' | 'transcribe' | 'postprocess' | 'import' | 'storage' | 'update'; stage: string; current: number; total: number; elapsed: number; recordId?: string | null };
+/** `transcription-queue` event: the step a record reached in the transcription queue. */
+export type QueueEvent = { recordId: string; state: 'queued' | 'running' | 'finished' | 'failed' | 'cancelled'; error?: string | null };
+/** A record in the native transcription queue, in running order. */
+export type QueueItem = { recordId: string; state: 'queued' | 'running' };
 export type Settings = {language:LanguagePreference;systemLanguage:'ru'|'en';openrouterUrl:string;hasToken:boolean;storageParent:string;storagePath:string;lastConfiguration:RecognitionConfig;chunkSeconds?:number};
 export type CloudModel = {id:string;name:string;modes:('streaming'|'transcription')[];preferredMode:'streaming'|'transcription'};
 export type RuntimePlatform = 'android'|'macos'|'linux'|'windows'|'ios'|'unknown';
@@ -77,7 +81,7 @@ export type PartialTextEvent={text:string;recordId:string|null;operationId:strin
 /** Result of `cloud_resume_state`: committed cloud chunks of an unfinished attempt. */
 export type CloudResume={done:number;total:number;configuration:RecognitionConfig};
 async function invokeOperation<T>(command:string,args:Record<string,unknown>):Promise<T> {
-  const kind=command==='transcribe'?'transcribe':command==='apply_postprocess'?'postprocess':command==='import_audio'?'import':null;
+  const kind=command==='apply_postprocess'?'postprocess':command==='import_audio'?'import':null;
   if(nativePlatform?.os!=='android'||!kind)return invoke<T>(command,args);
   const readSnapshot=()=>invoke<OperationSnapshot>('operation_activity_snapshot').catch(()=>null);
   const before=await readSnapshot();
@@ -100,6 +104,40 @@ let previewLoose:LooseRecording[]=new URLSearchParams(window.location.search).ge
 export const listLooseRecordings=()=>call<LooseRecording[]>('list_loose_recordings');
 export const adoptLooseRecording=(path:string)=>call<void>('adopt_loose_recording',{path});
 export const exportLooseRecording=(path:string,name:string,share:boolean)=>call<void>('export_loose_recording',{path,name,share});
+// The preview queue mirrors the native one: records are transcribed one at a time, in order.
+let previewCancelled='';
+const previewQueue:{id:string;configuration?:RecognitionConfig;running:boolean}[]=[];
+let previewQueueRunning=false;
+async function previewTranscribe(id:string,configurationArgument?:RecognitionConfig):Promise<string> {
+      const entry = previewEntries.find(entry => entry.id === id);
+      if (!entry) throw new Error('errors.record_not_found');
+      const configuration={...(configurationArgument || entry.configuration || previewSettings.lastConfiguration)};
+      entry.configuration=configuration;
+      const result = currentLanguage()==='en'?'Today we discussed our plans for next week. We will start by updating the interface to make recordings easy to work with.\n\nThe transcript keeps all our decisions together so we can revisit them later. We will assign tasks after the meeting and review the results on Friday.':'Сегодня мы обсудили планы на следующую неделю. Начнём с обновления интерфейса: важно сделать работу с записями простой и понятной.\n\nВсе договорённости сохраняются в расшифровке, чтобы к ним можно было вернуться позже. Задачи распределим после встречи, а в пятницу проверим результат.';
+      // Like a real cloud run: whole segments arrive every few seconds.
+      const segments=result.match(/[^.!?]+[.!?]+\s*/g)||[result],started=Date.now();
+      for (let index = 0; index < segments.length; index++) {
+        emit('task-progress', {kind:'transcribe',recordId:entry.id,stage:'progress.sendCloudChunk',current:index,total:segments.length,elapsed:Math.floor((Date.now()-started)/1000)});
+        await delay(2200+Math.random()*1200);if(previewCancelled===id){previewCancelled='';throw new Error('errors.operationCancelled');}
+        if(index===0){previewSettings.lastConfiguration=configuration;localStorage.setItem('hearfolio-preview-settings',JSON.stringify(previewSettings));}
+        emit('partial-text', {text:segments.slice(0,index+1).join(''),recordId:entry.id,operationId:null} satisfies PartialTextEvent);
+        emit('task-progress', {kind:'transcribe',recordId:entry.id,stage:'progress.recognizedChunks',current:index+1,total:segments.length,elapsed:Math.floor((Date.now()-started)/1000)});
+        // `?fail=transcribe` ends the first attempt after two segments, to exercise the error and retry states.
+        if(index===1&&!previewFailed&&new URLSearchParams(window.location.search).get('fail')==='transcribe'){previewFailed=true;throw new Error('errors.cloudHttp|HTTP 503: preview outage');}
+      }
+      previewTexts.set(entry.id,result); entry.outputPath='preview.txt'; entry.model=configuration.model; return result;
+}
+async function runPreviewQueue() {
+  if(previewQueueRunning)return;previewQueueRunning=true;
+  try{
+    while(previewQueue.length){
+      const item=previewQueue[0];item.running=true;emit('transcription-queue',{recordId:item.id,state:'running',error:null});
+      try{await previewTranscribe(item.id,item.configuration);previewQueue.shift();emit('transcription-queue',{recordId:item.id,state:'finished',error:null});}
+      catch(error){previewQueue.shift();const message=error instanceof Error?error.message:String(error);emit('transcription-queue',{recordId:item.id,state:message==='errors.operationCancelled'?'cancelled':'failed',error:message});}
+    }
+  }finally{previewQueueRunning=false;}
+}
+const previewQueueSnapshot=()=>previewQueue.map(item=>({recordId:item.id,state:item.running?'running':'queued'}));
 export async function call<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
   if (!preview) return invokeOperation<T>(command, args);
   let value: unknown;
@@ -192,24 +230,18 @@ export async function call<T>(command: string, args: Record<string, unknown> = {
     case 'download_model':
       for (let current = 0; current <= 100; current += 20) { emit('task-progress', {kind:'download',stage:'progress.download',current:current * 1048576,total:100 * 1048576,elapsed:current / 20}); await delay(200); }
       installedModels.add(String(args.id)); break;
-    case 'transcribe': {
-      const entry = previewEntries.find(entry => entry.id === args.id);
-      if (!entry) throw new Error('errors.record_not_found');
-      const configuration={...(args.configuration as RecognitionConfig || entry.configuration || previewSettings.lastConfiguration)};
-      entry.configuration=configuration;
-      const result = currentLanguage()==='en'?'Today we discussed our plans for next week. We will start by updating the interface to make recordings easy to work with.\n\nThe transcript keeps all our decisions together so we can revisit them later. We will assign tasks after the meeting and review the results on Friday.':'Сегодня мы обсудили планы на следующую неделю. Начнём с обновления интерфейса: важно сделать работу с записями простой и понятной.\n\nВсе договорённости сохраняются в расшифровке, чтобы к ним можно было вернуться позже. Задачи распределим после встречи, а в пятницу проверим результат.';
-      // Like a real cloud run: whole segments arrive every few seconds.
-      const segments=result.match(/[^.!?]+[.!?]+\s*/g)||[result],started=Date.now();
-      for (let index = 0; index < segments.length; index++) {
-        emit('task-progress', {kind:'transcribe',stage:'progress.sendCloudChunk',current:index,total:segments.length,elapsed:Math.floor((Date.now()-started)/1000)});
-        await delay(2200+Math.random()*1200);
-        if(index===0){previewSettings.lastConfiguration=configuration;localStorage.setItem('hearfolio-preview-settings',JSON.stringify(previewSettings));}
-        emit('partial-text', {text:segments.slice(0,index+1).join(''),recordId:entry.id,operationId:null} satisfies PartialTextEvent);
-        emit('task-progress', {kind:'transcribe',stage:'progress.recognizedChunks',current:index+1,total:segments.length,elapsed:Math.floor((Date.now()-started)/1000)});
-        // `?fail=transcribe` ends the first attempt after two segments, to exercise the error and retry states.
-        if(index===1&&!previewFailed&&new URLSearchParams(window.location.search).get('fail')==='transcribe'){previewFailed=true;throw new Error('errors.cloudHttp|HTTP 503: preview outage');}
-      }
-      previewTexts.set(entry.id,result); entry.outputPath='preview.txt'; entry.model=configuration.model; value=result; break;
+    case 'enqueue_transcription': {
+      const id=String(args.id),entry=previewEntries.find(item=>item.id===id);
+      if (!entry) throw new Error('errors.recordMissing');
+      if (!previewQueue.some(item=>item.id===id)) {previewQueue.push({id,configuration:args.configuration as RecognitionConfig|undefined,running:false});emit('transcription-queue',{recordId:id,state:'queued',error:null});void runPreviewQueue();}
+      value=previewQueueSnapshot(); break;
+    }
+    case 'transcription_queue': value=previewQueueSnapshot(); break;
+    case 'cancel_transcription': {
+      const at=previewQueue.findIndex(item=>item.id===args.id);
+      if (at>=0&&!previewQueue[at].running) {previewQueue.splice(at,1);emit('transcription-queue',{recordId:String(args.id),state:'cancelled',error:'errors.operationCancelled'});}
+      else if (at>=0) previewCancelled=String(args.id);
+      break;
     }
     default: throw new Error(`Preview command unavailable: ${command}`);
   }
@@ -218,7 +250,19 @@ export async function call<T>(command: string, args: Record<string, unknown> = {
 function releasePreviewFile(path: string) { const selected=previewFiles.get(path); if (selected) URL.revokeObjectURL(selected.url); previewFiles.delete(path); }
 export function registerPreviewFile(file: File) { const path=`preview:${crypto.randomUUID()}`; previewFiles.set(path,{file,url:URL.createObjectURL(file)}); return path; }
 
-type BrowserRecording={stream:MediaStream;context:AudioContext;source:MediaStreamAudioSourceNode;processor:ScriptProcessorNode;mute:GainNode;queue:Promise<void>;pending:number;error:Error|null;chunks:Int16Array[];level:number;paused:boolean};
+type BrowserRecording={stream:MediaStream;context:AudioContext;source:MediaStreamAudioSourceNode;processor:ScriptProcessorNode;mute:GainNode;queue:Promise<void>;pending:number;error:Error|null;chunks:Int16Array[];level:number;paused:boolean;batch:Int16Array[];batchSamples:number};
+// One IPC per ~1 s of PCM instead of per ScriptProcessor buffer (~12/s). Rust caps a body at 65536 samples.
+function flushRecordingBatch(recording:BrowserRecording,force=false){
+  if(!recording.batchSamples)return;
+  const body=new Uint8Array(recording.batchSamples*2);let offset=0;
+  for(const part of recording.batch){body.set(new Uint8Array(part.buffer,part.byteOffset,part.byteLength),offset);offset+=part.byteLength;}
+  recording.batch=[];recording.batchSamples=0;
+  // Bound queued IPC chunks; a stalled disk must never buffer an hour in RAM. The final flush on stop is exempt so no audio is dropped.
+  if(!force&&recording.pending>=8){recording.error=new Error('errors.recordingStop');recording.stream.getTracks().forEach(track=>track.stop());return;}
+  recording.pending++;
+  // Raw little-endian PCM body; Rust decimates to 16 kHz and owns the WAV.
+  recording.queue=recording.queue.then(()=>invoke<void>('append_audio_recording',body)).catch(()=>{recording.error=new Error('errors.recordingStop');recording.stream.getTracks().forEach(track=>track.stop());}).finally(()=>{recording.pending--;});
+}
 let browserRecording:BrowserRecording|null=null;
 let browserInputLevel=0;
 export function recordingInputLevel(){
@@ -267,7 +311,7 @@ export async function startAudioRecording():Promise<void> {
     if(!preview)await call('start_audio_recording',{sampleRate:context.sampleRate});
     if(generation!==recordingGeneration)throw new Error('errors.recordingUnavailable');
     const source=context.createMediaStreamSource(stream),processor=context.createScriptProcessor(4096,1,1),mute=context.createGain();mute.gain.value=0;
-    const recording:BrowserRecording={stream,context,source,processor,mute,queue:Promise.resolve(),pending:0,error:null,chunks:[],level:0,paused:false};
+    const recording:BrowserRecording={stream,context,source,processor,mute,queue:Promise.resolve(),pending:0,error:null,chunks:[],level:0,paused:false,batch:[],batchSamples:0};
     browserInputLevel=0;browserRecording=recording;
     processor.onaudioprocess=event=>{
       if(recording.error||recording.paused){browserInputLevel=0;return;}
@@ -276,11 +320,8 @@ export async function startAudioRecording():Promise<void> {
       recording.level=Math.min(1,Math.sqrt(input.reduce((sum,sample)=>sum+sample*sample,0)/input.length));
       for(let i=0;i<input.length;i++){const sample=Math.max(-1,Math.min(1,input[i]));samples[i]=Math.round(sample*(sample<0?32768:32767));}
       if(preview){recording.chunks.push(samples);return;}
-      // Bound queued IPC chunks; a stalled disk must never buffer an hour in RAM.
-      if(recording.pending>=8){recording.error=new Error('errors.recordingStop');recording.stream.getTracks().forEach(track=>track.stop());return;}
-      recording.pending++;
-      // Raw little-endian PCM body; Rust decimates to 16 kHz and owns the WAV.
-      recording.queue=recording.queue.then(()=>invoke<void>('append_audio_recording',new Uint8Array(samples.buffer))).catch(()=>{recording.error=new Error('errors.recordingStop');recording.stream.getTracks().forEach(track=>track.stop());}).finally(()=>{recording.pending--;});
+      recording.batch.push(samples);recording.batchSamples+=samples.length;
+      if(recording.batchSamples>=Math.min(Math.round(recording.context.sampleRate),32768))flushRecordingBatch(recording);
     };
     source.connect(processor);processor.connect(mute);mute.connect(context.destination);
   } catch(error) {
@@ -293,6 +334,7 @@ export async function pauseAudioRecording():Promise<void>{
   if(!preview&&nativePlatform?.os==='android'){await call('pause_audio_recording');return;}
   if(fixtureRecording){if(!fixturePaused)fixtureElapsed+=performance.now()-fixtureStartedAt;fixturePaused=true;browserInputLevel=0;return;}
   if(!browserRecording)throw new Error('errors.recordingUnavailable');browserRecording.paused=true;browserInputLevel=0;
+  if(!preview&&!browserRecording.error)flushRecordingBatch(browserRecording);
 }
 export async function resumeAudioRecording():Promise<void>{
   if(!preview&&nativePlatform?.os==='android'){await call('resume_audio_recording');return;}
@@ -303,7 +345,7 @@ export async function stopAudioRecording():Promise<AudioSelection|null> {
   if(!preview&&nativePlatform?.os==='android'){const result=await call<AudioSelection>('stop_audio_recording');nativeRecordingActive=false;return result;}
   if(fixtureRecording){fixtureRecording=false;const samples=Int16Array.from({length:48000},(_,index)=>Math.round(Math.sin(index*2*Math.PI*440/16000)*1000));const file=recordingWav([samples],16000);return {path:registerPreviewFile(file),name:file.name};}
   const recording=browserRecording;if(!recording)throw new Error('errors.recordingUnavailable');browserRecording=null;
-  closeBrowserRecording(recording);await recording.queue;
+  closeBrowserRecording(recording);if(!preview&&!recording.error)flushRecordingBatch(recording,true);await recording.queue;
   if(recording.error){if(!preview)await call('cancel_audio_recording').catch(()=>{});throw recording.error;}
   if(!preview)return call<AudioSelection>('stop_audio_recording');
   if(!recording.chunks.length)throw new Error('errors.recordingEmpty');

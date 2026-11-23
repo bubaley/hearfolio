@@ -7,16 +7,19 @@ import {Pacer} from './pacer';
 import {pauseAudioRecording, resumeAudioRecording, restoreNativeRecordingFlag, observePendingOperation, operationHandled, markOperationHandled} from './api';
 import type {OperationSnapshot} from './operation-recovery';
 import {describeBusy, type BusyActivity, type BusyNotice} from './busy-activity';
+import {applyQueueEvent, reconcileJobs, applyJobProgress, applyJobText, isProcessing, archiveBusy, queuePosition, type Job, type Jobs} from './transcription-jobs';
 import './styles.css';
 import {renderSettings, initialSettingsDraft, mergeSettingsDraft, hasSettingsChanges, isSettingsSection, settingsLabel, settingsSectionTitle, type SettingsSection, type SettingsDraft} from './settings-ui';
-import {recordingInputLevel, call, pickAudio, startAudioRecording, stopAudioRecording, cancelAudioRecording, discardAudioRecording, exportText, subscribe, subscribeAudioDrop, registerPreviewFile, audioSource, shareAudio, shareText, saveAudio, prepareNativePlayback, nativePlaybackState, playNativePlayback, pauseNativePlayback, seekNativePlayback, releaseNativePlayback, type NativePlayerState, type PartialTextEvent, type CloudResume, openExternal, openAndroidBatterySettings, pickStorageParent, loadRuntimePlatform, previewCapabilities, appVersion, checkDesktopUpdate, latestAndroidRelease, restartApp, isNewerVersion, preview, listLooseRecordings, adoptLooseRecording, exportLooseRecording, type LooseRecording, type AudioSelection, type Entry, type Progress, type Settings, type CloudModel, type RecognitionConfig, type RuntimeCapabilities, type AndroidRelease, type AppUpdate} from './api';
+import {recordingInputLevel, call, pickAudio, startAudioRecording, stopAudioRecording, cancelAudioRecording, discardAudioRecording, exportText, subscribe, subscribeAudioDrop, registerPreviewFile, audioSource, shareAudio, shareText, saveAudio, prepareNativePlayback, nativePlaybackState, playNativePlayback, pauseNativePlayback, seekNativePlayback, releaseNativePlayback, type NativePlayerState, type PartialTextEvent, type CloudResume, openExternal, openAndroidBatterySettings, pickStorageParent, loadRuntimePlatform, previewCapabilities, appVersion, checkDesktopUpdate, latestAndroidRelease, restartApp, isNewerVersion, preview, listLooseRecordings, adoptLooseRecording, exportLooseRecording, type LooseRecording, type AudioSelection, type Entry, type Progress, type QueueEvent, type QueueItem, type Settings, type CloudModel, type RecognitionConfig, type RuntimeCapabilities, type AndroidRelease, type AppUpdate} from './api';
 import {icon, escapeHtml as esc} from './icons';
 import {installSelects} from './select';
 import {initOrg, bindOrg, sourceTabsHtml, isCloudSource, cloudListHtml, cloudDetailHtml, closeDetail as closeOrgDetail, detailTitle as orgDetailTitle, detailToolsHtml as orgDetailToolsHtml, destinationChipHtml, destinationDockHtml, afterImport as orgAfterImport, copyToOrganization, hasOrganizations, orgSettingsHtml} from './org';
+import {transcriptParagraphs, speakerNames, speakerHeading, transcriptPlainText, formatClock, activeSegmentIndex, type Segment as Phrase} from './transcript';
 import {tr, locale, countLabel, errorText, setLanguage, currentLanguage, type LanguagePreference} from './i18n';
 
 import {setupPostprocess, rulesHtml, postprocessHtml, resultsHtml, textPickerHtml, textPickerOpen, bindPostprocess, ensureRules, hasRuleDraft, mayLeaveRules, restorePostprocessActivity} from './postprocess';
 
+type HistoryDetail={entry:Entry;text:string;segments?:Phrase[];warning?:string|null};
 type View = 'work' | 'history' | 'archive' | 'models' | 'settings' | 'rules' | 'cloud';
 let settingsSection:SettingsSection|null=null, settingsSaving=false, settingsError='';
 const models = [
@@ -26,7 +29,7 @@ const models = [
   {id:'nemotron-3.5',name:'Nemotron 3.5',detail:"Многоязычное распознавание. Нужен отдельный движок NeMo.",size:"708 МБ",installed:false},
 ];
 const app = document.querySelector<HTMLDivElement>('#app')!;
-let view:View='work', history:Entry[]=[], active:Entry|null=null, text='', busy=false, loading=true;
+let view:View='work', history:Entry[]=[], active:Entry|null=null, text='', segments:Phrase[]=[], busy=false, loading=true;
 let status='', isError=false, progress:Progress|null=null, resultSaved=false, search='', cloudLoading=false;
 let settings:Settings={language:'system',systemLanguage:currentLanguage(),openrouterUrl:'https://openrouter.ai/api/v1',chunkSeconds:120,hasToken:false,storageParent:'',storagePath:'',lastConfiguration:{provider:'local',model:'whisper-base',mode:'local'}};
 let platform:RuntimeCapabilities=preview?{...previewCapabilities}:{os:'unknown',mobile:false,localRecognition:false,customStorage:false,nativeAudio:false,audioRecording:false};
@@ -40,7 +43,7 @@ let runtimeLoaded=false, historyError='', sidebarCollapsed=localStorage.getItem(
 let theme=localStorage.getItem('hearing-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');
 let operationStarted=0, elapsedTimer:ReturnType<typeof setInterval>|null=null;
 let nativeOperation:OperationSnapshot|null=null, operationPolling=false, operationCancelling=false, recoveringOperation=false;
-let settingsSaveQueue:Promise<unknown>=Promise.resolve(), previousResult:{text:string;saved:boolean}|null=null;
+let settingsSaveQueue:Promise<unknown>=Promise.resolve(), previousResult:{text:string;saved:boolean;segments:Phrase[]}|null=null;
 let receivedPartial=false, audioPosition=0, audioWasPlaying=false, pickingAudio=false;
 let noticeTimer:ReturnType<typeof setTimeout>|null=null;
 let recordingPhase:'idle'|'starting'|'recording'|'paused'|'stopping'|'cancelling'='idle', recordingStarted=0, pendingRecording:AudioSelection|null=null;
@@ -48,6 +51,42 @@ let outputTab:'transcript'|'results'='transcript';
 // Captured audio whose import never finished; the archive view lists it for retry or export.
 let loose:LooseRecording[]=[],looseLoading=false,looseError='';
 let resume:(CloudResume&{id:string})|null=null;
+// Records waiting for or in transcription. The native queue runs them one at a time and keeps running
+// whatever the user opens, so a transcription never locks the screen: `busy` is only for work the
+// user waits for in the foreground (saving a recording, a model download, moving the archive).
+// Leaving a record that is in the queue is safe: the text is saved natively when its run ends, and
+// opening the record again shows the run. Deleting it, changing its model, clearing the archive,
+// moving it or restarting the app are what stay unavailable until the queue is empty.
+const jobs:Jobs=new Map();
+const processing=(id?:string|null)=>isProcessing(jobs,id);
+const transcribing=()=>processing(active?.id);
+const showing=()=>Boolean(progress)&&(busy||transcribing());
+const jobCancelling=new Set<string>();
+let shownJob='';
+const queuedProgress=(job:Job):Progress=>({kind:'transcribe',stage:tr(job.state==='queued'?'В очереди':'Подготавливаем запись'),current:0,total:0,elapsed:Math.floor((Date.now()-job.started)/1000)});
+function ensureJobProgress(){for(const job of jobs.values())if(!job.progress)job.progress=queuedProgress(job);}
+// The progress card shows the displayed record's own run unless a foreground task owns it.
+function syncShownProgress(){
+  if(busy)return;
+  const job=active?jobs.get(active.id):undefined,id=job&&active?active.id:'';
+  if(id!==shownJob){shownJob=id;progressKey='';}
+  progress=job?.progress||null;
+  if(progress)feedProgress();
+}
+function runningJob():{id:string;job:Job}|null{for(const [id,job] of jobs)if(job.state==='running')return {id,job};return null;}
+function jobPercent(id:string):number|null{
+  if(id===active?.id&&!busy)return progressPercent();
+  const p=jobs.get(id)?.progress;return p?.total?Math.min(99,Math.floor(p.current/p.total*100)):null;
+}
+function chipLabel(id:string):string{
+  if(jobs.has(id)){const percent=jobPercent(id);return percent===null?tr('Распознаём'):`${percent}%`;}
+  const percent=progressPercent();return percent===null?tr(progress?.kind==='postprocess'?'Обработка':'Распознаём'):`${percent}%`;
+}
+function refreshChips(){document.querySelectorAll<HTMLElement>('.record-state.live').forEach(chip=>{const next=`<i aria-hidden="true"></i>${chipLabel(chip.dataset.record||'')}`;if(chip.innerHTML!==next)chip.innerHTML=next;});}
+function bannerLine():string{
+  const running=runningJob(),stage=running?running.job.progress?.stage:progress?.stage,percent=running?jobPercent(running.id):progressPercent();
+  return `${stage||''}${percent!==null?` · ${percent}%`:''}`;
+}
 // Records whose cloud transcription stopped part-way; their finished segments are kept on disk.
 let unfinished=new Map<string,{done:number;total:number}>();
 // Startup recovery of an interrupted recording can take a while (the audio is compacted before archiving).
@@ -120,7 +159,7 @@ const frames=new FrameLoop(now=>{
   let again=false;
   if(recordingPhase!=='idle'){paintRecorderMeter(now);again=recordingPhase==='recording';}
   if(revealing){paintReveal(now);again||=revealing;}
-  if(busy&&progress?.total){paintProgress(now);again=true;}
+  if(showing()&&progress?.total){paintProgress(now);again=true;}
   return again&&!document.hidden;
 });
 function requestFrames(){frames.request();}
@@ -139,10 +178,58 @@ function startReveal(from=0){textPacer.reset(from,performance.now());revealing=t
 function feedReveal(){if(!revealing)return;textPacer.set(text.length,performance.now());requestFrames();}
 function finishReveal(){if(!revealing)return;const now=performance.now();textPacer.set(text.length,now);textPacer.finish(now);requestFrames();}
 function stopReveal(){revealing=false;}
+// Timed transcript: paragraphs with a time button; the playing one is marked by a class (no re-render per tick).
+let paragraphSource:Phrase[]|null=null,paragraphCache:Phrase[]=[],activeRow=-2,followPlayback=true;
+function paragraphs():Phrase[] {if(paragraphSource!==segments){paragraphSource=segments;paragraphCache=transcriptParagraphs(segments);}return paragraphCache;}
+function transcriptText():string {return transcriptPlainText(paragraphs(),text);}
+function timedTranscriptShown():boolean {return !(revealing&&revealRecord===active?.id)&&paragraphs().length>0;}
+function timedTranscriptHtml():string {
+  const list=paragraphs(),names=speakerNames(list),order=[...names.keys()];
+  return `<ol class="timed-transcript" id="transcript-list" lang="${esc(currentLanguage())}" aria-label="${esc(tr('Расшифровка'))}">${list.map((segment,index)=>{
+    const heading=speakerHeading(list,names,index),tone=segment.speaker?order.indexOf(segment.speaker):-1;
+    return `<li class="timed-row" data-row="${index}"><button type="button" class="timed-time" data-seek-ms="${segment.start_ms}" aria-label="${esc(tr('Воспроизвести с ')+formatClock(segment.start_ms))}">${formatClock(segment.start_ms)}</button><div class="timed-body">${heading?`<strong class="timed-speaker tone-${tone<0?'none':tone%6}">${esc(heading)}</strong>`:''}<p>${esc(segment.text)}</p></div></li>`;
+  }).join('')}</ol>`;
+}
+function playbackMs():number {
+  if(platform.mobile)return playerState.playing||playerState.currentTime>0?playerState.currentTime*1000:-1;
+  const audio=document.querySelector<HTMLAudioElement>('#audio');
+  return audio&&(!audio.paused||audio.currentTime>0)?audio.currentTime*1000:-1;
+}
+function syncActiveRow(force=false) {
+  const rows=document.querySelectorAll<HTMLElement>('.timed-row');if(!rows.length){activeRow=-2;return;}
+  const ms=playbackMs(),index=ms<0?-1:activeSegmentIndex(paragraphs(),ms);
+  if(index===activeRow&&!force)return;activeRow=index;
+  rows.forEach((row,position)=>{const on=position===index;row.classList.toggle('is-active',on);if(on)row.setAttribute('aria-current','true');else row.removeAttribute('aria-current');});
+  const row=index>=0?rows[index]:null,scroller=document.querySelector<HTMLElement>('#result');
+  if(row&&scroller&&followPlayback&&(platform.mobile?playerState.playing:!document.querySelector<HTMLAudioElement>('#audio')?.paused)){
+    const box=scroller.getBoundingClientRect(),rect=row.getBoundingClientRect();
+    if(rect.top<box.top+box.height*0.1||rect.bottom>box.top+box.height*0.8)row.scrollIntoView({block:'center',behavior:'smooth'});
+  }
+}
+async function seekToMs(ms:number) {
+  followPlayback=true;
+  if(platform.mobile){
+    if(playerLoading||playerError)return;
+    try{await seekNativePlayback(ms/1000);if(!playerState.playing)await playNativePlayback();playerState=await nativePlaybackState();stopPlayerPolling();updateNativePlayer();if(playerState.playing)void pollNativePlayer();}
+    catch(error){playerError=errorText(error);playerState.playing=false;render();}
+    return;
+  }
+  const audio=document.querySelector<HTMLAudioElement>('#audio');if(!audio)return;
+  audio.currentTime=ms/1000;audio.play().catch(()=>{});syncActiveRow();
+}
+function bindTimedTranscript() {
+  const scroller=document.querySelector<HTMLElement>('#result');
+  for(const name of ['wheel','touchmove'])scroller?.addEventListener(name,()=>{followPlayback=false;},{passive:true});
+  document.querySelectorAll<HTMLElement>('.timed-row').forEach(row=>row.onclick=event=>{
+    if(window.getSelection()?.toString())return;
+    const ms=paragraphs()[Number(row.dataset.row)]?.start_ms;if(ms===undefined)return;
+    event.preventDefault();void seekToMs(ms);
+  });
+}
 function paintReveal(now:number){
   if(revealRecord!==active?.id){revealing=false;return;}
   const before=Math.floor(textPacer.value);textPacer.frame(now);
-  if(textPacer.finished)revealing=false;
+  if(textPacer.finished){revealing=false;if(segments.length){render();return;}}
   if(Math.floor(textPacer.value)===before&&revealing)return;
   const article=document.querySelector('#transcript-text'),result=document.querySelector<HTMLElement>('#result');
   if(!article){if(shownText())paintPartial();return;}
@@ -169,8 +256,8 @@ function paintProgress(now:number){
   document.querySelectorAll<HTMLElement>('#progress .track i').forEach(bar=>{bar.style.width=`${value.toFixed(2)}%`;});
   document.querySelectorAll('#progress .progress-percent').forEach(label=>{if(label.textContent!==whole)label.textContent=whole;});
   document.querySelector<HTMLElement>('.stage-wave')?.style.setProperty('--progress',`${value.toFixed(2)}%`);
-  document.querySelectorAll('.record-state.live').forEach(chip=>{const next=`<i aria-hidden="true"></i>${whole}`;if(chip.innerHTML!==next)chip.innerHTML=next;});
-  const banner=document.querySelector('.job-banner small'),stage=progress?`${progress.stage} · ${whole}`:'';if(banner&&banner.textContent!==stage)banner.textContent=stage;
+  refreshChips();
+  const banner=document.querySelector('.job-banner small'),stage=bannerLine();if(banner&&banner.textContent!==stage)banner.textContent=stage;
 }
 let recordingPausedAt=0,recordingPausedMillis=0;
 document.documentElement.dataset.theme=theme;
@@ -280,32 +367,35 @@ function beginOperation(kind:Progress['kind'],stage:string) {
   if (elapsedTimer) clearInterval(elapsedTimer);
   elapsedTimer=setInterval(()=>{if(progress){progress.elapsed=Math.max(progress.elapsed,Math.floor((Date.now()-operationStarted)/1000));updateProgress();}},1000);
 }
-function endOperation() {busy=false;progress=null;nativeOperation=null;operationCancelling=false;if(elapsedTimer)clearInterval(elapsedTimer);elapsedTimer=null;}
+function endOperation() {busy=false;progress=null;nativeOperation=null;operationCancelling=false;if(elapsedTimer)clearInterval(elapsedTimer);elapsedTimer=null;syncShownProgress();}
 function progressBodyHtml():string {
   const p=progress!,smooth=smoothPercent(),percent=smooth===null?null:Math.floor(smooth);
   const remaining=p.elapsed>0&&p.current>0&&p.total>p.current?Math.ceil((p.total-p.current)/(p.current/p.elapsed)):0;
   const amount=(p.kind==='download'||p.kind==='update')&&p.total?`${(p.current/1048576).toFixed(1)} / ${(p.total/1048576).toFixed(1)}${tr(" МБ · ")}`:'';
   return `<div class="progress-label"><strong>${esc(p.stage)}</strong><span class="progress-percent">${percent===null?'':`${percent}%`}</span></div><div class="track ${percent===null?'indeterminate':''}"><i style="width:${smooth===null?25:smooth.toFixed(2)}%"></i></div><div class="progress-detail"><span>${amount}${tr("Прошло ")}${formatTime(p.elapsed)}</span><span>${remaining?`${tr("Осталось около ")}${formatTime(remaining)}`:''}</span></div>`;
 }
-const cancelKey=()=>`${nativeOperation?.state||''}:${operationCancelling}`;
-function cancelHtml():string {return nativeOperation?.state==='running'?`<button type="button" class="secondary" id="cancel-operation" ${operationCancelling?'disabled':''}>${tr(operationCancelling?'Отменяем…':'Отменить')}</button>`:'';}
+const cancelKey=()=>!busy&&transcribing()?`job:${jobCancelling.has(active!.id)}:${jobs.get(active!.id)?.state}`:`${nativeOperation?.state||''}:${operationCancelling}`;
+function cancelHtml():string {
+  if(!busy&&transcribing()){const stopping=jobCancelling.has(active!.id);return `<button type="button" class="secondary" id="cancel-operation" ${stopping?'disabled':''}>${tr(stopping?'Отменяем…':'Отменить')}</button>`;}
+  return nativeOperation?.state==='running'?`<button type="button" class="secondary" id="cancel-operation" ${operationCancelling?'disabled':''}>${tr(operationCancelling?'Отменяем…':'Отменить')}</button>`:'';}
 function progressHtml():string {
-  if (!busy||!progress) return '';
+  if (!showing()) return '';
   return `<div class="task-progress" role="status"><span class="spinner" aria-hidden="true"></span><div class="progress-body" id="progress-body">${progressBodyHtml()}</div><div class="progress-cancel" id="progress-cancel" data-key="${cancelKey()}">${cancelHtml()}</div></div>`;
 }
 // Patch progress in place so the cancel button keeps focus and never misses a click between ticks.
 function updateProgress() {
   const element=document.querySelector('#progress'),body=element?.querySelector('#progress-body'),cancel=element?.querySelector<HTMLElement>('#progress-cancel');
-  if(element&&body&&cancel&&busy&&progress){body.innerHTML=progressBodyHtml();if(cancel.dataset.key!==cancelKey()){cancel.innerHTML=cancelHtml();cancel.dataset.key=cancelKey();bindOperationCancel();}}
+  if(element&&body&&cancel&&showing()){body.innerHTML=progressBodyHtml();if(cancel.dataset.key!==cancelKey()){cancel.innerHTML=cancelHtml();cancel.dataset.key=cancelKey();bindOperationCancel();}}
   else if(element){element.innerHTML=progressHtml();bindOperationCancel();}
   const percent=progressPercent(),wave=document.querySelector<HTMLElement>('.stage-wave');
-  if(wave){wave.style.setProperty('--progress',`${percent??0}%`);wave.classList.toggle('indeterminate',busy&&progress?.kind==='transcribe'&&percent===null);}
-  const label=percent===null?tr(progress?.kind==='postprocess'?'Обработка':'Распознаём'):`${percent}%`;
-  document.querySelectorAll('.record-state.live').forEach(chip=>{chip.innerHTML=`<i aria-hidden="true"></i>${label}`;});
-  const banner=document.querySelector('.job-banner small');if(banner&&progress)banner.textContent=`${progress.stage}${percent!==null?` · ${percent}%`:''}`;
+  if(wave){wave.style.setProperty('--progress',`${percent??0}%`);wave.classList.toggle('indeterminate',transcribing()&&percent===null);}
+    refreshChips();
+  const banner=document.querySelector('.job-banner small');if(banner)banner.textContent=bannerLine();
 }
 function bindOperationCancel(){document.querySelector('#cancel-operation')?.addEventListener('click',()=>{void cancelNativeOperation();});}
-async function cancelNativeOperation(){if(!nativeOperation?.id||operationCancelling)return;operationCancelling=true;updateProgress();try{await call('cancel_background_operation',{id:nativeOperation.id});}catch(error){operationCancelling=false;notice(errorText(error),true);updateProgress();}}
+async function cancelNativeOperation(){
+  if(!busy&&active&&transcribing()){const id=active.id;if(jobCancelling.has(id))return;jobCancelling.add(id);updateProgress();try{await call('cancel_transcription',{id});}catch(error){jobCancelling.delete(id);notice(errorText(error),true);updateProgress();}return;}
+  if(!nativeOperation?.id||operationCancelling)return;operationCancelling=true;updateProgress();try{await call('cancel_background_operation',{id:nativeOperation.id});}catch(error){operationCancelling=false;notice(errorText(error),true);updateProgress();}}
 function groupLabel(timestamp:number) {
   const day=new Date(timestamp);day.setHours(0,0,0,0);const today=new Date();today.setHours(0,0,0,0);
   const age=Math.round((today.getTime()-day.getTime())/86400000);
@@ -321,14 +411,16 @@ function waveBars(seed:string,count:number):number[] {
   return Array.from({length:count},(_,index)=>{hash^=hash<<13;hash^=hash>>>17;hash^=hash<<5;const envelope=.35+.65*Math.sin(Math.PI*(index+.5)/count);return Math.max(.12,Math.min(1,envelope*(.35+((hash>>>0)%1000)/1000*.65)));});
 }
 function recordStateHtml(entry:Entry):string {
-  if(jobRecord()===entry.id){const percent=progressPercent();return `<span class="record-state live"><i aria-hidden="true"></i>${percent===null?tr(progress?.kind==='postprocess'?'Обработка':'Распознаём'):`${percent}%`}</span>`;}
+  const job=jobs.get(entry.id);
+  if(job?.state==='queued'){const place=queuePosition(jobs,entry.id);return `<span class="record-state queued" title="${tr('В очереди')}">${tr('В очереди')}${place>1?` · ${place}`:''}</span>`;}
+  if(job||jobRecord()===entry.id)return `<span class="record-state live" data-record="${esc(entry.id)}"><i aria-hidden="true"></i>${chipLabel(entry.id)}</span>`;
   if(entry.outputPath)return `<span class="record-state done">${tr('Текст')}</span>`;
   const partial=unfinished.get(entry.id);
   return partial?`<span class="record-state paused" title="${tr('Расшифровка не завершена')}">${partial.done}/${partial.total}</span>`:`<span class="record-state">${tr('Аудио')}</span>`;
 }
 function recordDetailHtml(entry:Entry):string {return `<span class="record-detail">${recordStateHtml(entry)}<span class="record-date">${dateLabel(entry.createdAt)}</span>${entry.durationSeconds?`<span>${formatTime(entry.durationSeconds)}</span>`:''}</span>`;}
 function recordActionsHtml(entry:Entry):string {
-  return `<div class="record-actions"><button class="icon-button" data-rename="${esc(entry.id)}" aria-label="${tr('Переименовать')} ${esc(entry.name)}" title="${tr('Переименовать запись')}" ${disabled()}>${icon('edit')}</button><button class="icon-button" data-delete="${esc(entry.id)}" aria-label="${tr('Удалить')} ${esc(entry.name)}" title="${tr('Удалить запись')}" ${disabled()}>${icon('trash')}</button></div>`;
+  return `<div class="record-actions"><button class="icon-button" data-rename="${esc(entry.id)}" aria-label="${tr('Переименовать')} ${esc(entry.name)}" title="${tr('Переименовать запись')}" ${disabled()}>${icon('edit')}</button><button class="icon-button" data-delete="${esc(entry.id)}" aria-label="${tr('Удалить')} ${esc(entry.name)}" title="${tr('Удалить запись')}" ${disabled()||(processing(entry.id)?'disabled':'')}>${icon('trash')}</button></div>`;
 }
 function historyItems(entries:Entry[]):string {
   let group='';
@@ -371,20 +463,21 @@ function captureHtml():string {
   return `<section class="welcome" id="drop-area">${platform.audioRecording?`${recordOrbHtml('start-recording',tr('Начать запись'))}<h1>${tr('Нажмите, чтобы записать')}</h1><p>${tr('Или')} <button class="link-button" data-choose ${disabled()}>${tr('выберите аудиофайл')}</button>${platform.mobile?'':tr(' — его можно просто перетащить сюда')}.</p>`:`<button class="drop-target" data-choose ${disabled()}>${icon('upload')}</button><h1>${tr('Добавьте аудиофайл')}</h1><p>${tr('Перетащите файл сюда или')} <button class="link-button" data-choose ${disabled()}>${tr('выберите на диске')}</button>.</p>`}<small>${audioFormats}</small>${destinationChipHtml()}</section>`;
 }
 function stageHtml():string {
-  const transcribing=busy&&progress?.kind==='transcribe',percent=transcribing?progressPercent():null;
-  return `<section class="stage ${transcribing?'is-running':''}" aria-live="polite"><div class="stage-wave ${transcribing&&percent===null?'indeterminate':''}" style="--progress:${percent??0}%" aria-hidden="true">${waveBars(active?.id||'hearfolio',42).map(level=>`<i style="--level:${level.toFixed(3)}"></i>`).join('')}</div><h2>${tr(transcribing?'Расшифровываем…':'Готово к расшифровке')}</h2><p>${tr(transcribing?(platform.mobile?'Можно свернуть приложение — работа продолжится, а текст появится здесь.':'Текст будет появляться здесь по мере готовности.'):'Выберите модель внизу и нажмите «Расшифровать».')}</p></section>`;
+  const running=transcribing(),waiting=running&&jobs.get(active!.id)?.state==='queued',percent=running&&!waiting?progressPercent():null;
+  return `<section class="stage ${running&&!waiting?'is-running':''}" aria-live="polite"><div class="stage-wave ${running&&percent===null?'indeterminate':''}" style="--progress:${percent??0}%" aria-hidden="true">${waveBars(active?.id||'hearfolio',42).map(level=>`<i style="--level:${level.toFixed(3)}"></i>`).join('')}</div><h2>${tr(waiting?'В очереди':running?'Расшифровываем…':'Готово к расшифровке')}</h2><p>${tr(waiting?'Расшифровка начнётся, когда дойдёт очередь. Можно записывать, добавлять файлы и открывать другие записи.':running?(platform.mobile?'Можно свернуть приложение — работа продолжится, а текст появится здесь.':'Текст будет появляться здесь по мере готовности. Можно записывать и открывать другие записи.'):'Выберите модель внизу и нажмите «Расшифровать».')}</p></section>`;
 }
 function outputHtml():string {
   if(recordingPhase!=='idle'||!active)return captureHtml();
   if(outputTab==='results')return resultsHtml();
   const visible=shownText();
+  if (visible&&timedTranscriptShown()) return timedTranscriptHtml();
   if (visible) return `<article class="transcript" id="transcript-text" lang="${esc(currentLanguage())}">${esc(visible)}</article>`;
   return stageHtml();
 }
-function resultMeta():string {return busy&&progress?.kind==='transcribe'?tr("Расшифровываем…"):text?`${countLabel(words(),'word')}${resultSaved?'':tr(" · не сохранено")}`:tr("Без текста");}
+function resultMeta():string {return transcribing()?tr(jobs.get(active!.id)?.state==='queued'?"В очереди":"Расшифровываем…"):text?`${countLabel(words(),'word')}${resultSaved?'':tr(" · не сохранено")}`:tr("Без текста");}
 function recordMetaHtml():string {
   if(!active)return '';
-  const gaps=active.incompleteRanges?.length&&!(busy&&progress?.kind==='transcribe')?`<span class="record-gaps" title="${tr('Часть записи распознана не полностью:')} ${esc(passagesLabel(active))}">${icon('alert')}${tr('Сверьте с аудио:')} ${esc(passagesLabel(active))}</span>`:'';
+  const gaps=active.incompleteRanges?.length&&!transcribing()?`<span class="record-gaps" title="${tr('Часть записи распознана не полностью:')} ${esc(passagesLabel(active))}">${icon('alert')}${tr('Сверьте с аудио:')} ${esc(passagesLabel(active))}</span>`:'';
   return [dateLabel(active.createdAt),active.durationSeconds?formatTime(active.durationSeconds):'',active.sizeBytes?sizeLabel(active.sizeBytes):'',resultMeta()].filter(Boolean).map(part=>`<span>${esc(part)}</span>`).join('')+gaps;
 }
 function providerControlsHtml():string {
@@ -408,7 +501,7 @@ function catalogResults(matches:CloudModel[]):string {
 }
 function runButtonHtml(issue:string):string {
   const again=Boolean(text&&resultSaved)&&!canResume(),label=canResume()?`${tr('Продолжить')} (${resume!.done}/${resume!.total})`:tr(again?'Расшифровать заново':'Расшифровать');
-  return `<button class="${again?'secondary':'primary'} run-button" id="run" ${busy||!active||issue?'disabled':''} title="${esc(issue||label+' · ⌘ Enter')}">${again?icon('history'):''}<span>${label}</span></button>`;
+  return `<button class="${again?'secondary':'primary'} run-button" id="run" ${busy||!active||transcribing()||issue?'disabled':''} title="${esc(issue||label+' · ⌘ Enter')}">${again?icon('history'):''}<span>${label}</span></button>`;
 }
 function requirementHtml(issue:string):string {
   if(!issue)return '';
@@ -419,7 +512,7 @@ function requirementHtml(issue:string):string {
 }
 function composerHtml(issue:string):string {
   if(recordingPhase!=='idle'||!active)return busy&&progress?`<div class="dock"><div id="progress">${progressHtml()}</div></div>`:'';
-  if(busy&&progress)return `<div class="dock"><div id="progress">${progressHtml()}</div></div>`;
+  if(showing())return `<div class="dock"><div id="progress">${progressHtml()}</div></div>`;
   if(outputTab==='results')return '';
   return `<div class="dock"><div id="progress"></div>${requirementHtml(issue)}<div class="dock-row"><div class="dock-model">${providerControlsHtml()}</div>${runButtonHtml(issue)}</div></div>`;
 }
@@ -429,7 +522,7 @@ function recordHeaderHtml():string {
 }
 function outputTabsHtml():string {
   if(!active||!(text||active.results?.length))return '';
-  return `<div class="output-tabs"><div class="output-tab-buttons" role="tablist" aria-label="${tr('Текст записи')}"><button role="tab" id="transcript-tab" data-output-tab="transcript" aria-selected="${outputTab==='transcript'}">${tr('Текст')}</button><button role="tab" id="results-tab" data-output-tab="results" aria-selected="${outputTab==='results'}">${tr('Выжимки')}${active.results?.length?` <small>${active.results.length}</small>`:''}</button></div>${outputTab==='transcript'&&text?`<div class="output-tools"><button type="button" class="ghost-button" id="copy-transcript" ${busy&&progress?.kind==='transcribe'?'disabled':''}>${icon('copy')}<span>${tr('Копировать')}</span></button>${resultSaved?`<button type="button" class="ghost-button" id="process-shortcut" ${busy?'disabled':''}>${icon('file')}<span>${tr('Сделать выжимку')}</span></button>`:''}</div>`:''}</div>`;
+  return `<div class="output-tabs"><div class="output-tab-buttons" role="tablist" aria-label="${tr('Текст записи')}"><button role="tab" id="transcript-tab" data-output-tab="transcript" aria-selected="${outputTab==='transcript'}">${tr('Текст')}</button><button role="tab" id="results-tab" data-output-tab="results" aria-selected="${outputTab==='results'}">${tr('Выжимки')}${active.results?.length?` <small>${active.results.length}</small>`:''}</button></div>${outputTab==='transcript'&&text?`<div class="output-tools"><button type="button" class="ghost-button" id="copy-transcript" ${transcribing()?'disabled':''}>${icon('copy')}<span>${tr('Копировать')}</span></button>${resultSaved?`<button type="button" class="ghost-button" id="process-shortcut" ${busy?'disabled':''}>${icon('file')}<span>${tr('Сделать выжимку')}</span></button>`:''}</div>`:''}</div>`;
 }
 function workHtml():string {
   const issue=readiness(),source=active&&!platform.mobile?audioSource(active):'';
@@ -437,7 +530,7 @@ function workHtml():string {
   return `<section class="workspace ${recording?'is-capture':''}">
     ${!recording?`${recordHeaderHtml()}<div class="audio-bar ${platform.mobile?'native-audio-bar':''}">${platform.mobile?nativePlayerHtml():source?`<audio id="audio" controls controlslist="nodownload noplaybackrate" preload="metadata" src="${esc(source)}" aria-label="${tr('Прослушать ')}${esc(active!.name)}"></audio>`:''}<p id="playback-error" class="playback-error" role="alert"></p></div>${outputTabsHtml()}`:''}
     <div class="transcript-scroll" id="result" ${active&&!recording&&(text||active.results?.length)?`role="tabpanel" aria-labelledby="${outputTab==='transcript'?'transcript-tab':'results-tab'}"`:''}>${outputHtml()}${!recording&&text&&resultSaved&&outputTab==='transcript'?postprocessHtml():''}</div>
-    ${previousResult?.saved&&!busy&&!resultSaved?`<div class="restore-result"><span>${tr('Предыдущий текст сохранён в архиве.')}</span><button class="text-button" id="restore">${tr('Вернуть его')}</button></div>`:''}
+    ${previousResult?.saved&&!busy&&!transcribing()&&!resultSaved?`<div class="restore-result"><span>${tr('Предыдущий текст сохранён в архиве.')}</span><button class="text-button" id="restore">${tr('Вернуть его')}</button></div>`:''}
     ${composerHtml(issue)}
   </section>`;
 }
@@ -446,9 +539,9 @@ function nativePlayerHtml():string {
   return `<div class="native-player" aria-label="${tr('Прослушать ')}${esc(active?.name||'')}"><button type="button" id="native-play" class="play-button" aria-label="${tr(playerState.playing?'Пауза':'Воспроизвести')}" ${playerLoading||playerError?'disabled':''}>${playerLoading?'<span class="spinner"></span>':icon(playerState.playing?'pause':'play')}</button><div class="player-track"><input type="range" id="native-seek" min="0" max="${Math.max(duration,1)}" value="${playerState.currentTime}" step="0.1" aria-label="${tr('Позиция воспроизведения')}" ${playerLoading||playerError||!duration?'disabled':''}><div><span id="native-position">${formatTime(playerState.currentTime)}</span><span id="native-duration">${duration?formatTime(duration):'—'}</span></div></div></div>${playerError?`<div class="player-error" role="alert"><span>${esc(playerError)}</span><button type="button" class="text-button" id="retry-playback">${tr('Повторить')}</button></div>`:''}`;
 }
 function homeHtml():string {
-  const job=jobRecord()?history.find(entry=>entry.id===jobRecord()):null;
+  const jobId=runningJob()?.id||jobRecord(),job=jobId?history.find(entry=>entry.id===jobId):null;
   const restoreBanner=restoring?`<div class="job-banner" role="status"><span class="spinner"></span><span><strong>${tr('Восстанавливаем запись…')}</strong><small>${tr('Аудио сохранено. Это займёт немного времени.')}</small></span></div>`:'';
-  return `<section class="home">${restoreBanner}${job?`<button class="job-banner" data-history="${esc(job.id)}"><span class="spinner"></span><span><strong>${esc(displayName(job))}</strong><small>${esc(progress?.stage||'')}${progressPercent()!==null?` · ${progressPercent()}%`:''}</small></span>${icon('chevron')}</button>`:''}${sourceTabsHtml()}${history.length>5||search||isCloudSource()?searchFieldHtml():''}<div class="record-list" id="history-results">${historyResults()}</div></section><div class="home-dock"><button class="dock-side" data-choose ${disabled()}>${icon('upload')}<span>${tr('Файл')}</span></button>${platform.audioRecording?recordOrbHtml('quick-record',tr('Начать запись')):''}${destinationDockHtml()||'<span class="dock-side" aria-hidden="true"></span>'}</div>`;
+  return `<section class="home">${restoreBanner}${job?`<button class="job-banner" data-history="${esc(job.id)}"><span class="spinner"></span><span><strong>${esc(displayName(job))}</strong><small>${esc(bannerLine())}</small></span>${icon('chevron')}</button>`:''}${sourceTabsHtml()}${history.length>5||search||isCloudSource()?searchFieldHtml():''}<div class="record-list" id="history-results">${historyResults()}</div></section><div class="home-dock"><button class="dock-side" data-choose ${disabled()}>${icon('upload')}<span>${tr('Файл')}</span></button>${platform.audioRecording?recordOrbHtml('quick-record',tr('Начать запись')):''}${destinationDockHtml()||'<span class="dock-side" aria-hidden="true"></span>'}</div>`;
 }
 function modelsHtml():string {
   const installationCommand=platform.os==='linux'?'sudo apt install ffmpeg':'brew install ffmpeg whisper.cpp';
@@ -509,7 +602,7 @@ function mobileHeaderHtml():string {
   const home=view==='history',back=view==='rules'?'settings':'history';
   // A record names itself in the page; its app bar carries the actions instead of a second title.
   const record=view==='work'&&active&&recordingPhase==='idle'?active:null;
-  const recordTools=record?`<button type="button" class="icon-button" data-rename="${esc(record.id)}" aria-label="${tr('Переименовать запись')}" ${disabled()}>${icon('edit')}</button><button type="button" class="icon-button" id="record-share" aria-haspopup="dialog" aria-expanded="false" aria-controls="record-actions-dialog" aria-label="${tr('Поделиться')}">${icon('share')}</button><button type="button" class="icon-button" data-delete="${esc(record.id)}" aria-label="${tr('Удалить запись')}" ${disabled()}>${icon('trash')}</button>`:'';
+  const recordTools=record?`<button type="button" class="icon-button" data-rename="${esc(record.id)}" aria-label="${tr('Переименовать запись')}" ${disabled()}>${icon('edit')}</button><button type="button" class="icon-button" id="record-share" aria-haspopup="dialog" aria-expanded="false" aria-controls="record-actions-dialog" aria-label="${tr('Поделиться')}">${icon('share')}</button><button type="button" class="icon-button" data-delete="${esc(record.id)}" aria-label="${tr('Удалить запись')}" ${disabled()||(processing(record.id)?'disabled':'')}>${icon('trash')}</button>`:'';
   const barTitle=record||view==='cloud'?'':view==='settings'&&settingsSection?settingsSectionTitle(settingsSection):headerTitle();
   return `<header class="main-header mobile-header">${home?`<span class="brand">${brandHtml()}</span>`:`<button type="button" class="icon-button back-button" ${view==='settings'&&settingsSection?'data-settings-back':`data-back="${back}"`} aria-label="${tr('Назад')}" ${recordingPhase!=='idle'?'hidden':''}>${icon('back')}</button><span class="header-title">${esc(barTitle)}</span>`}<div class="header-status"><div id="update-header">${updateHeaderHtml()}</div>${recordTools}${view==='cloud'?orgDetailToolsHtml(true):''}${home?`<button type="button" class="icon-button badge-host" data-view="archive" aria-label="${tr('Архив')}">${icon('archive')}${looseBadgeHtml()}</button><button type="button" class="icon-button" data-view="settings" aria-label="${tr('Настройки')}">${icon('settings')}</button>`:''}</div></header>`;
 }
@@ -518,9 +611,9 @@ function updateHeaderHtml():string {
 }
 function updatesHtml():string {
   if(platform.os!=='android'&&platform.os!=='macos'&&platform.os!=='linux'&&platform.os!=='windows')return `<p>${tr('Обновления на этой платформе недоступны.')}</p>`;
-  if(updateInstalled)return `<p>${tr('Обновление установлено. Перезапустите приложение, когда закончите работу.')}</p><button type="button" class="secondary" id="restart-update" ${busy?'disabled':''}>${tr('Перезапустить приложение')}</button>`;
+  if(updateInstalled)return `<p>${tr('Обновление установлено. Перезапустите приложение, когда закончите работу.')}</p><button type="button" class="secondary" id="restart-update" ${busy||archiveBusy(jobs)?'disabled':''}>${tr('Перезапустить приложение')}</button>`;
   const version=pendingUpdate?.version||androidRelease?.version;
-  return `<p>${platform.mobile?tr('На Android обновление устанавливается вручную из APK. Ваш архив останется в приложении.'):tr('Обновления проверяются автоматически. Установка и перезапуск выполняются по вашему запросу.')}</p>${version?`<div class="update-offer"><span>${tr('Доступно обновление')} <strong>${esc(version)}</strong></span><button type="button" class="secondary" id="install-update" ${busy||updateChecking?'disabled':''}>${tr(platform.mobile?'Открыть APK':'Установить обновление')}</button></div>`:''}${updateError?`<p class="update-error" role="alert">${esc(tr(updateError))}</p>`:updateChecked&&!version?`<p class="update-checked">${tr('Установлена последняя версия')}</p>`:''}<button type="button" class="text-button" id="check-update" ${busy||updateChecking?'disabled':''}>${tr(updateChecking?'Проверяем обновления…':'Проверить обновления')}</button>`;
+  return `<p>${platform.mobile?tr('На Android обновление устанавливается вручную из APK. Ваш архив останется в приложении.'):tr('Обновления проверяются автоматически. Установка и перезапуск выполняются по вашему запросу.')}</p>${version?`<div class="update-offer"><span>${tr('Доступно обновление')} <strong>${esc(version)}</strong></span><button type="button" class="secondary" id="install-update" ${busy||updateChecking||(!platform.mobile&&archiveBusy(jobs))?'disabled':''}>${tr(platform.mobile?'Открыть APK':'Установить обновление')}</button></div>`:''}${updateError?`<p class="update-error" role="alert">${esc(tr(updateError))}</p>`:updateChecked&&!version?`<p class="update-checked">${tr('Установлена последняя версия')}</p>`:''}<button type="button" class="text-button" id="check-update" ${busy||updateChecking?'disabled':''}>${tr(updateChecking?'Проверяем обновления…':'Проверить обновления')}</button>`;
 }
 function refreshUpdateUi() {
   const section=document.querySelector('#about-updates');if(section){section.innerHTML=updatesHtml();bindUpdates();}
@@ -543,7 +636,7 @@ async function checkUpdates(manual=false) {
   finally{updateChecking=false;refreshUpdateUi();}
 }
 async function installUpdate() {
-  if(busy||updateChecking)return;
+  if(busy||updateChecking||(!platform.mobile&&archiveBusy(jobs)))return;
   if(platform.mobile){if(androidRelease)await openExternal(androidRelease.url).catch(error=>notice(errorText(error),true));return;}
   if(!pendingUpdate)return;
   const selected=pendingUpdate;
@@ -557,6 +650,7 @@ async function installUpdate() {
 }
 async function restartAfterUpdate(requireUpdate=true) {
   if(busy||(requireUpdate&&!updateInstalled)||!['macos','linux','windows'].includes(platform.os))return;
+  if(archiveBusy(jobs)){notice(tr('Дождитесь окончания расшифровок: после этого можно перезапустить приложение.'),true);return;}
   if(!await mayLeaveSettings()||!await mayReplaceRecord(false))return;
   if(!await confirmAction(tr('Перезапустить приложение?'),tr('Текущая работа будет завершена. Сохранённые записи останутся в архиве.'),tr('Перезапустить'),false))return;
   if(busy)return;
@@ -573,7 +667,8 @@ function preservePlayback() {
   if (audio) {audioPosition=audio.currentTime;audioWasPlaying=!audio.paused;}
 }
 function activityLabel():string {
-  if(!busy||recordingPhase!=='idle'||!progress)return '';
+  if(recordingPhase!=='idle')return '';
+  if(!busy||!progress)return runningJob()?tr('Расшифровываем'):'';
   return progress.kind==='download'?tr("Скачиваем модель"):progress.kind==='import'?tr("Добавляем запись"):progress.kind==='storage'?tr('Переносим архив'):progress.kind==='update'?tr('Устанавливаем обновление'):progress.kind==='postprocess'?tr('Обрабатываем текст…'):tr('Расшифровываем');
 }
 function desktopHeaderHtml():string {
@@ -590,7 +685,7 @@ let booted=false;
 function render() {
   // Until the platform is known, show only the mark so Android never flashes the desktop layout.
   if(!booted){app.innerHTML=`<div class="boot"><span class="brand-mark">${icon('wave')}</span></div>`;return;}
-  preservePlayback();
+  preservePlayback();syncShownProgress();
   if(platform.mobile&&view==='work'&&!active&&recordingPhase==='idle'&&!pendingRecording&&!busy)view='history';
   const kept=document.querySelector<HTMLAudioElement>('#audio');
   document.documentElement.dataset.platform=platform.os;
@@ -601,12 +696,13 @@ function render() {
   const slot=document.querySelector<HTMLAudioElement>('#audio');let reused=false;
   if(kept&&slot&&kept.getAttribute('src')===slot.getAttribute('src')){slot.replaceWith(kept);reused=true;}
   attachRecorderView();requestFrames();
-  bind();updateNotice();if(!reused)restorePlayback();if(view==='work'&&active&&platform.mobile&&recordingPhase==='idle')void ensureNativePlayer();else stopPlayerPolling();
+  bind();updateNotice();if(!reused)restorePlayback();bindTimedTranscript();syncActiveRow(true);if(view==='work'&&active&&platform.mobile&&recordingPhase==='idle')void ensureNativePlayer();else stopPlayerPolling();
 }
 function restorePlayback() {
   const audio=document.querySelector<HTMLAudioElement>('#audio');
   if (!audio) return;
   audio.addEventListener('loadedmetadata',()=>{if(audioPosition&&audioPosition<audio.duration)audio.currentTime=audioPosition;if(audioWasPlaying)audio.play().catch(()=>{});});
+  for(const name of ['timeupdate','seeked','play','pause'])audio.addEventListener(name,()=>syncActiveRow());
   audio.addEventListener('error',()=>{const error=document.querySelector('#playback-error');if(error)error.textContent=tr('Не удалось воспроизвести аудио. Попробуйте открыть запись снова. Файл можно распознать.');});
 }
 function stopPlayerPolling(){if(playerPoll)clearTimeout(playerPoll);playerPoll=null;}
@@ -615,6 +711,7 @@ function updateNativePlayer(){
   if(position)position.textContent=formatTime(playerState.currentTime);if(total)total.textContent=duration?formatTime(duration):'—';
   if(seek){seek.max=String(Math.max(duration,1));if(document.activeElement!==seek)seek.value=String(Math.min(playerState.currentTime,duration));seek.disabled=playerLoading||!!playerError||!duration;}
   if(button){button.innerHTML=playerLoading?'<span class="spinner"></span>':icon(playerState.playing?'pause':'play');button.setAttribute('aria-label',tr(playerState.playing?'Пауза':'Воспроизвести'));button.disabled=playerLoading||!!playerError;}
+  syncActiveRow();
 }
 async function pollNativePlayer(){
   const generation=playerGeneration;if(view!=='work'||!active||active.id!==playerId||!playerState.playing)return;
@@ -637,7 +734,7 @@ function bindNativePlayer(){
 }
 
 function resetPlayback() {stopPlayerPolling();playerGeneration++;playerId='';playerLoading=false;playerError='';playerState={duration:0,currentTime:0,playing:false};void releaseNativePlayback().catch(()=>{});audioPosition=0;audioWasPlaying=false;const audio=document.querySelector<HTMLAudioElement>('#audio');if(audio){audio.pause();audio.currentTime=0;}}
-async function mayReplaceRecord(discardRecording=true) {if(pendingRecording){if(discardRecording){if(!await discardPendingRecording())return false;}else if(!await confirmAction(tr('Удалить записанное аудио?'),tr('Эта запись ещё не добавлена в архив и будет потеряна.'),tr('Продолжить без записи'),false))return false;}return !text||resultSaved||await confirmAction(tr("Неполный текст не сохранён"),tr("Скопируйте или экспортируйте текст, чтобы сохранить его. При переходе к другой записи этот результат будет потерян."),tr("Продолжить без текста"),false);}
+async function mayReplaceRecord(discardRecording=true) {if(pendingRecording){if(discardRecording){if(!await discardPendingRecording())return false;}else if(!await confirmAction(tr('Удалить записанное аудио?'),tr('Эта запись ещё не добавлена в архив и будет потеряна.'),tr('Продолжить без записи'),false))return false;}return !text||resultSaved||transcribing()||await confirmAction(tr("Неполный текст не сохранён"),tr("Скопируйте или экспортируйте текст, чтобы сохранить его. При переходе к другой записи этот результат будет потерян."),tr("Продолжить без текста"),false);}
 async function mayLeaveSettings() {
   if(settingsSaving||!await mayLeaveRules())return false;
   if(!settingsDraft)return true;
@@ -678,7 +775,7 @@ function bind() {
   document.querySelector('#quick-record')?.addEventListener('click',()=>{void quickRecord();});
   document.querySelectorAll('[data-open-recorder]').forEach(element=>element.addEventListener('click',openRecorder));
   document.querySelectorAll<HTMLElement>('[data-back]').forEach(element=>element.onclick=()=>changeView(element.dataset.back as View));
-  document.querySelector('#copy-transcript')?.addEventListener('click',()=>copyText(text));
+  document.querySelector('#copy-transcript')?.addEventListener('click',()=>copyText(transcriptText()));
   document.querySelector('#run')?.addEventListener('click',run);
   document.querySelectorAll('button[data-theme]').forEach(element=>element.addEventListener('click',()=>{theme=theme==='dark'?'light':'dark';document.documentElement.dataset.theme=theme;localStorage.setItem('hearing-theme',theme);render();}));
   document.querySelector('#collapse')?.addEventListener('click',()=>setSidebar(true));document.querySelector('#expand')?.addEventListener('click',()=>setSidebar(false));
@@ -696,7 +793,7 @@ function bind() {
   document.querySelector('#retry-history')?.addEventListener('click',()=>refreshHistory());
   document.querySelector('#retry-runtime')?.addEventListener('click',()=>refreshRuntime());
   document.querySelector('#copy-install')?.addEventListener('click',()=>copyText(platform.os==='linux'?'sudo apt install ffmpeg':'brew install ffmpeg whisper.cpp'));
-  document.querySelector('#restore')?.addEventListener('click',()=>{if(previousResult){text=previousResult.text;resultSaved=previousResult.saved;previousResult=null;render();}});
+  document.querySelector('#restore')?.addEventListener('click',()=>{if(previousResult){text=previousResult.text;segments=previousResult.segments;resultSaved=previousResult.saved;previousResult=null;render();}});
   document.querySelectorAll<HTMLAnchorElement>('a[href^="https://"]').forEach(anchor=>anchor.onclick=event=>{event.preventDefault();openExternal(anchor.href).catch(error=>notice(errorText(error),true));});
   bindSettings();bindUpdates();bindArchive();bindOrg();
 }
@@ -704,7 +801,7 @@ function setSidebar(collapsed:boolean) {sidebarCollapsed=collapsed;localStorage.
 let recordActionsDialog:HTMLDialogElement|null=null;
 function openRecordActions(){
   if(!active||recordActionsDialog?.open)return;
-  const entry=active,transcript=text,trigger=document.querySelector<HTMLElement>('#record-share');
+  const entry=active,transcript=transcriptText(),trigger=document.querySelector<HTMLElement>('#record-share');
   const dialog=document.createElement('dialog');recordActionsDialog=dialog;dialog.className='record-actions-dialog';dialog.id='record-actions-dialog';trigger?.setAttribute('aria-expanded','true');dialog.setAttribute('aria-labelledby','record-actions-title');
   const action=(name:string,label:string,glyph:string)=>`<button type="button" data-record-action="${name}">${icon(glyph)}<span>${tr(label)}</span></button>`;
   dialog.innerHTML=`<div class="record-actions-heading"><h2 id="record-actions-title">${tr('Поделиться')}</h2><button type="button" class="icon-button" data-actions-close aria-label="${tr('Закрыть')}">${icon('close')}</button></div><div class="record-actions-group">${action('share-audio','Поделиться аудио','share')}${transcript.trim()?action('share-text','Поделиться текстом','file'):''}${hasOrganizations()?action('organization','Копировать в организацию','cloud'):''}</div><div class="record-actions-group">${action('save-audio','Сохранить аудио','download')}${transcript.trim()?action('save-text','Сохранить текст','download')+action('copy-text','Копировать текст','copy'):''}</div>`;
@@ -755,12 +852,13 @@ async function persist(token?:string,snapshot:{language:LanguagePreference;openr
 }
 async function changeStorage() {
   if(busy||!platform.customStorage)return;
+  if(archiveBusy(jobs)){notice(tr('Дождитесь окончания расшифровок: после этого можно перенести архив.'),true);return;}
   try{
     const parent=await pickStorageParent(settings.storageParent);if(!parent||parent===settings.storageParent)return;
     beginOperation('storage',tr("Переносим архив"));preservePlayback();render();
     settings=await call<Settings>('set_storage_parent',{parent});
     history=sortHistory(await call<Entry[]>('list_history'));
-    if(active){const detail=await call<{entry:Entry;text:string}>('get_history',{id:active.id});active=detail.entry;}
+    if(active){const detail=await call<HistoryDetail>('get_history',{id:active.id});active=detail.entry;}
     const statuses=await call<{id:string;installed:boolean}[]>('model_status');models.forEach(model=>model.installed=statuses.find(item=>item.id===model.id)?.installed||false);
     notice(tr("Архив перенесён"));
   }catch(error){notice(`${tr("Не удалось перенести архив: ")}${errorText(error)}`,true);}
@@ -780,7 +878,7 @@ function restoreConfiguration(entry?:Entry|null) {
   if(configuration.provider==='openrouter'&&!cloudModels.length)void loadCloudModels();
 }
 function chooseConfiguration(next:RecognitionConfig) {
-  if(busy||(!platform.localRecognition&&next.provider==='local'))return;
+  if(busy||transcribing()||(!platform.localRecognition&&next.provider==='local'))return;
   configuration={...next};if(next.provider==='local')localChoice=next.model;else cloudChoice=next.model;
   if(active&&next.model.trim()){const id=active.id,snapshot={...next};active={...active,configuration:snapshot};history=history.map(entry=>entry.id===id?{...entry,configuration:snapshot}:entry);configurationSaveQueue=configurationSaveQueue.then(()=>call('update_record_configuration',{id,configuration:snapshot})).catch(error=>notice(errorText(error),true));}
   render();
@@ -813,7 +911,7 @@ async function loadCloudModels() {
     if(url!==settings.openrouterUrl)return;
     cloudModels=loaded;saveAudioCatalog(localStorage,url,loaded);
     const normalized=normalizeCatalogConfiguration(configuration);
-    if(normalized.mode!==configuration.mode){if(!busy)chooseConfiguration(normalized);else if(progress?.kind!=='transcribe')configuration=normalized;}
+    if(normalized.mode!==configuration.mode){if(!busy&&!transcribing())chooseConfiguration(normalized);else if(!transcribing())configuration=normalized;}
   }
   catch(error){if(url===settings.openrouterUrl)catalogError=errorText(error);}
   finally{cloudLoading=false;render();if(url!==settings.openrouterUrl)void loadCloudModels();else if(catalogOpen&&!platform.mobile&&window.innerWidth>760)document.querySelector<HTMLInputElement>('#catalog-search')?.focus();}
@@ -830,7 +928,7 @@ async function refreshRuntime() {
 }
 async function newRecord():Promise<boolean> {
   if(busy||!await mayLeaveSettings()||!await mayReplaceRecord())return false;
-  resetPlayback();settingsDraft=null;active=null;restoreConfiguration();text='';outputTab='transcript';resultSaved=false;previousResult=null;status='';view='work';render();return true;
+  resetPlayback();settingsDraft=null;active=null;restoreConfiguration();text='';segments=[];outputTab='transcript';resultSaved=false;previousResult=null;status='';view='work';render();return true;
 }
 async function quickRecord(){if(busy||nativeRecovery||recordingPhase!=='idle')return;if(active&&!await newRecord())return;await startRecording();}
 async function discardPendingRecording():Promise<boolean> {
@@ -921,7 +1019,7 @@ async function importSelection(selected:AudioSelection,kind:'recording'|'import'
     if(platform.os==='android')markOperationHandled(`recording:${entry.id}`);
     // Recording into an organization: the queued upload owns it from here.
     if(kind!=='recovered'&&await orgAfterImport(entry,kind)){imported=true;pendingRecording=null;void refreshHistory();return true;}
-    imported=true;pendingRecording=null;resetPlayback();active=entry;restoreConfiguration(entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;
+    imported=true;pendingRecording=null;resetPlayback();active=entry;restoreConfiguration(entry);text='';segments=[];outputTab='transcript';resultSaved=false;previousResult=null;
     const refreshed=await Promise.allSettled([call<Settings>('get_settings'),call<Entry[]>('list_history')]);
     if(refreshed[0].status==='fulfilled')settings=refreshed[0].value;
     if(refreshed[1].status==='fulfilled')history=sortHistory(refreshed[1].value);
@@ -939,12 +1037,18 @@ async function choose(path?:string) {
   catch(error){notice(`${tr('Не удалось добавить запись: ')}${errorText(error)}`,true);}
   finally{pickingAudio=false;}
 }
+// A record in the queue shows its run (live text so far), not the transcript saved before it.
+function adoptJob(){
+  const job=active?jobs.get(active.id):undefined;if(!job)return;
+  text=job.text;segments=[];resultSaved=false;receivedPartial=Boolean(job.text);stopReveal();
+  if(job.text)startReveal(job.text.length);
+}
 async function loadHistory(id:string) {
   if(active?.id===id){if(!await mayLeaveSettings())return;settingsDraft=null;view='work';render();return;}
   if(busy){void explainBusy();return;}
   if(!await mayLeaveSettings())return;
   if(!await mayReplaceRecord())return;
-  try {const detail=await call<{entry:Entry;text:string;warning?:string|null}>('get_history',{id});resetPlayback();active=detail.entry;restoreConfiguration(detail.entry);text=detail.text;outputTab='transcript';ensureRules();resultSaved=Boolean(detail.entry.outputPath&&detail.text);previousResult=null;settingsDraft=null;view='work';resume=null;void refreshResume(id);status=detail.warning?errorText(detail.warning):'';isError=Boolean(detail.warning);render();}
+  try {const detail=await call<HistoryDetail>('get_history',{id});resetPlayback();active=detail.entry;restoreConfiguration(detail.entry);text=detail.text;segments=detail.segments||[];outputTab='transcript';ensureRules();resultSaved=Boolean(detail.entry.outputPath&&detail.text);previousResult=null;adoptJob();settingsDraft=null;view='work';resume=null;void refreshResume(id);status=detail.warning?errorText(detail.warning):'';isError=Boolean(detail.warning);render();}
   catch(error) {notice(`${tr("Не удалось открыть запись: ")}${errorText(error)}`,true);}
 }
 async function renameEntry(id:string) {
@@ -988,15 +1092,17 @@ async function renameEntry(id:string) {
   input.setAttribute('autofocus','');dialog.showModal();input.focus();input.select();
 }
 async function deleteEntry(id:string) {
-  if(busy)return;const entry=history.find(item=>item.id===id);if(!entry)return;
+  if(busy)return;
+  if(processing(id)){notice(errorText('errors.recordProcessing'),true);return;}const entry=history.find(item=>item.id===id);if(!entry)return;
   if(active?.id===id&&text&&!resultSaved&&!await mayReplaceRecord(false))return;
   if(!await confirmAction(tr("Удалить запись?"),`«${displayName(entry)}${tr("» и её расшифровка будут удалены из архива. Исходный файл останется на месте.")}`,tr("Удалить запись")))return;
-  try{await call('delete_history',{id});history=history.filter(item=>item.id!==id);if(active?.id===id){resetPlayback();active=null;text='';outputTab='transcript';resultSaved=false;previousResult=null;if(platform.mobile)view='history';}render();}
+  try{await call('delete_history',{id});history=history.filter(item=>item.id!==id);if(active?.id===id){resetPlayback();active=null;text='';segments=[];outputTab='transcript';resultSaved=false;previousResult=null;if(platform.mobile)view='history';}render();}
   catch(error){notice(`${tr("Не удалось удалить запись: ")}${errorText(error)}`,true);}
 }
 async function clearHistory() {
+  if(archiveBusy(jobs)){notice(tr('Дождитесь окончания расшифровок: после этого можно очистить архив.'),true);return;}
   if(busy||!await confirmAction(tr("Очистить архив?"),`${tr("Будут удалены все записи из архива (")}${recordCount(history.length)}${tr(") и их расшифровки. Исходные файлы останутся на месте.")}`,tr("Очистить архив")))return;
-  try{await call('clear_history');resetPlayback();history=[];active=null;text='';outputTab='transcript';resultSaved=false;previousResult=null;render();}
+  try{await call('clear_history');resetPlayback();history=[];active=null;text='';segments=[];outputTab='transcript';resultSaved=false;previousResult=null;render();}
   catch(error){notice(`${tr("Не удалось очистить архив: ")}${errorText(error)}`,true);}
 }
 async function download(id:string) {
@@ -1012,27 +1118,83 @@ function incompleteNotice(entry:Entry|null):string {
   return entry?.incompleteRanges?.length?`${tr('Часть записи распознана не полностью:')} ${passagesLabel(entry)}. ${tr('Сверьте эти места с аудио.')}`:'';
 }
 async function run() {
-  if(!active||busy||readiness())return;
-  const id=active.id,beforeAttempt={text,saved:resultSaved};
-  if(text&&resultSaved)previousResult={text,saved:true};
-  receivedPartial=false;outputTab='transcript';
-  beginOperation('transcribe',tr("Подготавливаем запись"));startReveal(0);render();
-  const generation=operationGeneration;
+  if(!active||busy||transcribing()||readiness())return;
+  const id=active.id;
+  previousResult=text&&resultSaved?{text,saved:true,segments}:null;
+  segments=[];receivedPartial=false;outputTab='transcript';startReveal(0);
   try {
     await settingsSaveQueue;await configurationSaveQueue;
-    text=await call<string>('transcribe',{id,configuration:{...configuration}});finishReveal();
-    const detail=await call<{entry:Entry;text:string;warning?:string|null}>('get_history',{id});active=detail.entry;resultSaved=Boolean(detail.entry.outputPath&&detail.text);previousResult=null;
-    settings=await call<Settings>('get_settings');
-    history=sortHistory(await call<Entry[]>('list_history'));resume=null;unfinished.delete(id);
-    const warning=incompleteNotice(detail.entry);if(warning){status=warning;isError=true;noticeAction=null;}
+    // The queue answers at once: the run itself goes on natively, one record at a time.
+    const queue=await call<QueueItem[]>('enqueue_transcription',{id,configuration:{...configuration}});
+    if(!jobs.has(id)){
+      const known=queue.find(item=>item.recordId===id);
+      if(known)noteQueueEvent({recordId:id,state:known.state});
+    }
+    render();
   } catch(error) {
-    void refreshResume(id);
-    if(generation!==operationGeneration)return;
-    if(!receivedPartial){text=beforeAttempt.text;resultSaved=beforeAttempt.saved;if(resultSaved)previousResult=null;stopReveal();}else finishReveal();
-    if(String(error).includes('errors.operationCancelled')){status=errorText(error);isError=false;noticeAction=null;}
-    else if(String(error).includes('errors.operationBusy')){status='';noticeAction=null;void explainBusy();}
+    stopReveal();
+    if(active?.id===id&&!processing(id)){
+      try{const detail=await call<HistoryDetail>('get_history',{id});if(active?.id===id){active=detail.entry;text=detail.text;segments=detail.segments||[];resultSaved=Boolean(detail.entry.outputPath&&detail.text);if(resultSaved)previousResult=null;}}catch{/* The screen keeps what it shows. */}
+    }
+    if(String(error).includes('errors.operationBusy')){status='';noticeAction=null;void explainBusy();}
     else{status=`${tr("Не удалось завершить распознавание: ")}${errorText(error)}`;isError=true;noticeAction={message:status,label:tr('Повторить'),run:()=>{void run();}};}
-  } finally {if(generation===operationGeneration){ensureRules();try{settings=await call<Settings>('get_settings');}catch{/* Keep known defaults when settings cannot be refreshed. */}if(generation===operationGeneration)endOperation();render();}}
+    render();
+  }
+}
+// The queue's mirror: every state change is applied at once, the archive is read afterwards.
+function noteQueueEvent(event:QueueEvent):'started'|'ended'|'changed'|'ignored' {
+  const change=applyQueueEvent(jobs,event,Date.now());
+  ensureJobProgress();
+  if(change==='ended')jobCancelling.delete(event.recordId);
+  return change;
+}
+let queueSettled:Promise<unknown>=Promise.resolve();
+subscribe<QueueEvent>('transcription-queue',event=>{
+  const job=jobs.get(event.recordId),change=noteQueueEvent(event);
+  if(change==='ended')queueSettled=queueSettled.then(()=>jobEnded(event,job)).catch(()=>{});
+  else if(change!=='ignored')render();
+}).catch(error=>notice(errorText(error),true));
+async function refreshArchive(){
+  try{history=sortHistory(await call<Entry[]>('list_history'));historyError='';}catch(error){historyError=errorText(error);}
+  await refreshUnfinished();
+  try{settings=await call<Settings>('get_settings');}catch{/* Keep known defaults when settings cannot be refreshed. */}
+}
+async function reloadActiveFromArchive(id:string){
+  try{const detail=await call<HistoryDetail>('get_history',{id});if(active?.id!==id||processing(id))return;active=detail.entry;text=detail.text;segments=detail.segments||[];resultSaved=Boolean(detail.entry.outputPath&&detail.text);}catch{/* The screen keeps what it shows. */}
+}
+// A run ended. Whatever the user is looking at stays; only this record's own state is refreshed.
+async function jobEnded(event:QueueEvent,job?:Job){
+  const id=event.recordId,name=()=>{const entry=history.find(item=>item.id===id);return entry?displayName(entry):'';};
+  await refreshArchive();
+  const shown=active?.id===id;
+  if(event.state==='finished'){
+    if(shown){
+      await reloadActiveFromArchive(id);
+      if(active?.id===id){previousResult=null;resume=null;finishReveal();ensureRules();const warning=incompleteNotice(active);if(warning){status=warning;isError=true;noticeAction=null;}}
+    }else notice(`«${name()}» — ${tr('расшифровка готова')}`);
+    unfinished.delete(id);
+  }else{
+    void refreshResume(id);
+    const cancelled=event.state==='cancelled',message=errorText(event.error||'errors.operationInterrupted');
+    const retry=()=>{void (async()=>{if(active?.id!==id)await loadHistory(id);if(active?.id===id&&view==='work')await run();})();};
+    if(shown){
+      if(job?.text){text=job.text;segments=[];resultSaved=false;finishReveal();}
+      else{await reloadActiveFromArchive(id);stopReveal();previousResult=null;}
+      if(cancelled){status=message;isError=false;noticeAction=null;}
+      else if(String(event.error).includes('errors.operationBusy')){status='';noticeAction=null;void explainBusy();}
+      else{status=`${tr("Не удалось завершить распознавание: ")}${message}`;isError=true;noticeAction={message:status,label:tr('Повторить'),run:retry};}
+    }else if(!cancelled)notice(`«${name()}»: ${tr("не удалось завершить распознавание: ")}${message}`,true,{label:tr('Открыть'),run:retry.bind(null)});
+  }
+  render();
+}
+// Rebuilds the mirror from the native queue: the window may have been paused or recreated, and events are not replayed.
+async function syncQueue(){
+  try{
+    const gone=reconcileJobs(jobs,await call<QueueItem[]>('transcription_queue'),Date.now());
+    ensureJobProgress();
+    if(gone.length){await refreshArchive();for(const id of gone){jobCancelling.delete(id);if(active?.id===id){await reloadActiveFromArchive(id);finishReveal();}}}
+    render();
+  }catch{/* The next tick reads it again. */}
 }
 function confirmAction(heading:string,message:string,action:string,danger=true,dismiss=tr('Отмена')):Promise<boolean> {
   if(document.querySelector('dialog[open]'))return Promise.resolve(false);
@@ -1049,7 +1211,7 @@ function confirmAction(heading:string,message:string,action:string,danger=true,d
   });
 }
 
-setupPostprocess({entry:()=>active,transcript:()=>text,saved:()=>resultSaved,busy:()=>busy,render,notice,begin:()=>beginOperation('postprocess',tr('Обрабатываем текст…')),end:endOperation,confirm:confirmAction,updated:entry=>{active=entry;history=history.map(item=>item.id===entry.id?entry:item);},showResults:()=>{outputTab='results';},configure:()=>{void changeView('settings','recognition');},copy:copyText,hasToken:()=>settings.hasToken});
+setupPostprocess({entry:()=>active,transcript:()=>text,saved:()=>resultSaved,busy:()=>busy||archiveBusy(jobs),render,notice,begin:()=>beginOperation('postprocess',tr('Обрабатываем текст…')),end:endOperation,confirm:confirmAction,updated:entry=>{active=entry;history=history.map(item=>item.id===entry.id?entry:item);},showResults:()=>{outputTab='results';},configure:()=>{void changeView('settings','recognition');},copy:copyText,hasToken:()=>settings.hasToken});
 render();
 async function initialize() {
   const initial=await Promise.allSettled([loadRuntimePlatform(),call<Settings>('get_settings'),appVersion()]);
@@ -1061,7 +1223,7 @@ async function initialize() {
   cloudModels=readAudioCatalog(localStorage,settings.openrouterUrl);
   restoreConfiguration(active);render();
   if(configuration.provider==='openrouter'&&cloudModels.length)void loadCloudModels();
-  await Promise.allSettled([refreshHistory(),refreshRuntime()]);ensureRules();
+  await Promise.allSettled([refreshHistory(),refreshRuntime()]);ensureRules();await syncQueue();
   if(platform.os==='android'){
     // Reading the recorder state also archives a capture the last session left behind.
     const slow=setTimeout(()=>{restoring=true;render();},600);
@@ -1071,7 +1233,7 @@ async function initialize() {
   // A crash during a desktop recording leaves a repaired WAV in temp; archive it instead of losing it.
   if(!preview&&['macos','linux','windows'].includes(platform.os)){try{const recovered=await call<AudioSelection[]>('recover_audio_recordings');for(const selection of recovered)await importSelection(selection,'recovered');if(recovered.length)notice(`${tr('Восстановлено записей после сбоя:')} ${recovered.length}`);}catch(error){notice(errorText(error),true);}}
   // A transcription cut short by a crash or a forced quit: say so once and offer to continue.
-  if(!preview&&!platform.mobile){try{const snapshot=await call<OperationSnapshot>('operation_activity_snapshot');if(snapshot.state==='interrupted'&&snapshot.kind==='transcribe')await consumeNativeOperation(snapshot);}catch{/* Nothing to report. */}}
+  if(!preview){try{const snapshot=await call<OperationSnapshot>('operation_activity_snapshot');if(snapshot.state==='interrupted'&&snapshot.kind==='transcribe'&&!processing(snapshot.recordId))await consumeNativeOperation(snapshot,true);}catch{/* Nothing to report. */}}
   await refreshLoose();if(loose.length&&!status)notice(`${tr('Не обработано записей:')} ${loose.length}. ${tr('Они в «Архиве».')}`,true);
   if(!preview)void checkUpdates();
 }
@@ -1081,16 +1243,23 @@ void initOrg({render:()=>render(),notice,confirm:(heading,message,action,danger)
 subscribe<null>('hearfolio-request-restart',()=>{void restartAfterUpdate(false);}).catch(error=>notice(errorText(error),true));
 setInterval(()=>{if(!preview&&Date.now()-lastUpdateCheck>=4*60*60*1000)void checkUpdates();},4*60*60*1000);
 document.addEventListener('visibilitychange',()=>{if(!preview&&document.visibilityState==='visible'&&Date.now()-lastUpdateCheck>=4*60*60*1000)void checkUpdates();});
-subscribe<Progress>('task-progress',payload=>{if(!busy||!progress||payload.kind!==progress.kind)return;progress={...payload,stage:errorText(payload.stage),elapsed:Math.max(payload.elapsed,Math.floor((Date.now()-operationStarted)/1000))};feedProgress();updateProgress();}).catch(error=>notice(errorText(error),true));
+subscribe<Progress>('task-progress',payload=>{
+  if(payload.kind==='transcribe'){
+    // Each run reports for its own record; only the displayed one moves the progress card.
+    const job=payload.recordId?jobs.get(payload.recordId):undefined;if(!job)return;
+    applyJobProgress(jobs,{...payload,stage:errorText(payload.stage),elapsed:Math.max(payload.elapsed,Math.floor((Date.now()-job.started)/1000))});
+    if(active?.id===payload.recordId){syncShownProgress();updateProgress();}else refreshChips();
+    return;
+  }
+  if(!busy||!progress||payload.kind!==progress.kind)return;progress={...payload,stage:errorText(payload.stage),elapsed:Math.max(payload.elapsed,Math.floor((Date.now()-operationStarted)/1000))};feedProgress();updateProgress();}).catch(error=>notice(errorText(error),true));
 function paintPartial(){
   const result=document.querySelector('#result');if(result){const follow=result.scrollHeight-result.scrollTop-result.clientHeight<90;result.innerHTML=outputHtml();if(follow)result.scrollTop=result.scrollHeight;}
   const meta=document.querySelector('#text-meta');if(meta)meta.innerHTML=recordMetaHtml();
 }
 subscribe<PartialTextEvent>('partial-text',payload=>{
-  if(!busy||progress?.kind!=='transcribe'||!payload.text)return;
-  if(payload.recordId&&payload.recordId!==active?.id)return;
-  if(nativeOperation?.id&&payload.operationId&&payload.operationId!==nativeOperation.id)return;
-  if(!receivedPartial)void call<Settings>('get_settings').then(saved=>{settings=saved;}).catch(()=>{});receivedPartial=true;text=payload.text;resultSaved=false;
+  // Live text is kept per record, so it is complete when the user comes back to a running one.
+  if(!payload.text||!applyJobText(jobs,payload.recordId,payload.text)||payload.recordId!==active?.id)return;
+  if(!receivedPartial)void call<Settings>('get_settings').then(saved=>{settings=saved;}).catch(()=>{});receivedPartial=true;text=payload.text;segments=[];resultSaved=false;
   if(!revealing||revealRecord!==active?.id)startReveal(0);feedReveal();
   const meta=document.querySelector('#text-meta');if(meta)meta.innerHTML=recordMetaHtml();
 }).catch(error=>notice(errorText(error),true));
@@ -1116,7 +1285,7 @@ document.addEventListener('keydown',event=>{
   if(key==='b'){event.preventDefault();setSidebar(!sidebarCollapsed);}
 });
 window.addEventListener('unhandledrejection',event=>{const reason=event.reason instanceof Error?event.reason.message:String(event.reason??'');if(reason.startsWith('errors.')){event.preventDefault();notice(errorText(reason),true);}});
-window.addEventListener('beforeunload',event=>{if(settingsDraft||settingsSaving||hasRuleDraft()||pendingRecording||busy||(text&&!resultSaved))event.preventDefault();});
+window.addEventListener('beforeunload',event=>{if(settingsDraft||settingsSaving||hasRuleDraft()||pendingRecording||busy||archiveBusy(jobs)||(text&&!resultSaved))event.preventDefault();});
 
 function updateCatalogViewport(){const viewport=window.visualViewport;document.documentElement.style.setProperty('--catalog-height',`${viewport?.height||window.innerHeight}px`);document.documentElement.style.setProperty('--catalog-top',`${viewport?.offsetTop||0}px`);}
 updateCatalogViewport();window.visualViewport?.addEventListener('resize',updateCatalogViewport);window.visualViewport?.addEventListener('scroll',updateCatalogViewport);window.addEventListener('resize',updateCatalogViewport);
@@ -1128,10 +1297,10 @@ let lastNativeRecordingResult='';
 // starts; without a receipt a failed save would reopen its screen on every launch, even after the
 // audio was archived or deleted from Archive.
 function recordingReceipt(p:NativeRecordingResult){return p.entry?`recording:${p.entry.id}`:p.path?`recording-result:${p.path}:${p.stateRevision??''}:${p.error??''}`:'';}
-async function finishNativeRecording(p:NativeRecordingResult){const key=JSON.stringify(p),receipt=recordingReceipt(p);if(key===lastNativeRecordingResult||(receipt&&operationHandled(receipt))){if(recordingPhase!=='idle'){resetRecorderUi();render();}return;}lastNativeRecordingResult=key;if(receipt)markOperationHandled(receipt);resetRecorderUi();pendingRecording=p.selection||null;if(p.entry&&await orgAfterImport(p.entry,"recording")){await refreshHistory();render();notice(tr("Запись сохранена"));return;}if(p.entry){resetPlayback();active=p.entry;restoreConfiguration(p.entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;view='work';await refreshHistory();}render();if(p.error)notice(errorText(p.error),true);else notice(tr('Запись сохранена'));if(!p.entry)void refreshLoose();}
+async function finishNativeRecording(p:NativeRecordingResult){const key=JSON.stringify(p),receipt=recordingReceipt(p);if(key===lastNativeRecordingResult||(receipt&&operationHandled(receipt))){if(recordingPhase!=='idle'){resetRecorderUi();render();}return;}lastNativeRecordingResult=key;if(receipt)markOperationHandled(receipt);resetRecorderUi();pendingRecording=p.selection||null;if(p.entry&&await orgAfterImport(p.entry,"recording")){await refreshHistory();render();notice(tr("Запись сохранена"));return;}if(p.entry){resetPlayback();active=p.entry;restoreConfiguration(p.entry);text='';segments=[];outputTab='transcript';resultSaved=false;previousResult=null;view='work';await refreshHistory();}render();if(p.error)notice(errorText(p.error),true);else notice(tr('Запись сохранена'));if(!p.entry)void refreshLoose();}
 subscribe<NativeRecordingResult>('recording-native-finished',p=>{if(nativeRecordingOrder.acceptResult(p))void finishNativeRecording(p);}).catch(()=>{});
 let quickFinishing=false;
-async function finishQuickRecording(){if(quickFinishing)return;quickFinishing=true;try{const entries=await call<Entry[]>('import_quick_recordings');externalRecording=false;recordingPhase='idle';busy=false;if(entries.length){const entry=entries[entries.length-1];if(!active||resultSaved||!text){resetPlayback();active=entry;restoreConfiguration(entry);text='';outputTab='transcript';resultSaved=false;previousResult=null;}await refreshHistory();notice(tr('Запись сохранена'));}render();}catch(e){if(!String(e).includes('operationBusy')){externalRecording=false;recordingPhase='idle';busy=false;render();notice(errorText(e),true);}}finally{quickFinishing=false;}}
+async function finishQuickRecording(){if(quickFinishing)return;quickFinishing=true;try{const entries=await call<Entry[]>('import_quick_recordings');externalRecording=false;recordingPhase='idle';busy=false;if(entries.length){const entry=entries[entries.length-1];if(!active||resultSaved||!text){resetPlayback();active=entry;restoreConfiguration(entry);text='';segments=[];outputTab='transcript';resultSaved=false;previousResult=null;}await refreshHistory();notice(tr('Запись сохранена'));}render();}catch(e){if(!String(e).includes('operationBusy')){externalRecording=false;recordingPhase='idle';busy=false;render();notice(errorText(e),true);}}finally{quickFinishing=false;}}
 async function syncNativeRecording(afterControl=false){
   if((document.hidden&&!afterControl)||platform.os!=='android'||((recordingPhase==='cancelling'||recordingControlPending)&&!afterControl))return;
   return recordingSnapshotPoll.read(()=>readNativeRecordingSnapshot(),afterControl);
@@ -1175,8 +1344,11 @@ document.addEventListener('visibilitychange',()=>{if(!document.hidden)void impor
 
 setInterval(()=>{if(!document.hidden&&platform.os==='android')void importQuickRecordings();},5000);
 
-async function consumeNativeOperation(snapshot:OperationSnapshot){
+// `startup`: the one report of a transcription that a crash or a forced quit cut short. Every other
+// transcription is the native queue's business (see `transcription-queue`), not a foreground operation.
+async function consumeNativeOperation(snapshot:OperationSnapshot,startup=false){
   if(!snapshot.id||!snapshot.kind||snapshot.state==='idle')return;
+  if(snapshot.kind==='transcribe'&&!startup)return;
   if(snapshot.kind!=='transcribe'&&snapshot.kind!=='postprocess'&&snapshot.kind!=='import')return;
   const pending=observePendingOperation(snapshot);
   if(pending.terminal)return; // The original UI action now receives this result.
@@ -1188,8 +1360,8 @@ async function consumeNativeOperation(snapshot:OperationSnapshot){
     if(!pending.matched&&changed){
       recoveringOperation=true;
       try{
-        if(snapshot.recordId){const detail=await call<{entry:Entry;text:string}>('get_history',{id:snapshot.recordId});resetPlayback();active=detail.entry;restoreConfiguration(active);text=detail.text;resultSaved=Boolean(active.outputPath&&detail.text);}
-        if(snapshot.partial){text=snapshot.partial;resultSaved=false;receivedPartial=true;}
+        if(snapshot.recordId){const detail=await call<HistoryDetail>('get_history',{id:snapshot.recordId});resetPlayback();active=detail.entry;restoreConfiguration(active);text=detail.text;segments=detail.segments||[];resultSaved=Boolean(active.outputPath&&detail.text);}
+        if(snapshot.partial){text=snapshot.partial;segments=[];resultSaved=false;receivedPartial=true;}
         if(snapshot.kind==='transcribe')startReveal(text.length);
         beginOperation(snapshot.kind,errorText(snapshot.progress?.stage||`progress.${snapshot.kind}`));
         view='work';outputTab=snapshot.kind==='postprocess'?'results':'transcript';
@@ -1198,7 +1370,7 @@ async function consumeNativeOperation(snapshot:OperationSnapshot){
       }catch(error){nativeOperation=null;notice(errorText(error),true);}finally{recoveringOperation=false;}
     }
     if(snapshot.progress){progress={...snapshot.progress,kind:snapshot.kind,stage:errorText(snapshot.progress.stage)};operationStarted=Date.now()-progress.elapsed*1000;feedProgress();}
-    if(snapshot.kind==='transcribe'&&snapshot.partial&&active?.id===snapshot.recordId&&snapshot.partial!==text){text=snapshot.partial;resultSaved=false;receivedPartial=true;if(!revealing)startReveal(0);feedReveal();}
+    if(snapshot.kind==='transcribe'&&snapshot.partial&&active?.id===snapshot.recordId&&snapshot.partial!==text){text=snapshot.partial;segments=[];resultSaved=false;receivedPartial=true;if(!revealing)startReveal(0);feedReveal();}
     updateProgress();return;
   }
   // A newly opened WebView has no pending invoke. Read the already committed
@@ -1209,7 +1381,7 @@ async function consumeNativeOperation(snapshot:OperationSnapshot){
     const imported=snapshot.kind==='import'&&snapshot.state==='finished'?snapshot.result as Entry:null;
     const id=imported?.id||snapshot.recordId;
     stopReveal();
-    if(id){const detail=await call<{entry:Entry;text:string}>('get_history',{id});resetPlayback();active=detail.entry;restoreConfiguration(active);text=detail.text;resultSaved=Boolean(active.outputPath&&detail.text);previousResult=null;view='work';outputTab=snapshot.kind==='postprocess'?'results':'transcript';}
+    if(id){const detail=await call<HistoryDetail>('get_history',{id});resetPlayback();active=detail.entry;restoreConfiguration(active);text=detail.text;segments=detail.segments||[];resultSaved=Boolean(active.outputPath&&detail.text);previousResult=null;view='work';outputTab=snapshot.kind==='postprocess'?'results':'transcript';}
     if(imported)pendingRecording=null;
     restorePostprocessActivity(null,false);endOperation();
     await refreshHistory();markOperationHandled(snapshot.id);
@@ -1233,5 +1405,12 @@ subscribe<OperationSnapshot>('operation-native-finished',snapshot=>{
   const id=snapshot.id;
   setTimeout(()=>{if(busy&&nativeOperation?.id===id){abandonOperation();render();notice(errorText(snapshot.error||'errors.operationInterrupted'),snapshot.state!=='cancelled');}},2000);
 }).catch(()=>{});
-document.addEventListener('visibilitychange',()=>{if(!document.hidden)void syncNativeOperation();});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden){void syncNativeOperation();void syncQueue();}});
 setInterval(()=>{void syncNativeOperation();},1000);
+// The queue's events are not replayed to a window that was paused; while records wait, read it now and then.
+setInterval(()=>{if(jobs.size&&!document.hidden)void syncQueue();},3000);
+setInterval(()=>{
+  if(busy||!transcribing()||!progress)return;
+  const job=jobs.get(active!.id);if(!job)return;
+  progress.elapsed=Math.max(progress.elapsed,Math.floor((Date.now()-job.started)/1000));updateProgress();
+},1000);

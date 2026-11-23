@@ -3,10 +3,12 @@ mod background;
 mod cloud;
 mod cloud_job;
 mod compact;
+mod crashlog;
 mod org;
 mod phrases;
 mod platform;
 mod postprocess;
+mod queue;
 mod recording;
 mod records;
 mod restart;
@@ -41,20 +43,45 @@ static JOB_TEST_LOCK: Mutex<()> = Mutex::new(());
 fn history_lock() -> Result<MutexGuard<'static, ()>, String> {
     HISTORY_LOCK.lock().map_err(|_| "errors.historyLock".into())
 }
-/// Who holds the exclusive job lock. Each guard owns a token, so a lock that
-/// was released on its behalf (a wedged job reaped by the operation watchdog)
-/// is never cleared again by that job's late drop.
+/// Who holds a job lock. Each guard owns a token, so a lock that was released
+/// on its behalf (a wedged job reaped by the operation watchdog) is never
+/// cleared again by that job's late drop.
 struct JobOwner {
     token: u64,
     kind: &'static str,
     since: Instant,
 }
-static JOB_OWNER: Mutex<Option<JobOwner>> = Mutex::new(None);
+/// Two exclusive slots. `heavy` is the long job (transcription, model
+/// download, archive move, text processing, restart); `light` is a short
+/// archive step (import, rename, delete). A light step may run next to the
+/// transcription, so the interface is never locked by it; every other heavy
+/// job excludes both.
+#[derive(Default)]
+struct Jobs {
+    heavy: Option<JobOwner>,
+    light: Option<JobOwner>,
+}
+static JOB_OWNER: Mutex<Jobs> = Mutex::new(Jobs {
+    heavy: None,
+    light: None,
+});
 static NEXT_JOB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-fn job_owner() -> MutexGuard<'static, Option<JobOwner>> {
+/// A recording is in progress. It has its own flag instead of the job lock,
+/// so it never waits for a transcription and a transcription never ends it.
+static RECORDING_ACTIVE: AtomicBool = AtomicBool::new(false);
+fn job_owner() -> MutexGuard<'static, Jobs> {
     JOB_OWNER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+fn is_light(kind: &str) -> bool {
+    matches!(kind, "import" | "archive")
+}
+fn refresh_job_flag(jobs: &Jobs) {
+    JOB_ACTIVE.store(
+        jobs.heavy.is_some() || jobs.light.is_some(),
+        Ordering::Release,
+    );
 }
 struct JobGuard {
     token: u64,
@@ -64,17 +91,36 @@ impl JobGuard {
     fn acquire(kind: &'static str) -> Result<Self, String> {
         // A job that stopped responding must not keep everything else busy.
         background::reap_stale_operation();
-        let mut owner = job_owner();
-        if owner.is_some() {
-            return Err("errors.operationBusy".to_owned());
-        }
+        let mut jobs = job_owner();
         let token = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
-        *owner = Some(JobOwner {
+        let owner = JobOwner {
             token,
             kind,
             since: Instant::now(),
-        });
-        JOB_ACTIVE.store(true, Ordering::Release);
+        };
+        if is_light(kind) {
+            // Next to a transcription, never next to another heavy job.
+            let blocked = jobs.light.is_some()
+                || jobs
+                    .heavy
+                    .as_ref()
+                    .is_some_and(|heavy| heavy.kind != "transcribe");
+            if blocked {
+                return Err("errors.operationBusy".to_owned());
+            }
+            jobs.light = Some(owner);
+        } else {
+            let moves_archive = matches!(kind, "storage" | "restart");
+            let blocked = jobs.heavy.is_some()
+                || jobs.light.is_some()
+                || (kind != "transcribe" && RECORDING_ACTIVE.load(Ordering::Acquire))
+                || (moves_archive && queue::is_busy());
+            if blocked {
+                return Err("errors.operationBusy".to_owned());
+            }
+            jobs.heavy = Some(owner);
+        }
+        refresh_job_flag(&jobs);
         Ok(Self { token })
     }
     fn token(&self) -> u64 {
@@ -83,25 +129,70 @@ impl JobGuard {
 }
 /// Releases the job lock if `token` still owns it.
 fn release_job(token: u64) -> bool {
-    let mut owner = job_owner();
-    if owner.as_ref().is_some_and(|owner| owner.token == token) {
-        *owner = None;
-        JOB_ACTIVE.store(false, Ordering::Release);
-        true
-    } else {
-        false
-    }
-}
-/// `(kind, held for)` of the current job lock.
-fn job_holder() -> Option<(&'static str, Duration)> {
-    job_owner()
+    let mut jobs = job_owner();
+    let mut released = false;
+    if jobs
+        .heavy
         .as_ref()
+        .is_some_and(|owner| owner.token == token)
+    {
+        jobs.heavy = None;
+        released = true;
+    }
+    if jobs
+        .light
+        .as_ref()
+        .is_some_and(|owner| owner.token == token)
+    {
+        jobs.light = None;
+        released = true;
+    }
+    refresh_job_flag(&jobs);
+    released
+}
+/// `(kind, held for)` of what keeps the app busy: a job, else the queued
+/// transcriptions waiting for their turn.
+fn job_holder() -> Option<(&'static str, Duration)> {
+    let jobs = job_owner();
+    jobs.heavy
+        .as_ref()
+        .or(jobs.light.as_ref())
         .map(|owner| (owner.kind, owner.since.elapsed()))
+        .or_else(|| queue::is_busy().then_some(("transcribe", Duration::ZERO)))
 }
 impl Drop for JobGuard {
     fn drop(&mut self) {
         release_job(self.token);
     }
+}
+/// Held for the whole life of a recording session.
+struct RecordingGuard;
+impl RecordingGuard {
+    fn acquire() -> Result<Self, String> {
+        background::reap_stale_operation();
+        let jobs = job_owner();
+        // A transcription may run; the archive move, a download or a restart may not.
+        let blocked = jobs
+            .heavy
+            .as_ref()
+            .is_some_and(|heavy| heavy.kind != "transcribe")
+            || RECORDING_ACTIVE
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err();
+        if blocked {
+            return Err("errors.operationBusy".to_owned());
+        }
+        Ok(Self)
+    }
+}
+impl Drop for RecordingGuard {
+    fn drop(&mut self) {
+        RECORDING_ACTIVE.store(false, Ordering::Release);
+    }
+}
+/// A recording is being captured.
+pub(crate) fn recording_active() -> bool {
+    RECORDING_ACTIVE.load(Ordering::Acquire)
 }
 
 #[derive(Serialize)]
@@ -123,6 +214,8 @@ struct Progress {
     current: u64,
     total: u64,
     elapsed: u64,
+    /// The record a transcription works on; absent for other kinds of work.
+    record_id: Option<String>,
 }
 #[derive(Serialize)]
 struct HistoryDetail {
@@ -270,6 +363,7 @@ fn emit(
             current,
             total,
             elapsed,
+            record_id: background::current_record_id(),
         },
     );
 }
@@ -522,9 +616,19 @@ async fn import_audio(
     let job = JobGuard::acquire("import")?;
     tauri::async_runtime::spawn_blocking(move || {
         let _job = job;
-        let mut operation = background::OperationGuard::start(&app, &_job, "import", None, false)?;
+        // The operation slot is single. While a queued transcription owns it,
+        // the import runs without one: that transcription keeps the process
+        // (and, on Android, the foreground service) alive meanwhile.
+        let mut operation =
+            match background::OperationGuard::start(&app, &_job, "import", None, false) {
+                Ok(operation) => Some(operation),
+                Err(error) if error == "errors.operationBusy" && queue::is_busy() => None,
+                Err(error) => return Err(error),
+            };
         let result = import_audio_sync(&app, path, name, configuration);
-        operation.finish(&result);
+        if let Some(operation) = operation.as_mut() {
+            operation.finish(&result);
+        }
         result
     })
     .await
@@ -870,6 +974,10 @@ fn rename_history(id: String, name: String) -> Result<HistoryEntry, String> {
 #[tauri::command]
 fn delete_history(id: String) -> Result<(), String> {
     let _job = JobGuard::acquire("archive")?;
+    // Queued or running: the transcription would write into a deleted record.
+    if queue::contains(&id) {
+        return Err("errors.recordProcessing".into());
+    }
     let _lock = history_lock()?;
     let root = base()?;
     delete_entries_at(&root, Some(&id))?;
@@ -879,6 +987,9 @@ fn delete_history(id: String) -> Result<(), String> {
 #[tauri::command]
 fn clear_history() -> Result<(), String> {
     let _job = JobGuard::acquire("archive")?;
+    if queue::is_busy() {
+        return Err("errors.operationBusy".into());
+    }
     let _lock = history_lock()?;
     let root = base()?;
     delete_entries_at(&root, None)?;
@@ -1356,16 +1467,21 @@ impl cloud_job::Backend for CloudBackend<'_> {
         );
     }
 }
-#[tauri::command]
-async fn transcribe(
-    app: tauri::AppHandle,
-    id: String,
+/// Transcribes one record to completion on the calling (worker) thread. The
+/// caller holds the job lock for the whole run; `queue` runs one record at a
+/// time, so two local engines are never active together.
+pub(crate) fn run_transcription(
+    app: &tauri::AppHandle,
+    id: &str,
     configuration: Option<RecognitionConfig>,
+    job: JobGuard,
 ) -> Result<String, String> {
-    let job = JobGuard::acquire("transcribe")?;
-    tauri::async_runtime::spawn_blocking(move || {
+    let app = app.clone();
+    let id = id.to_owned();
+    {
         let _job = job;
-        let mut operation = background::OperationGuard::start(&app, &_job, "transcribe", Some(&id), true)?;
+        let mut operation =
+            background::OperationGuard::start(&app, &_job, "transcribe", Some(&id), true)?;
         let result = (|| {
             let settings = cloud::load()?;
             let entries = read_history()?;
@@ -1471,8 +1587,7 @@ async fn transcribe(
                             start.elapsed().as_secs(),
                         );
                         let prior = join_parts(&parts);
-                        let length_ms = piece_ms(chunk)
-                            .unwrap_or(u64::from(chunk_seconds) * 1000);
+                        let length_ms = piece_ms(chunk).unwrap_or(u64::from(chunk_seconds) * 1000);
                         let mut backend = CloudBackend {
                             app: &app,
                             settings: &settings,
@@ -1655,9 +1770,7 @@ async fn transcribe(
         })();
         operation.finish(&result);
         result
-    })
-    .await
-    .map_err(|e| format!("errors.operationFailed|{e}"))?
+    }
 }
 #[tauri::command]
 fn save_text(path: String, content: String) -> Result<(), String> {
@@ -1668,6 +1781,7 @@ fn save_text(path: String, content: String) -> Result<(), String> {
 }
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    crashlog::install();
     let builder = tauri::Builder::default();
     // Must be first: a second launch (Windows/Linux deep link) forwards its URL here.
     #[cfg(desktop)]
@@ -1700,6 +1814,7 @@ pub fn run() {
                     remove_interrupted_scratch(&root, SystemTime::now());
                 }
                 remove_retired_transfer_files(&root);
+                queue::start(app.handle());
                 app.asset_protocol_scope()
                     .allow_directory(root.join("input"), false)?;
             }
@@ -1764,7 +1879,9 @@ pub fn run() {
             delete_history,
             clear_history,
             download_model,
-            transcribe,
+            queue::enqueue_transcription,
+            queue::transcription_queue,
+            queue::cancel_transcription,
             save_text,
             org::commands::org_state,
             org::commands::org_connect_start,
@@ -1919,5 +2036,45 @@ mod supervised_process_tests {
         operation.finish::<()>(&Err("errors.operationCancelled".into()));
         drop(job);
         let _ = fs::remove_file(state);
+    }
+}
+
+#[cfg(test)]
+mod job_lock_tests {
+    use super::*;
+    #[test]
+    fn a_recording_and_a_transcription_never_wait_for_each_other() {
+        let _serial = JOB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transcription = JobGuard::acquire("transcribe").unwrap();
+        // A new recording starts, and its audio is archived, while a record is transcribed.
+        let recording = RecordingGuard::acquire().expect("recording beside a transcription");
+        assert!(recording_active());
+        assert!(RecordingGuard::acquire().is_err());
+        let import = JobGuard::acquire("import").expect("import beside a transcription");
+        // Long jobs still exclude everything they would break.
+        for kind in [
+            "download",
+            "storage",
+            "restart",
+            "postprocess",
+            "transcribe",
+        ] {
+            assert!(JobGuard::acquire(kind).is_err(), "{kind}");
+        }
+        drop(import);
+        drop(transcription);
+        // With only a recording running, the next transcription may start but a download may not.
+        assert!(JobGuard::acquire("download").is_err());
+        let next = JobGuard::acquire("transcribe").expect("transcription beside a recording");
+        drop(next);
+        drop(recording);
+        assert!(!recording_active());
+        let download = JobGuard::acquire("download").unwrap();
+        assert!(RecordingGuard::acquire().is_err());
+        assert!(JobGuard::acquire("import").is_err());
+        drop(download);
+        assert!(job_holder().is_none());
     }
 }

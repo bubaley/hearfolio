@@ -38,6 +38,19 @@ pub fn reset_client() {
     }
 }
 
+/// Focus fires constantly; pooled sockets already expire after 30 s idle, so
+/// a wake only resets the pool when the previous reset is old enough.
+pub fn reset_client_throttled() {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if last.is_some_and(|at| at.elapsed() < Duration::from_secs(20)) {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    drop(last);
+    reset_client();
+}
+
 /// Redirects may only stay on the same host and never downgrade HTTPS: the
 /// `Organization-Key` header and request bodies must not reach another server.
 fn redirect_policy(attempt: reqwest::redirect::Attempt) -> reqwest::redirect::Action {

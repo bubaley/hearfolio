@@ -23,6 +23,7 @@ Releases use SemVer derived from Conventional Commits, with a changelog and down
 - Transcribe locally with Whisper Tiny, Base, or Small, or Nemotron 3.5 Streaming.
 - Download models from the app with download size, percentage, and estimated time remaining.
 - Connect OpenRouter using a base URL and API token, then choose an audio model from the searchable catalog in the recording. The supported endpoint is selected automatically.
+- Keep working while recordings are transcribed: record, import files, and browse other recordings. Transcriptions run one after another in a saved queue (queued and running states show in the list); a queued record can be cancelled, but not deleted, and the archive cannot be moved nor the app restarted until the queue is empty. Waiting records resume after a restart; an interrupted cloud run is never repeated automatically.
 - See processing stages, elapsed time, and partial transcripts. Available progress details depend on the engine.
 - Browse and search recordings by name, play the original audio, and rename the title with its audio extension preserved.
 - Copy or export transcripts as `.txt` files. Renamed recordings use the new name when exporting text.

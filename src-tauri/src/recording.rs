@@ -1,4 +1,4 @@
-use crate::{platform::AudioSelection, JobGuard};
+use crate::{platform::AudioSelection, JobGuard, RecordingGuard};
 use std::{
     collections::HashSet,
     fs,
@@ -75,7 +75,7 @@ impl Capture {
 struct Session {
     path: PathBuf,
     writer: Option<Capture>,
-    _job: JobGuard,
+    _job: RecordingGuard,
 }
 impl Drop for Session {
     fn drop(&mut self) {
@@ -223,7 +223,7 @@ fn restore_session(active: &mut Option<Session>, path: &Path) -> Result<bool, St
     *active = Some(Session {
         path: path.to_owned(),
         writer: None,
-        _job: JobGuard::acquire("recording")?,
+        _job: RecordingGuard::acquire()?,
     });
     Ok(true)
 }
@@ -329,7 +329,7 @@ pub async fn start_audio_recording(
         let _lifecycle = NATIVE_LIFECYCLE
             .lock()
             .map_err(|_| "errors.recordingStart")?;
-        let job = JobGuard::acquire("recording")?;
+        let job = RecordingGuard::acquire()?;
         let extension = "wav";
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -487,32 +487,51 @@ pub async fn recover_audio_recordings() -> Result<Vec<AudioSelection>, String> {
             .map_err(|_| "errors.recordingUnavailable")?
             .as_ref()
             .map(|session| session.path.clone());
-        let mut found = Vec::new();
-        for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if Some(&path) == active.as_ref() || native_recording_id(&path).is_none() {
-                continue;
-            }
-            let registered = FINISHED
-                .lock()
-                .map_err(|_| "errors.recordingUnavailable")?
-                .contains(&path);
-            if !registered && repair_wav(&path).is_none() {
-                continue;
-            }
-            FINISHED
-                .lock()
-                .map_err(|_| "errors.recordingUnavailable")?
-                .insert(path.clone());
-            found.push(AudioSelection {
-                name: Some(recording_name(&path)),
-                path: path.to_string_lossy().into_owned(),
-            });
-        }
-        Ok(found)
+        recover_in(&directory, active.as_ref())
     })
     .await
     .map_err(|_| "errors.recordingUnavailable".to_owned())?
+}
+fn recover_in(directory: &Path, active: Option<&PathBuf>) -> Result<Vec<AudioSelection>, String> {
+    let mut found = Vec::new();
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+        Err(error) => {
+            crate::crashlog::note(&format!(
+                "recovery: cannot read {}: {error}",
+                directory.display()
+            ));
+            return Err("errors.recordingUnavailable".into());
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if Some(&path) == active || native_recording_id(&path).is_none() {
+            continue;
+        }
+        let registered = FINISHED
+            .lock()
+            .map_err(|_| "errors.recordingUnavailable")?
+            .contains(&path);
+        // A failed repair leaves the file untouched for a later attempt.
+        if !registered && repair_wav(&path).is_none() {
+            crate::crashlog::note(&format!(
+                "recovery: {} is not a repairable recording (kept untouched)",
+                path.display()
+            ));
+            continue;
+        }
+        FINISHED
+            .lock()
+            .map_err(|_| "errors.recordingUnavailable")?
+            .insert(path.clone());
+        found.push(AudioSelection {
+            name: Some(recording_name(&path)),
+            path: path.to_string_lossy().into_owned(),
+        });
+    }
+    Ok(found)
 }
 
 /// Captured audio the archive never took in. A failed or interrupted import
@@ -792,15 +811,15 @@ mod tests {
         let session = Session {
             path: path.clone(),
             writer: None,
-            _job: JobGuard::acquire("test").unwrap(),
+            _job: RecordingGuard::acquire().unwrap(),
         };
-        assert!(JobGuard::acquire("test").is_err());
+        assert!(RecordingGuard::acquire().is_err());
         FINISHED.lock().unwrap().insert(path.clone());
         drop(session);
         assert!(path.is_file());
         imported(&foreign);
         assert!(foreign.is_file());
-        let job = JobGuard::acquire("test").unwrap();
+        let job = RecordingGuard::acquire().unwrap();
         imported(&path);
         assert!(!path.exists());
         let cancelled = directory.join("cancelled.wav");
@@ -811,7 +830,7 @@ mod tests {
         };
         drop(session);
         assert!(!cancelled.exists());
-        drop(JobGuard::acquire("test").unwrap());
+        drop(RecordingGuard::acquire().unwrap());
         fs::remove_dir_all(directory).unwrap();
     }
     #[test]
@@ -857,6 +876,54 @@ mod tests {
         assert_eq!(repair_wav(&path), Some(16000 * 3 * 2));
         assert_eq!(hound::WavReader::open(&path).unwrap().duration(), 16000 * 3);
         fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn crashed_recording_is_repaired_listed_and_survives_failed_import() {
+        let directory =
+            std::env::temp_dir().join(format!("hearfolio-recover-{}", uuid::Uuid::new_v4()));
+        let temp = directory.join("temp");
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("hearfolio-recording-123456.wav");
+        let mut capture = Capture::open(&path, 16000).unwrap();
+        let mut sent = 0;
+        while sent < 16000 * 5 {
+            capture
+                .append((sent..sent + 4096).map(|i| ((i % 100) as i16) * 100))
+                .unwrap();
+            sent += 4096;
+        }
+        // Process killed: no finalize, no Drop, buffered tail lost.
+        std::mem::forget(capture);
+        // Worst case: the header sizes were never committed either.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(4)).unwrap();
+            file.write_all(&0u32.to_le_bytes()).unwrap();
+            file.seek(SeekFrom::Start(40)).unwrap();
+            file.write_all(&0u32.to_le_bytes()).unwrap();
+        }
+        // Foreign and unrepairable files are left alone.
+        let junk = temp.join("hearfolio-recording-999.wav");
+        fs::write(&junk, b"not a wav").unwrap();
+        let other = temp.join("other.wav");
+        fs::write(&other, b"x").unwrap();
+        let found = recover_in(&temp, None).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(Path::new(&found[0].path), path);
+        let reader = hound::WavReader::open(&path).unwrap();
+        assert!(reader.duration() >= 16000 * 2, "{}", reader.duration());
+        drop(reader);
+        // A failed import never calls imported(): the file is still there.
+        assert!(path.is_file() && junk.is_file() && other.is_file());
+        // Recovery is idempotent.
+        assert_eq!(recover_in(&temp, None).unwrap().len(), 1);
+        assert!(recover_in(&directory.join("missing"), None)
+            .unwrap()
+            .is_empty());
+        imported(&path);
+        assert!(!path.exists());
+        fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn native_permission_contract_never_treats_denied_or_unknown_as_granted() {
@@ -1465,19 +1532,19 @@ mod native_recovery_tests {
         let mut session = Some(Session {
             path: path.clone(),
             writer: None,
-            _job: JobGuard::acquire("test").unwrap(),
+            _job: RecordingGuard::acquire().unwrap(),
         });
         assert!(take_terminal_session(&mut session, "recording", &path).is_none());
         assert!(
             take_terminal_session(&mut session, "finished", Path::new("/foreign.wav")).is_none()
         );
-        assert!(JobGuard::acquire("test").is_err());
+        assert!(RecordingGuard::acquire().is_err());
         let terminal = take_terminal_session(&mut session, "finished", &path).unwrap();
         FINISHED.lock().unwrap().insert(path.clone());
         drop(terminal);
         assert!(session.is_none());
         assert!(path.exists());
-        drop(JobGuard::acquire("test").unwrap());
+        drop(RecordingGuard::acquire().unwrap());
         discard(&path).unwrap();
         assert!(!path.exists());
     }
@@ -1504,11 +1571,11 @@ mod native_recovery_tests {
             &serde_json::json!({"state":"starting","path":path})
         )
         .is_none());
-        assert!(JobGuard::acquire("test").is_err());
+        assert!(RecordingGuard::acquire().is_err());
         drop(retire_absent_session(&mut active, &serde_json::json!({"state":"idle"})).unwrap());
         assert!(restore_session(&mut active, &path).unwrap());
         drop(active);
-        drop(JobGuard::acquire("test").unwrap());
+        drop(RecordingGuard::acquire().unwrap());
     }
     #[test]
     fn start_the_service_never_took_releases_the_job_lock() {
@@ -1530,9 +1597,9 @@ mod native_recovery_tests {
         ] {
             let mut active = None;
             restore_session(&mut active, &path).unwrap();
-            assert!(JobGuard::acquire("test").is_err());
+            assert!(RecordingGuard::acquire().is_err());
             drop(retire_absent_session(&mut active, &status).expect("absent session"));
-            drop(JobGuard::acquire("test").expect("job lock released"));
+            drop(RecordingGuard::acquire().expect("job lock released"));
         }
         // The service's own file keeps the session, whatever its state.
         for state in ["starting", "recording", "paused", "stopping", "finished"] {
@@ -1548,7 +1615,7 @@ mod native_recovery_tests {
         restore_session(&mut active, &path).unwrap();
         assert!(retire_absent_session(&mut active, &serde_json::json!({})).is_none());
         drop(active);
-        drop(JobGuard::acquire("test").unwrap());
+        drop(RecordingGuard::acquire().unwrap());
     }
     #[test]
     fn timed_out_old_response_and_terminal_journal_cannot_claim_a_new_recording() {
@@ -1569,9 +1636,9 @@ mod native_recovery_tests {
         assert!(take_terminal_session(&mut active, "finished", &old_path).is_none());
         assert!(take_terminal_session(&mut active, "cancelled", &old_path).is_none());
         assert_eq!(active.as_ref().unwrap().path, new_path);
-        assert!(JobGuard::acquire("test").is_err());
+        assert!(RecordingGuard::acquire().is_err());
         drop(active);
-        drop(JobGuard::acquire("test").unwrap());
+        drop(RecordingGuard::acquire().unwrap());
     }
     #[test]
     fn recreated_session_reacquires_job_and_preserves_an_existing_owner() {
@@ -1582,12 +1649,12 @@ mod native_recovery_tests {
             std::env::temp_dir().join(format!("hearfolio-restored-{}.wav", uuid::Uuid::new_v4()));
         let mut active = None;
         assert!(restore_session(&mut active, &path).unwrap());
-        assert!(JobGuard::acquire("test").is_err());
+        assert!(RecordingGuard::acquire().is_err());
         assert!(!restore_session(&mut active, Path::new("/foreign.wav")).unwrap());
         assert_eq!(active.as_ref().unwrap().path, path);
         let terminal = take_terminal_session(&mut active, "finished", &path).unwrap();
         drop(terminal);
-        drop(JobGuard::acquire("test").unwrap());
+        drop(RecordingGuard::acquire().unwrap());
     }
     #[cfg(unix)]
     #[test]
@@ -1615,7 +1682,7 @@ mod native_recovery_tests {
         assert_eq!(active.as_ref().unwrap().path, native);
         let stopped = take_terminal_session(&mut active, "finished", &native).unwrap();
         drop(stopped);
-        drop(JobGuard::acquire("test").unwrap());
+        drop(RecordingGuard::acquire().unwrap());
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -1663,7 +1730,7 @@ mod native_recovery_tests {
         let _monitor = NATIVE_LIFECYCLE.lock().unwrap();
         assert!(take_terminal_session(&mut active, "finished", &path).is_none());
         drop(stopped);
-        drop(JobGuard::acquire("test").unwrap());
+        drop(RecordingGuard::acquire().unwrap());
     }
     #[test]
     fn only_allocated_native_wav_names_get_a_stable_archive_id() {

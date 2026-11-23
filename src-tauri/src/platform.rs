@@ -53,7 +53,9 @@ pub struct AudioSelection {
 }
 
 pub fn open_audio(app: &AppHandle, path: &str) -> Result<fs::File, String> {
-    let file_path: tauri_plugin_fs::FilePath = path.parse().unwrap();
+    let file_path: tauri_plugin_fs::FilePath = path
+        .parse()
+        .map_err(|_| "errors.audioPathInvalid".to_owned())?;
     #[cfg(not(target_os = "android"))]
     if matches!(&file_path, tauri_plugin_fs::FilePath::Url(url) if url.scheme() != "file") {
         return Err("errors.audioPathInvalid".into());
