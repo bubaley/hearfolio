@@ -51,8 +51,21 @@ runs:
           fi
         done
         apt_options=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Dir::Cache::Archives="$archives")
-        sudo apt-get "${apt_options[@]}" update
-        sudo apt-get "${apt_options[@]}" install -y --no-install-recommends libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
+        # A mirror that answers but crawls would otherwise hold the whole job
+        # until its limit. Bound each attempt and retry; apt resumes from the
+        # packages already downloaded into the cache directory.
+        apt_run() {
+          for attempt in 1 2 3; do
+            if sudo timeout --kill-after=15 420 apt-get "${apt_options[@]}" "$@"; then
+              return 0
+            fi
+            echo "apt-get $1 failed or timed out (attempt $attempt/3)" >&2
+            sleep 10
+          done
+          return 1
+        }
+        apt_run update
+        apt_run install -y --no-install-recommends libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
         # Tauri's GStreamer plugin copies every file in its source directory.
         # Use an explicit directory containing only the selected plugin packages,
         # even if the hosted runner has other GStreamer plugins preinstalled.
