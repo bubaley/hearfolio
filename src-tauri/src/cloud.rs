@@ -662,6 +662,29 @@ fn read_limited_response(
     Ok(body)
 }
 
+/// Output limit used when the catalog does not state one.
+const POSTPROCESS_DEFAULT_OUTPUT_TOKENS: u64 = 16_384;
+/// Below this a result is more likely to be cut off than useful.
+const POSTPROCESS_MIN_OUTPUT_TOKENS: u64 = 1_024;
+
+/// Output budget for a post-processing request: the model's own limit (reasoning
+/// models spend it on thinking too, so a small cap cut results short) bounded by
+/// the room the context window leaves after the input. `None` when too little
+/// is left for a useful answer.
+fn postprocess_output_budget(
+    model_limit: Option<u64>,
+    context_length: u64,
+    input_bound: u64,
+) -> Option<u64> {
+    let free = context_length.saturating_sub(input_bound);
+    let budget = model_limit
+        .unwrap_or(POSTPROCESS_DEFAULT_OUTPUT_TOKENS)
+        .min(free);
+    // A model that states a limit below the floor is still honoured.
+    let floor = POSTPROCESS_MIN_OUTPUT_TOKENS.min(model_limit.unwrap_or(u64::MAX));
+    (budget > 0 && budget >= floor).then_some(budget)
+}
+
 pub fn postprocess_text(
     settings: &Settings,
     model: &str,
@@ -679,17 +702,15 @@ pub fn postprocess_text(
         .into_iter()
         .find(|item| item.id == model)
         .ok_or("errors.postprocessModelUnsupported")?;
-    let max_tokens = selected
-        .max_completion_tokens
-        .unwrap_or(4096)
-        .min(4096)
-        .min(selected.context_length / 4);
     // Bytes are a deliberately conservative token bound, including UTF-8 input.
     // Reject oversize input rather than silently shortening a saved transcript.
     let input_bound = transcript.len() as u64 + instruction.len() as u64 + 512;
-    if max_tokens == 0 || input_bound.saturating_add(max_tokens) > selected.context_length {
-        return Err("errors.postprocessContextTooLong".into());
-    }
+    let max_tokens = postprocess_output_budget(
+        selected.max_completion_tokens,
+        selected.context_length,
+        input_bound,
+    )
+    .ok_or("errors.postprocessContextTooLong")?;
     crate::background::check_current()?;
     let request = client_with_timeout(300)?
         .post(format!("{}/chat/completions", settings.openrouter_url))
@@ -1248,6 +1269,37 @@ pub fn transcribe(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn postprocess_output_budget_follows_the_model_limit_not_a_fixed_cap() {
+        // A long summary used to be cut at 4096 tokens.
+        assert_eq!(
+            postprocess_output_budget(Some(32_000), 200_000, 20_000),
+            Some(32_000)
+        );
+        // Unknown limit: a roomy default, still bounded by free context.
+        assert_eq!(
+            postprocess_output_budget(None, 200_000, 1_000),
+            Some(16_384)
+        );
+        assert_eq!(
+            postprocess_output_budget(None, 20_000, 10_000),
+            Some(10_000)
+        );
+        // The context window stays the hard bound.
+        assert_eq!(
+            postprocess_output_budget(Some(32_000), 40_000, 30_000),
+            Some(10_000)
+        );
+        // Too little room left, or no room: refuse instead of truncating.
+        assert_eq!(postprocess_output_budget(None, 10_000, 9_500), None);
+        assert_eq!(
+            postprocess_output_budget(Some(32_000), 10_000, 10_000),
+            None
+        );
+        // A model that states a small limit is honoured.
+        assert_eq!(postprocess_output_budget(Some(512), 8_192, 100), Some(512));
+    }
+
     use super::*;
     #[test]
     fn settings_written_by_a_version_with_device_transfer_still_load() {
