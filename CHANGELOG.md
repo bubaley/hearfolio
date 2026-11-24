@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.14.3 (2026-11-24)
+
+### Fixes and performance
+
+- **org:** show cloud recordings with timings, speakers and Markdown ([6137eed](https://github.com/bubaley/hearfolio/commit/6137eede7f4ed0f57bb075d149e9e9f71ddc6af2))
+
 ## 0.14.2 (2026-11-24)
 
 ### Fixes and performance
