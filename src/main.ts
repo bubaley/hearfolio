@@ -14,7 +14,8 @@ import {recordingInputLevel, call, pickAudio, startAudioRecording, stopAudioReco
 import {icon, escapeHtml as esc} from './icons';
 import {installSelects} from './select';
 import {initOrg, bindOrg, sourceTabsHtml, isCloudSource, cloudListHtml, cloudDetailHtml, closeDetail as closeOrgDetail, detailTitle as orgDetailTitle, detailToolsHtml as orgDetailToolsHtml, destinationChipHtml, destinationDockHtml, afterImport as orgAfterImport, copyToOrganization, hasOrganizations, orgSettingsHtml} from './org';
-import {transcriptParagraphs, speakerNames, speakerHeading, transcriptPlainText, formatClock, activeSegmentIndex, type Segment as Phrase} from './transcript';
+import {transcriptParagraphs, speakerNames,  transcriptPlainText,  activeSegmentIndex, type Segment as Phrase} from './transcript';
+import {timedListHtml} from './timed-transcript';
 import {tr, locale, countLabel, errorText, setLanguage, currentLanguage, type LanguagePreference} from './i18n';
 
 import {setupPostprocess, rulesHtml, postprocessHtml, resultsHtml, textPickerHtml, textPickerOpen, bindPostprocess, ensureRules, hasRuleDraft, mayLeaveRules, restorePostprocessActivity} from './postprocess';
@@ -181,14 +182,12 @@ function stopReveal(){revealing=false;}
 // Timed transcript: paragraphs with a time button; the playing one is marked by a class (no re-render per tick).
 let paragraphSource:Phrase[]|null=null,paragraphCache:Phrase[]=[],activeRow=-2,followPlayback=true;
 function paragraphs():Phrase[] {if(paragraphSource!==segments){paragraphSource=segments;paragraphCache=transcriptParagraphs(segments);}return paragraphCache;}
-function transcriptText():string {return transcriptPlainText(paragraphs(),text);}
+const speakerLabel=(n:number)=>currentLanguage()==='ru'?`Спикер ${n}`:`Speaker ${n}`;
+function transcriptText():string {return transcriptPlainText(paragraphs(),text,null,speakerLabel);}
 function timedTranscriptShown():boolean {return !(revealing&&revealRecord===active?.id)&&paragraphs().length>0;}
 function timedTranscriptHtml():string {
-  const list=paragraphs(),names=speakerNames(list),order=[...names.keys()];
-  return `<ol class="timed-transcript" id="transcript-list" lang="${esc(currentLanguage())}" aria-label="${esc(tr('Расшифровка'))}">${list.map((segment,index)=>{
-    const heading=speakerHeading(list,names,index),tone=segment.speaker?order.indexOf(segment.speaker):-1;
-    return `<li class="timed-row" data-row="${index}"><button type="button" class="timed-time" data-seek-ms="${segment.start_ms}" aria-label="${esc(tr('Воспроизвести с ')+formatClock(segment.start_ms))}">${formatClock(segment.start_ms)}</button><div class="timed-body">${heading?`<strong class="timed-speaker tone-${tone<0?'none':tone%6}">${esc(heading)}</strong>`:''}<p>${esc(segment.text)}</p></div></li>`;
-  }).join('')}</ol>`;
+  const list=paragraphs();
+  return timedListHtml(list,speakerNames(list,null,speakerLabel),{id:'transcript-list',lang:currentLanguage(),label:tr('Расшифровка'),seekLabel:tr('Воспроизвести с ')});
 }
 function playbackMs():number {
   if(platform.mobile)return playerState.playing||playerState.currentTime>0?playerState.currentTime*1000:-1;
@@ -196,7 +195,7 @@ function playbackMs():number {
   return audio&&(!audio.paused||audio.currentTime>0)?audio.currentTime*1000:-1;
 }
 function syncActiveRow(force=false) {
-  const rows=document.querySelectorAll<HTMLElement>('.timed-row');if(!rows.length){activeRow=-2;return;}
+  const rows=document.querySelectorAll<HTMLElement>('#transcript-list .timed-row');if(!rows.length){activeRow=-2;return;}
   const ms=playbackMs(),index=ms<0?-1:activeSegmentIndex(paragraphs(),ms);
   if(index===activeRow&&!force)return;activeRow=index;
   rows.forEach((row,position)=>{const on=position===index;row.classList.toggle('is-active',on);if(on)row.setAttribute('aria-current','true');else row.removeAttribute('aria-current');});
@@ -220,7 +219,7 @@ async function seekToMs(ms:number) {
 function bindTimedTranscript() {
   const scroller=document.querySelector<HTMLElement>('#result');
   for(const name of ['wheel','touchmove'])scroller?.addEventListener(name,()=>{followPlayback=false;},{passive:true});
-  document.querySelectorAll<HTMLElement>('.timed-row').forEach(row=>row.onclick=event=>{
+  document.querySelectorAll<HTMLElement>('#transcript-list .timed-row').forEach(row=>row.onclick=event=>{
     if(window.getSelection()?.toString())return;
     const ms=paragraphs()[Number(row.dataset.row)]?.start_ms;if(ms===undefined)return;
     event.preventDefault();void seekToMs(ms);

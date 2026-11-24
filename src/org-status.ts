@@ -3,7 +3,8 @@
 
 export type UploadPhase='queued'|'uploading'|'completing'|'done'|'failed';
 export type UploadView={clientId:string;connectionId:string;organizationId:string;remoteId:string|null;displayName:string;recordedAt:number;durationMs:number|null;size:number;uploaded:number;phase:UploadPhase;error:string|null;waitingNetwork:boolean;nextAttemptAt:number;projectId:string|null;visibility:string;localRecordId:string|null;hasTranscript:boolean;createdAt:number};
-export type CloudRecording={id:string;client_id?:string;title?:string;recorded_at?:string;duration_ms?:number;status?:string;upload_state?:string;progress?:number;segments_done?:number;segments_total?:number;error_message?:string|null;project?:{id:string;name:string;emoji?:string|null}|null;tags?:{id:string;name:string;color:string}[];visibility?:string;transcript_words?:number;results_count?:number;transcript_text?:string;language?:string|null;created_by?:{first_name?:string;last_name?:string;email?:string}|null};
+import type {Segment, SpeakerNames} from './transcript';
+export type CloudRecording={id:string;client_id?:string;title?:string;recorded_at?:string;duration_ms?:number;status?:string;upload_state?:string;progress?:number;segments_done?:number;segments_total?:number;error_message?:string|null;project?:{id:string;name:string;emoji?:string|null}|null;tags?:{id:string;name:string;color:string}[];visibility?:string;transcript_words?:number;results_count?:number;transcript_text?:string;transcript_segments?:Segment[]|null;speaker_names?:SpeakerNames;language?:string|null;created_by?:{first_name?:string;last_name?:string;email?:string}|null};
 export type Tone='queued'|'progress'|'error'|'done'|'muted';
 export type Status={label:string;tone:Tone;percent:number|null;action:'retry-upload'|'retry-transcription'|null};
 type Say=(ru:string,en:string)=>string;

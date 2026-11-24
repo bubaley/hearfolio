@@ -7,6 +7,9 @@ import {convertFileSrc} from '@tauri-apps/api/core';
 import {call as nativeCall, preview, subscribe, shareText, exportText, type Entry} from './api';
 import {errorText, locale, currentLanguage} from './i18n';
 import {icon, escapeHtml as esc} from './icons';
+import {renderMarkdown, stripLeadingTitle} from './markdown';
+import {activeSegmentIndex, speakerNames, transcriptParagraphs, transcriptPlainText, type Segment} from './transcript';
+import {timedListHtml} from './timed-transcript';
 import {mergeRows, uploadStatus, recordingStatus, RETENTION_CHOICES, type UploadView, type CloudRecording, type Row, type Status} from './org-status';
 
 type Organization={id:string;name:string;key:string;role:string};
@@ -89,7 +92,7 @@ function previewFixture():OrgState {
   const connection:Connection={id:'conn-demo',server:'https://cloud.example.com',serverName:'Hearfolio',serverVersion:'1.0.0',user:{id:'u1',email:'anna@example.com',name:'Анна'},organizations:[{id:'org-1',name:'Acme',key:'acme',role:'admin'},{id:'org-2',name:'Studio',key:'studio',role:'member'}],createdAt:now,secure:true,needsReauth:false};
   const items:CloudRecording[]=[
     {id:'r1',title:'Планёрка по релизу',recorded_at:iso(now-3600_000),duration_ms:1840_000,status:'transcribing',segments_done:3,segments_total:8,project:{id:'p1',name:'Релиз 2.0',emoji:'🚀'},tags:[{id:'t1',name:'встреча',color:'blue'}],visibility:'organization',transcript_words:0},
-    {id:'r2',title:'Интервью с клиентом',recorded_at:iso(now-86400_000),duration_ms:2710_000,status:'transcribed',project:null,tags:[{id:'t2',name:'клиенты',color:'green'},{id:'t3',name:'исследование',color:'purple'}],visibility:'personal',transcript_words:4120,results_count:1,transcript_text:'Добрый день. Расскажите, как вы сейчас ведёте заметки после встреч?\n\nСейчас мы записываем на телефон, а потом кто-то вручную расшифровывает — это занимает полдня.'},
+    {id:'r2',title:'Интервью с клиентом',recorded_at:iso(now-86400_000),duration_ms:2710_000,status:'transcribed',project:null,tags:[{id:'t2',name:'клиенты',color:'green'},{id:'t3',name:'исследование',color:'purple'}],visibility:'personal',transcript_words:4120,results_count:1,transcript_text:'Добрый день. Расскажите, как вы сейчас ведёте заметки после встреч?\n\nСейчас мы записываем на телефон, а потом кто-то вручную расшифровывает — это занимает полдня.',speaker_names:{'0:a':'Анна'},transcript_segments:Array.from({length:24},(_,n)=>({start_ms:n*5000,end_ms:n*5000+4800,speaker:n%4<2?'0:a':'0:b',text:n%4<2?'Расскажите, как вы сейчас ведёте заметки после встреч?':'Сейчас мы записываем на телефон, а потом кто-то вручную расшифровывает — это занимает полдня.'}))},
     {id:'r3',title:'Созвон с подрядчиком',recorded_at:iso(now-3*86400_000),duration_ms:600_000,status:'failed',error_message:'Модель не ответила. Повторите.',visibility:'organization',transcript_words:0},
   ];
   previewItems=items;
@@ -104,6 +107,15 @@ function previewFixture():OrgState {
   ];
   return {connections:[connection],settings:{destination:{connectionId:'conn-demo',organizationId:'org-1',projectId:'p1',visibility:'organization'},retentionDays:30},uploads,cache:{files:4,bytes:57_000_000}};
 }
+let previewAudioUrl='';
+// Two minutes of silence, so the preview player has something to seek in.
+function previewAudio():string {
+  if(previewAudioUrl)return previewAudioUrl;
+  const rate=8000,size=rate*120,view=new DataView(new ArrayBuffer(44+size)),tag=(at:number,value:string)=>[...value].forEach((char,n)=>view.setUint8(at+n,char.charCodeAt(0)));
+  tag(0,'RIFF');view.setUint32(4,36+size,true);tag(8,'WAVEfmt ');view.setUint32(16,16,true);view.setUint16(20,1,true);view.setUint16(22,1,true);view.setUint32(24,rate,true);view.setUint32(28,rate,true);view.setUint16(32,1,true);view.setUint16(34,8,true);tag(36,'data');view.setUint32(40,size,true);
+  new Uint8Array(view.buffer,44).fill(128);
+  return previewAudioUrl=URL.createObjectURL(new Blob([view.buffer],{type:'audio/wav'}));
+}
 async function call<T>(command:string,args:Record<string,unknown>={}):Promise<T> {
   if(!preview)return nativeCall<T>(command,args);
   if(!previewState)previewState=previewOrg?previewFixture():{connections:[],settings:{destination:null,retentionDays:30},uploads:[],cache:{files:0,bytes:0}};
@@ -115,7 +127,7 @@ async function call<T>(command:string,args:Record<string,unknown>={}):Promise<T>
     case 'org_clear_cache':s.cache={files:0,bytes:0};return structuredClone(s) as T;
     case 'org_projects':await wait(200);return (projects.get(libraryKey(String(args.connectionId),String(args.organizationId)))||[]) as T;
     case 'org_library':case 'org_sync':{await wait(command==='org_sync'?400:0);return {items:String(args.organizationId)==='org-1'?previewItems.map(item=>({...item,transcript_text:undefined})):[],syncedAt:Date.now()} as T;}
-    case 'org_recording':{await wait(150);const item=previewItems.find(row=>row.id===args.recordingId);return (item?{recording:{...item},results:item.id==='r2'?[{id:'res1',title:say('Краткое содержание','Summary'),status:'done',content:say('Клиент тратит полдня на ручную расшифровку встреч. Главная боль — потеря договорённостей.','The client spends half a day transcribing meetings by hand. The main pain is lost agreements.'),model:'google/gemini-2.5-flash'}]:[],audioCached:false,offline:null}:null) as T;}
+    case 'org_recording':{await wait(150);const item=previewItems.find(row=>row.id===args.recordingId);return (item?{recording:{...item},results:item.id==='r2'?[{id:'res1',title:say('Краткое содержание','Summary'),status:'done',content:'## Суть\nКлиент тратит **полдня** на ручную расшифровку.\n\n## Главное\n\n**Решения**\n- Попробовать Hearfolio на одной команде\n- Вернуться с итогами\n\n| Задача | Кто |\n| --- | --- |\n| Доступы | Анна |',model:'google/gemini-2.5-flash'}]:[],audioCached:false,offline:null}:null) as T;}
     case 'org_connect_start':{await wait(500);const server=String(args.server).trim();if(!server||server.includes(' '))throw new Error('errors.orgUrlInvalid');if(server.startsWith('http://')&&!/localhost|127\.0\.0\.1/.test(server))throw new Error('errors.orgUrlInsecure');
       setTimeout(()=>{previewState=previewFixture();previewEmit('org-connection',{state:'connected',flow:'preview',connection:previewState.connections[0]});},1500);return {state:'preview',redirect:'deepLink'} as T;}
     case 'org_connect_cancel':return undefined as T;
@@ -124,7 +136,7 @@ async function call<T>(command:string,args:Record<string,unknown>={}):Promise<T>
     case 'org_retry_upload':{const upload=s.uploads.find(item=>item.clientId===args.clientId);if(upload){upload.phase='uploading';upload.error=null;}return upload as T;}
     case 'org_cancel_upload':s.uploads=s.uploads.filter(item=>item.clientId!==args.clientId);return undefined as T;
     case 'org_enqueue_record':{const destination=args.destination as Destination,view:UploadView={clientId:crypto.randomUUID(),connectionId:destination.connectionId,organizationId:destination.organizationId,remoteId:null,displayName:say('Новая запись','New recording'),recordedAt:Date.now(),durationMs:3000,size:3_000_000,uploaded:0,phase:'queued',error:null,waitingNetwork:false,nextAttemptAt:0,projectId:destination.projectId,visibility:destination.visibility,localRecordId:null,hasTranscript:false,createdAt:Date.now()};s.uploads.push(view);simulateUpload(view.clientId);return structuredClone(view) as T;}
-    case 'org_audio':throw new Error('errors.orgOffline');
+    case 'org_audio':{await wait(300);return {path:null,url:previewAudio()} as T;}
     case 'org_retry_recording':{const item=previewItems.find(row=>row.id===args.recordingId);if(item){item.status='queued';item.error_message=null;}return item as T;}
     case 'org_wake':return undefined as T;
     default:throw new Error(`Preview command unavailable: ${command}`);
@@ -247,7 +259,7 @@ export function cloudListHtml():string {
 function openUpload(){return open?.clientId?state.uploads.find(upload=>upload.clientId===open!.clientId)||null:null;}
 async function openRecording(connectionId:string,organizationId:string,recordingId:string|null,clientId:string|null){
   if(!recordingId&&clientId)recordingId=state.uploads.find(upload=>upload.clientId===clientId)?.remoteId||null;
-  open={connectionId,organizationId,recordingId,clientId};detailError='';detailTab='transcript';audio=null;
+  open={connectionId,organizationId,recordingId,clientId};detailError='';detailTab='transcript';audio=null;resetReading();
   // The list row is shown at once; the transcript and summaries follow.
   const row=recordingId?libraries.get(libraryKey(connectionId,organizationId))?.items.find(item=>item.id===recordingId):null;
   detail=row?{recording:row,results:null,audioCached:false,offline:null}:null;
@@ -266,7 +278,7 @@ async function loadDetail(refresh:boolean){
   }catch(error){if(open===target)detailError=orgErrorText(error);}
   finally{detailFetching=false;if(open===target){detailLoading=false;rerender();}}
 }
-export function closeDetail(){open=null;detail=null;audio=null;void releaseNative();}
+export function closeDetail(){open=null;detail=null;audio=null;resetReading();void releaseNative();}
 export function detailTitle():string {return detail?.recording.title||openUpload()?.displayName||say('Запись','Recording');}
 function resultsHtml(results:Result[]|null):string {
   if(!results&&detailFetching)return `<div class="list-empty"><span class="spinner"></span>${say('Загружаем выжимки…','Loading summaries…')}</div>`;
@@ -274,7 +286,7 @@ function resultsHtml(results:Result[]|null):string {
   if(!results.length)return `<div class="org-empty">${say('Выжимок пока нет. Их создают в веб-версии или автоматически по правилам организации.','No summaries yet. They are created on the web or automatically by organization rules.')}</div>`;
   return results.map(result=>{
     const running=result.status==='queued'||result.status==='running',failed=result.status==='failed';
-    return `<article class="org-result"><header><strong>${esc(result.title||say('Выжимка','Summary'))}</strong>${running?`<span class="record-state org-state tone-progress"><i aria-hidden="true"></i>${say('Готовится','Generating')}</span>`:failed?`<span class="record-state org-state tone-error">${say('Ошибка','Failed')}</span>`:''}</header>${failed?`<p class="org-muted">${esc(result.error_message||'')}</p>`:running?'':`<div class="org-result-text">${esc(result.content||'')}</div>`}${result.model?`<small class="org-muted">${esc(result.model)}</small>`:''}</article>`;
+    return `<article class="org-result"><header><strong>${esc(result.title||say('Выжимка','Summary'))}</strong>${running?`<span class="record-state org-state tone-progress"><i aria-hidden="true"></i>${say('Готовится','Generating')}</span>`:failed?`<span class="record-state org-state tone-error">${say('Ошибка','Failed')}</span>`:''}</header>${failed?`<p class="org-muted">${esc(result.error_message||'')}</p>`:running?'':`<div class="org-result-text md">${renderMarkdown(stripLeadingTitle(result.content||'',result.title||''))}</div>`}${result.model?`<small class="org-muted">${esc(result.model)}</small>`:''}</article>`;
   }).join('');
 }
 function audioHtml():string {
@@ -295,7 +307,7 @@ export function detailToolsHtml(compact:boolean):string {
 }
 let actionsDialog:HTMLDialogElement|null=null;
 function openDetailActions(){
-  const transcript=detail?.recording.transcript_text||'';if(!transcript||actionsDialog?.open)return;
+  const transcript=plainTranscript();if(!transcript||actionsDialog?.open)return;
   const title=detailTitle(),trigger=document.querySelector<HTMLElement>('#org-share');
   const dialog=document.createElement('dialog');actionsDialog=dialog;dialog.className='record-actions-dialog';dialog.setAttribute('aria-labelledby','org-actions-title');
   const action=(name:string,label:string,glyph:string)=>`<button type="button" data-org-action="${name}">${icon(glyph)}<span>${label}</span></button>`;
@@ -336,10 +348,64 @@ export function cloudDetailHtml():string {
     :!recording?`<div class="org-empty">${say('Текст появится после загрузки и расшифровки на сервере.','Text appears after the upload and server transcription.')}</div>`
     :detailTab==='results'?resultsHtml(results)
     :!transcript&&detailFetching&&recording.status==='transcribed'?`<div class="list-empty"><span class="spinner"></span>${say('Загружаем текст…','Loading text…')}</div>`
+    :transcript&&paragraphs().length?timedListHtml(paragraphs(),speakerNames(paragraphs(),recording.speaker_names,speakerLabel),{id:'org-transcript',lang:recording.language||currentLanguage(),label:say('Расшифровка','Transcript'),seekLabel:say('Воспроизвести с ','Play from ')})
     :transcript?`<article class="transcript" lang="${esc(recording.language||currentLanguage())}">${esc(transcript)}</article>`
     :`<div class="org-empty">${recording.status==='failed'?say('Расшифровка не получилась.','Transcription failed.'):say('Текст появится после расшифровки.','Text will appear after transcription.')}</div>`;
   const offline=detail?.offline?`<div class="org-inline-note">${esc(orgErrorText(detail.offline))}</div>`:'';
-  return `<section class="workspace org-detail"><header class="record-header"><div class="record-heading"><div class="record-name-row"><h1>${esc(detailTitle())}</h1></div><div class="record-meta">${meta.map(part=>`<span>${esc(part)}</span>`).join('')}</div>${tags}</div>${ctx.mobile()?'':`<div class="record-tools">${detailToolsHtml(false)}</div>`}</header>${offline}${banner}${audioHtml()}${tabs}<div class="transcript-scroll">${body}</div></section>`;
+  return `<section class="workspace org-detail"><header class="record-header"><div class="record-heading"><div class="record-name-row"><h1>${esc(detailTitle())}</h1></div><div class="record-meta">${meta.map(part=>`<span>${esc(part)}</span>`).join('')}</div>${tags}</div>${ctx.mobile()?'':`<div class="record-tools">${detailToolsHtml(false)}</div>`}</header>${offline}${banner}${audioHtml()}${tabs}<div class="transcript-scroll" id="org-scroll">${body}</div></section>`;
+}
+
+// ---------------------------------------------------------------- timed transcript
+const speakerLabel=(n:number)=>say(`Спикер ${n}`,`Speaker ${n}`);
+let paragraphSource:Segment[]|null=null,paragraphCache:Segment[]=[];
+function paragraphs():Segment[] {
+  const segments=detail?.recording.transcript_segments;if(!segments?.length)return [];
+  if(paragraphSource!==segments){paragraphSource=segments;paragraphCache=transcriptParagraphs(segments);}
+  return paragraphCache;
+}
+function plainTranscript():string {const recording=detail?.recording;return transcriptPlainText(paragraphs(),recording?.transcript_text||'',recording?.speaker_names,speakerLabel);}
+// Survive re-renders: the playing element, the reading position of each tab and the marked row.
+let player:HTMLAudioElement|null=null,pendingSeek:number|null=null,activeRow=-2,followPlayback=true;
+const scrollTops={transcript:0,results:0};
+function resetReading(){player?.pause();player=null;pendingSeek=null;activeRow=-2;followPlayback=true;nativePosition=0;paragraphSource=null;paragraphCache=[];scrollTops.transcript=scrollTops.results=0;}
+function syncActiveRow(force=false){
+  const rows=document.querySelectorAll<HTMLElement>('#org-transcript .timed-row');if(!rows.length){activeRow=-2;return;}
+  const android=ctx.android(),playing=android?nativePlaying:Boolean(player&&!player.paused),seconds=android?nativePosition:player?.currentTime||0;
+  const index=audio?.src&&(playing||seconds>0)?activeSegmentIndex(paragraphs(),seconds*1000):-1;
+  if(index===activeRow&&!force)return;activeRow=index;
+  rows.forEach((row,position)=>{const on=position===index;row.classList.toggle('is-active',on);if(on)row.setAttribute('aria-current','true');else row.removeAttribute('aria-current');});
+  const row=rows[index],scroller=document.querySelector<HTMLElement>('#org-scroll');
+  if(!row||!scroller||!followPlayback||!playing)return;
+  const box=scroller.getBoundingClientRect(),rect=row.getBoundingClientRect();
+  if(rect.top<box.top+box.height*0.1||rect.bottom>box.top+box.height*0.8)row.scrollIntoView({block:'center',behavior:'smooth'});
+}
+async function seekTo(ms:number){
+  followPlayback=true;pendingSeek=ms/1000;
+  if(!audio?.src){await playAudio();return;}
+  if(!ctx.android()){applySeek();void player?.play().catch(()=>{});return;}
+  try{await seekNative();await nativeCall('play_native_playback');nativePlaying=true;rerender();}catch(error){ctx.notice(errorText(error),true);}
+}
+function applySeek(){if(pendingSeek===null||!player||player.readyState<1)return;player.currentTime=pendingSeek;pendingSeek=null;syncActiveRow();}
+async function seekNative(){if(pendingSeek===null)return;const seconds=pendingSeek;pendingSeek=null;await nativeCall('seek_native_playback',{seconds});nativePosition=seconds;syncActiveRow();}
+function bindReading(){
+  const slot=document.querySelector<HTMLAudioElement>('#org-audio');
+  if(slot&&player&&player.getAttribute('src')===slot.getAttribute('src'))slot.replaceWith(player);
+  else if(slot){
+    player=slot;
+    slot.addEventListener('loadedmetadata',applySeek);
+    for(const name of ['timeupdate','seeked','play','pause'])slot.addEventListener(name,()=>syncActiveRow());
+  }
+  const scroller=document.querySelector<HTMLElement>('#org-scroll');
+  if(scroller){
+    const tab=detailTab;scroller.scrollTop=scrollTops[tab];
+    scroller.addEventListener('scroll',()=>{if(scroller.isConnected)scrollTops[tab]=scroller.scrollTop;},{passive:true});
+    for(const name of ['wheel','touchmove'])scroller.addEventListener(name,()=>{followPlayback=false;},{passive:true});
+  }
+  document.querySelectorAll<HTMLElement>('#org-transcript .timed-row').forEach(row=>row.onclick=()=>{
+    if(window.getSelection()?.toString())return;
+    const segment=paragraphs()[Number(row.dataset.row)];if(segment)void seekTo(segment.start_ms);
+  });
+  syncActiveRow(true);
 }
 
 // ---------------------------------------------------------------- audio
@@ -352,10 +418,12 @@ async function playAudio(){
   try{
     if(ctx.android()){
       const path=await call<string>('org_cache_audio',{connectionId:target.connectionId,organizationId:target.organizationId,recordingId});
-      await call('org_prepare_native_playback',{path});await nativeCall('play_native_playback');
+      await call('org_prepare_native_playback',{path});
+      if(open!==target)return;
+      await seekNative();await nativeCall('play_native_playback');
       if(open!==target)return;
       audio={key:recordingId,src:path,loading:false,error:'',progress:100};nativePlaying=true;
-      nativeTimer=setInterval(async()=>{try{const player=await nativeCall<{currentTime:number;playing:boolean}>('native_playback_state');nativePosition=player.currentTime;nativePlaying=player.playing;const label=document.querySelector('#org-native-time');if(label)label.textContent=`${timeLabel(nativePosition*1000)} / ${timeLabel(detail?.recording.duration_ms||0)}`;}catch{/* Player released. */}},500);
+      nativeTimer=setInterval(async()=>{try{const player=await nativeCall<{currentTime:number;playing:boolean}>('native_playback_state');nativePosition=player.currentTime;nativePlaying=player.playing;syncActiveRow();const label=document.querySelector('#org-native-time');if(label)label.textContent=`${timeLabel(nativePosition*1000)} / ${timeLabel(detail?.recording.duration_ms||0)}`;}catch{/* Player released. */}},500);
     }else{
       const value=await call<{path:string|null;url:string|null}>('org_audio',{connectionId:target.connectionId,organizationId:target.organizationId,recordingId});
       if(open!==target)return;
@@ -365,7 +433,7 @@ async function playAudio(){
     }
   }catch(error){if(open===target)audio={key:recordingId,src:'',loading:false,error:orgErrorText(error),progress:0};}
   rerender();
-  requestAnimationFrame(()=>{void document.querySelector<HTMLAudioElement>('#org-audio')?.play().catch(()=>{});});
+  requestAnimationFrame(()=>{if(open===target)void document.querySelector<HTMLAudioElement>('#org-audio')?.play().catch(()=>{});});
 }
 
 // ---------------------------------------------------------------- destination
@@ -498,10 +566,11 @@ export function bindOrg(){
   });
   document.querySelector('#org-retry-transcription')?.addEventListener('click',async()=>{if(!open?.recordingId)return;try{await call('org_retry_recording',{connectionId:open.connectionId,organizationId:open.organizationId,recordingId:open.recordingId});await loadDetail(true);}catch(error){ctx.notice(orgErrorText(error),true);}});
   document.querySelector('#org-detail-retry')?.addEventListener('click',()=>{void loadDetail(true);});
+  bindReading();
   document.querySelector('#org-play')?.addEventListener('click',()=>{void playAudio();});
   document.querySelector('#org-native-play')?.addEventListener('click',async()=>{try{if(nativePlaying)await nativeCall('pause_native_playback');else await nativeCall('play_native_playback');nativePlaying=!nativePlaying;rerender();}catch(error){ctx.notice(errorText(error),true);}});
   document.querySelectorAll<HTMLElement>('[data-org-tab]').forEach(button=>button.onclick=()=>{detailTab=button.dataset.orgTab as typeof detailTab;ctx.render();});
-  document.querySelector('#org-copy')?.addEventListener('click',()=>{void copyTranscript(detail?.recording.transcript_text||'');});
+  document.querySelector('#org-copy')?.addEventListener('click',()=>{void copyTranscript(plainTranscript());});
   document.querySelector('#org-share')?.addEventListener('click',openDetailActions);
   const form=document.querySelector<HTMLFormElement>('#org-connect-form');
   form?.addEventListener('input',()=>{serverDraft=String(new FormData(form).get('server')||'');});

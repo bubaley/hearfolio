@@ -49,11 +49,15 @@ export type SpeakerNames = Record<string, string> | null | undefined
  * (`<request start ms>:<id>`), so a transcript stitched from several requests, or with fewer than two speakers, gets
  * no names (same rule as the server's summaries).
  */
-export const speakerNames = (segments: readonly Segment[], named?: SpeakerNames): Map<string, string> => {
+export const speakerNames = (
+  segments: readonly Segment[],
+  named?: SpeakerNames,
+  unnamed: (n: number) => string = (n) => `Спикер ${n}`,
+): Map<string, string> => {
   const labels = [...new Set(segments.filter((s) => s.text.trim() && s.speaker).map((s) => s.speaker as string))]
   const scopes = new Set(labels.map((label) => (label.includes(':') ? label.slice(0, label.lastIndexOf(':')) : '')))
   if (labels.length < 2 || scopes.size !== 1) return new Map()
-  return new Map(labels.map((label, index) => [label, named?.[label]?.trim() || `Спикер ${index + 1}`]))
+  return new Map(labels.map((label, index) => [label, named?.[label]?.trim() || unnamed(index + 1)]))
 }
 
 /** The name to show above a paragraph: only where the speaker changes. */
@@ -64,8 +68,12 @@ export const speakerHeading = (segments: readonly Segment[], names: Map<string, 
 }
 
 /** Plain transcript lines, `Имя: …` where speakers are known. */
-export const transcriptPlainLines = (segments: readonly Segment[], named?: SpeakerNames) => {
-  const names = speakerNames(segments, named)
+export const transcriptPlainLines = (
+  segments: readonly Segment[],
+  named?: SpeakerNames,
+  unnamed?: (n: number) => string,
+) => {
+  const names = speakerNames(segments, named, unnamed)
   return segments.map((segment) => {
     const name = segment.speaker ? names.get(segment.speaker) : undefined
     return name ? `${name}: ${segment.text}` : segment.text
@@ -97,8 +105,13 @@ export const activeSegmentIndex = (segments: readonly Segment[], ms: number) => 
 }
 
 /** Whole transcript as plain text for copy, share and export: speaker-labelled lines when speakers are known. */
-export const transcriptPlainText = (segments: readonly Segment[], fallback: string, named?: SpeakerNames) => {
+export const transcriptPlainText = (
+  segments: readonly Segment[],
+  fallback: string,
+  named?: SpeakerNames,
+  unnamed?: (n: number) => string,
+) => {
   const spoken = segments.filter((segment) => segment.text.trim())
-  const names = speakerNames(spoken, named)
-  return names.size ? transcriptPlainLines(spoken, named).join('\n') : fallback
+  const names = speakerNames(spoken, named, unnamed)
+  return names.size ? transcriptPlainLines(spoken, named, unnamed).join('\n') : fallback
 }
