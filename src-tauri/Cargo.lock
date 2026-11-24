@@ -4237,7 +4237,7 @@ dependencies = [
 
 [[package]]
 name = "speechdesk"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "base64 0.22.1",
  "cc",

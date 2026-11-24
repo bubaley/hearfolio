@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.14.2 (2026-11-24)
+
+### Fixes and performance
+
+- **postprocess:** let a result use the model's full output limit ([4f0dbef](https://github.com/bubaley/hearfolio/commit/4f0dbefd8f66f20fe7fe1f9185683294f9592578))
+
+### Maintenance
+
+- **release:** bound apt installs on the Linux runner and retry slow mirrors ([28c6fd0](https://github.com/bubaley/hearfolio/commit/28c6fd0b0b6fca46dc01bcca84c7cbba5d94c92c))
+
 ## 0.14.1 (2026-11-23)
 
 ### Fixes and performance
